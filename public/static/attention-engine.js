@@ -29,6 +29,9 @@
     bindActions();
     bindResultsButtons();
     injectToast();
+    initKeysDrawer();
+    initURLFetch();
+    loadStoredKeys();
   });
 
   /* ══════════════════════════════════════════════════════════════════
@@ -1008,6 +1011,312 @@ METRICS ENTERED
 
   function escapeTick(str) {
     return (str || '').replace(/`/g, '\\`').replace(/\$/g, '\\$');
+  }
+
+  /* ══════════════════════════════════════════════════════════════════
+     API KEYS DRAWER
+  ══════════════════════════════════════════════════════════════════ */
+  const STORAGE_KEY = 'spectra_ae_keys';
+
+  function getStoredKeys() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch { return {}; }
+  }
+
+  function saveKey(name, value) {
+    const keys = getStoredKeys();
+    keys[name] = value;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(keys));
+  }
+
+  function loadStoredKeys() {
+    const keys = getStoredKeys();
+    if (keys.youtube) {
+      const el = $('key-youtube');
+      if (el) { el.value = keys.youtube; el.classList.add('has-value'); }
+      setKeyStatus('yt', 'active', '● Connected');
+    }
+    if (keys.meta) {
+      const el = $('key-meta');
+      if (el) { el.value = keys.meta; el.classList.add('has-value'); }
+      setKeyStatus('meta', 'active', '● Connected');
+    }
+    updateSummary(keys);
+    updateNavDot(keys);
+  }
+
+  function setKeyStatus(blockId, state, text) {
+    const dot  = document.querySelector(`#${blockId}-status .ae-key-dot`);
+    const label = document.querySelector(`#${blockId}-status .ae-key-status-text`);
+    if (dot)  { dot.className = `ae-key-dot ${state}`; }
+    if (label){ label.className = `ae-key-status-text ${state}`; label.textContent = text; }
+    // Mark block as connected
+    const block = document.querySelector(`[data-platform="${blockId === 'yt' ? 'youtube' : 'meta'}"]`);
+    if (block && state === 'active') block.classList.add('connected');
+  }
+
+  function updateSummary(keys) {
+    const ytEl  = $('sum-youtube');
+    const igEl  = $('sum-instagram');
+    const fbEl  = $('sum-facebook');
+    if (ytEl) {
+      ytEl.textContent   = keys.youtube ? '✓ Key saved' : '— Not set';
+      ytEl.className     = `ae-sum-val ${keys.youtube ? 'connected' : 'missing'}`;
+    }
+    if (igEl) {
+      igEl.textContent   = keys.meta ? '✓ Token saved' : '— Not set';
+      igEl.className     = `ae-sum-val ${keys.meta ? 'connected' : 'missing'}`;
+    }
+    if (fbEl) {
+      fbEl.textContent   = keys.meta ? '✓ Token saved' : '— Not set';
+      fbEl.className     = `ae-sum-val ${keys.meta ? 'connected' : 'missing'}`;
+    }
+  }
+
+  function updateNavDot(keys) {
+    const dot = $('keys-status-dot');
+    if (!dot) return;
+    const hasYT   = !!keys.youtube;
+    const hasMeta = !!keys.meta;
+    if (hasYT && hasMeta)        { dot.className = 'ae-keys-status-dot has-keys'; }
+    else if (hasYT || hasMeta)   { dot.className = 'ae-keys-status-dot partial'; }
+    else                          { dot.className = 'ae-keys-status-dot'; }
+  }
+
+  function initKeysDrawer() {
+    const overlay = $('keys-overlay');
+    const drawer  = $('keys-drawer');
+    const btnOpen = $('btn-open-keys');
+    const btnClose = $('btn-close-keys');
+
+    function openDrawer() {
+      drawer?.classList.add('open');
+      overlay?.classList.add('open');
+      document.body.style.overflow = 'hidden';
+    }
+    function closeDrawer() {
+      drawer?.classList.remove('open');
+      overlay?.classList.remove('open');
+      document.body.style.overflow = '';
+    }
+
+    btnOpen?.addEventListener('click', openDrawer);
+    btnClose?.addEventListener('click', closeDrawer);
+    overlay?.addEventListener('click', closeDrawer);
+
+    // Save buttons
+    $$('.ae-key-save').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const keyName = btn.dataset.key;
+        const inputId = `key-${keyName}`;
+        const input   = $(inputId);
+        if (!input) return;
+        const val = input.value.trim();
+        if (!val) { showToast('Enter a key first', 'error'); return; }
+        saveKey(keyName, val);
+        input.classList.add('has-value');
+        // Animate button
+        btn.textContent = 'Saved ✓';
+        btn.classList.add('saved');
+        setTimeout(() => { btn.textContent = 'Save'; btn.classList.remove('saved'); }, 2200);
+        const statusId = keyName === 'youtube' ? 'yt' : 'meta';
+        setKeyStatus(statusId, 'active', '● Connected');
+        const keys = getStoredKeys();
+        updateSummary(keys);
+        updateNavDot(keys);
+        showToast(`${keyName === 'youtube' ? 'YouTube' : 'Meta'} key saved`, 'success');
+      });
+    });
+
+    // Toggle show/hide key inputs
+    $$('.ae-key-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const input = $(btn.dataset.target);
+        if (!input) return;
+        input.type = input.type === 'password' ? 'text' : 'password';
+      });
+    });
+  }
+
+  /* ══════════════════════════════════════════════════════════════════
+     URL AUTO-FETCH — detects platform, hits /api/fetch-url, populates form
+  ══════════════════════════════════════════════════════════════════ */
+  function initURLFetch() {
+    const urlInput = $('content-url');
+    if (!urlInput) return;
+
+    let fetchTimer = null;
+
+    urlInput.addEventListener('input', () => {
+      clearTimeout(fetchTimer);
+      const val = urlInput.value.trim();
+
+      // Reset preview
+      hideURLPreview();
+      clearURLNote();
+
+      if (!val || val.length < 20) return;
+
+      // Auto-select platform from URL
+      autoSelectPlatform(val);
+
+      // Debounce fetch by 900ms after user stops typing
+      fetchTimer = setTimeout(() => tryFetchURL(val), 900);
+    });
+
+    urlInput.addEventListener('blur', () => {
+      clearTimeout(fetchTimer);
+      const val = urlInput.value.trim();
+      if (val && val.length > 20) tryFetchURL(val);
+    });
+  }
+
+  function autoSelectPlatform(url) {
+    let detected = null;
+    if (url.includes('youtube.com') || url.includes('youtu.be')) detected = 'youtube';
+    else if (url.includes('instagram.com'))  detected = 'instagram';
+    else if (url.includes('facebook.com') || url.includes('fb.watch')) detected = 'facebook';
+    else if (url.includes('tiktok.com'))     detected = 'tiktok';
+    else if (url.includes('twitter.com') || url.includes('x.com')) detected = 'twitter';
+
+    if (detected) {
+      const btn = document.querySelector(`.ae-platform-btn[data-platform="${detected}"]`);
+      if (btn && !btn.classList.contains('active')) {
+        $$('.ae-platform-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        state.platform = detected;
+      }
+    }
+  }
+
+  async function tryFetchURL(url) {
+    const keys = getStoredKeys();
+
+    // Check if we have the key for this platform
+    const isYT   = url.includes('youtube.com') || url.includes('youtu.be');
+    const isIG   = url.includes('instagram.com');
+    const isFB   = url.includes('facebook.com') || url.includes('fb.watch');
+
+    // Show spinner
+    const spinner = $('url-spinner');
+    if (spinner) spinner.classList.add('active');
+
+    try {
+      const params = new URLSearchParams({ url });
+      if (keys.youtube) params.set('yt_key', keys.youtube);
+      if (keys.meta)    params.set('fb_token', keys.meta);
+
+      const res  = await fetch(`/api/fetch-url?${params}`);
+      const data = await res.json();
+
+      if (spinner) spinner.classList.remove('active');
+
+      if (data.needs_key) {
+        // Show hint to add key
+        const platformName = isYT ? 'YouTube' : isIG ? 'Instagram' : isFB ? 'Facebook' : 'platform';
+        showURLNote(`Add your ${platformName} API key via the API Keys button in the nav to auto-populate metrics.`);
+        return;
+      }
+
+      if (data.error && data.needs_manual) {
+        showURLNote(data.error);
+        return;
+      }
+
+      if (data.error && !data.metrics) {
+        showURLNote('Could not fetch data: ' + data.error);
+        return;
+      }
+
+      // ✅ Success — populate the form
+      if (data.title) {
+        showURLPreview(data.thumbnail, data.title, data);
+      }
+
+      populateMetrics(data);
+
+      if (data.notes) showURLNote(data.notes);
+
+    } catch (err) {
+      if (spinner) spinner.classList.remove('active');
+      showURLNote('Network error fetching URL metadata.');
+    }
+  }
+
+  function populateMetrics(data) {
+    const m = data.metrics || {};
+
+    // Fill numeric inputs only if value > 0
+    const fields = {
+      'M-views':    m.views,
+      'm-views':    m.views,
+      'm-likes':    m.likes,
+      'm-comments': m.comments,
+      'm-shares':   m.shares,
+      'm-saves':    m.saves,
+      'm-watchtime': m.watch_time_pct,
+    };
+    if ($('m-views') && m.views > 0)            $('m-views').value    = m.views;
+    if ($('m-likes') && m.likes > 0)            $('m-likes').value    = m.likes;
+    if ($('m-comments') && m.comments > 0)      $('m-comments').value = m.comments;
+    if ($('m-shares') && m.shares > 0)          $('m-shares').value   = m.shares;
+    if ($('m-saves') && m.saves > 0)            $('m-saves').value    = m.saves;
+    if ($('m-watchtime') && m.watch_time_pct > 0) $('m-watchtime').value = m.watch_time_pct;
+
+    // Duration
+    if ($('duration') && data.duration_sec > 0) $('duration').value = data.duration_sec;
+
+    // Flash filled inputs
+    ['m-views','m-likes','m-comments','m-shares','m-saves','m-watchtime','duration'].forEach(id => {
+      const el = $(id);
+      if (el && el.value && parseFloat(el.value) > 0) {
+        el.style.borderColor = 'rgba(52,211,153,0.5)';
+        setTimeout(() => { el.style.borderColor = ''; }, 2000);
+      }
+    });
+
+    const count = Object.values(m).filter(v => v > 0).length;
+    if (count > 0) showToast(`${count} metric${count > 1 ? 's' : ''} auto-filled from ${(data.platform || 'URL').toUpperCase()}`, 'success');
+  }
+
+  function showURLPreview(thumb, title, data) {
+    const preview = $('url-preview');
+    const thumbEl = $('url-thumb');
+    const titleEl = $('url-preview-title');
+    const metaEl  = $('url-preview-meta');
+    if (!preview) return;
+
+    if (thumbEl && thumb) { thumbEl.src = thumb; thumbEl.style.display = 'block'; }
+    else if (thumbEl) thumbEl.style.display = 'none';
+    if (titleEl) titleEl.textContent = title || '';
+    if (metaEl) {
+      const parts = [];
+      if (data.channel)      parts.push(data.channel);
+      if (data.duration_sec) parts.push(formatDuration(data.duration_sec));
+      if (data.platform)     parts.push(data.platform.toUpperCase());
+      metaEl.textContent = parts.join(' · ');
+    }
+    preview.classList.add('visible');
+  }
+
+  function hideURLPreview() {
+    const preview = $('url-preview');
+    if (preview) preview.classList.remove('visible');
+  }
+
+  function showURLNote(msg) {
+    const el = $('url-fetch-note');
+    if (el) { el.textContent = msg; el.style.display = 'block'; }
+  }
+
+  function clearURLNote() {
+    const el = $('url-fetch-note');
+    if (el) { el.textContent = ''; el.style.display = 'none'; }
+  }
+
+  function formatDuration(sec) {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}:${String(s).padStart(2,'0')}`;
   }
 
 })();

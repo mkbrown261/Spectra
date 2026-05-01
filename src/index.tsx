@@ -401,6 +401,133 @@ app.post('/api/attention/score', async (c) => {
 })
 
 /* ══════════════════════════════════════════════════════════════════
+   API: GET /api/fetch-url  — auto-populate metrics from a content URL
+   Supports: YouTube (public), Instagram (token), Facebook (token)
+══════════════════════════════════════════════════════════════════ */
+app.get('/api/fetch-url', async (c) => {
+  const url    = c.req.query('url') || ''
+  const ytKey  = c.req.query('yt_key') || process.env.YOUTUBE_API_KEY || ''
+  const fbToken = c.req.query('fb_token') || process.env.FB_ACCESS_TOKEN || ''
+
+  if (!url) return c.json({ error: 'No URL provided' }, 400)
+
+  // ── YouTube ──────────────────────────────────────────────────────
+  const ytMatch = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([A-Za-z0-9_-]{11})/)
+  if (ytMatch) {
+    const videoId = ytMatch[1]
+    if (!ytKey) return c.json({ error: 'YouTube API key required', platform: 'youtube', needs_key: true }, 200)
+    try {
+      const apiUrl = `https://www.googleapis.com/youtube/v3/videos?id=${videoId}&key=${ytKey}&part=snippet,statistics,contentDetails`
+      const res = await fetch(apiUrl)
+      const data: any = await res.json()
+      if (!data.items?.length) return c.json({ error: 'Video not found', platform: 'youtube' }, 200)
+      const item = data.items[0]
+      const stats = item.statistics || {}
+      const snippet = item.snippet || {}
+      // Parse ISO 8601 duration (PT1M30S → 90s)
+      const dur = item.contentDetails?.duration || 'PT0S'
+      const durMatch = dur.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/)
+      const durSec = (parseInt(durMatch?.[1]||'0')*3600) + (parseInt(durMatch?.[2]||'0')*60) + parseInt(durMatch?.[3]||'0')
+      return c.json({
+        platform:     'youtube',
+        title:        snippet.title || '',
+        channel:      snippet.channelTitle || '',
+        thumbnail:    snippet.thumbnails?.high?.url || snippet.thumbnails?.default?.url || '',
+        published:    snippet.publishedAt || '',
+        duration_sec: durSec,
+        metrics: {
+          views:           parseInt(stats.viewCount   || '0'),
+          likes:           parseInt(stats.likeCount   || '0'),
+          comments:        parseInt(stats.commentCount|| '0'),
+          shares:          0,   // YouTube API does not expose shares
+          saves:           0,   // YouTube API does not expose saves/playlists
+          watch_time_pct:  0,   // Only available in YouTube Studio (private)
+        },
+        notes: 'Shares, saves, and watch time % are not available via the public YouTube API. Enter manually.',
+      })
+    } catch (err: any) {
+      return c.json({ error: err.message, platform: 'youtube' }, 500)
+    }
+  }
+
+  // ── Instagram Reel / Post ─────────────────────────────────────────
+  const igMatch = url.match(/instagram\.com\/(?:reel|p|tv)\/([A-Za-z0-9_-]+)/)
+  if (igMatch) {
+    if (!fbToken) return c.json({ error: 'Facebook/Instagram access token required', platform: 'instagram', needs_key: true }, 200)
+    try {
+      // Step 1: resolve shortcode to media ID via oEmbed (no auth needed for basic info)
+      const oembedUrl = `https://graph.facebook.com/v19.0/instagram_oembed?url=${encodeURIComponent(url)}&access_token=${fbToken}`
+      const oRes = await fetch(oembedUrl)
+      const oData: any = await oRes.json()
+
+      // Step 2: search user's media for this post by shortcode
+      const meUrl = `https://graph.facebook.com/v19.0/me/accounts?fields=instagram_business_account&access_token=${fbToken}`
+      const meRes = await fetch(meUrl)
+      const meData: any = await meRes.json()
+
+      return c.json({
+        platform:  'instagram',
+        title:     oData.title || oData.author_name || '',
+        thumbnail: oData.thumbnail_url || '',
+        author:    oData.author_name || '',
+        metrics: {
+          views:          0,
+          likes:          0,
+          comments:       0,
+          shares:         0,
+          saves:          0,
+          watch_time_pct: 0,
+        },
+        notes: 'To get full Instagram metrics (likes, comments, saves, reach) you need to connect your Instagram Business Account. Basic info loaded from oEmbed.',
+        oembed: oData,
+      })
+    } catch (err: any) {
+      return c.json({ error: err.message, platform: 'instagram' }, 500)
+    }
+  }
+
+  // ── Facebook Video ────────────────────────────────────────────────
+  const fbMatch = url.match(/facebook\.com\/(?:watch\/?\?v=|.*\/videos\/)(\d+)/)
+  if (fbMatch) {
+    const videoId = fbMatch[1]
+    if (!fbToken) return c.json({ error: 'Facebook access token required', platform: 'facebook', needs_key: true }, 200)
+    try {
+      const fbUrl = `https://graph.facebook.com/v19.0/${videoId}?fields=title,description,length,views,likes.limit(0).summary(true),comments.limit(0).summary(true),shares&access_token=${fbToken}`
+      const res = await fetch(fbUrl)
+      const data: any = await res.json()
+      if (data.error) return c.json({ error: data.error.message, platform: 'facebook' }, 200)
+      return c.json({
+        platform:     'facebook',
+        title:        data.title || data.description?.slice(0,80) || '',
+        duration_sec: Math.round(data.length || 0),
+        metrics: {
+          views:          parseInt(data.views || '0'),
+          likes:          data.likes?.summary?.total_count || 0,
+          comments:       data.comments?.summary?.total_count || 0,
+          shares:         data.shares?.count || 0,
+          saves:          0,
+          watch_time_pct: 0,
+        },
+        notes: 'Saves and watch time % are not available via the public Facebook Graph API.',
+      })
+    } catch (err: any) {
+      return c.json({ error: err.message, platform: 'facebook' }, 500)
+    }
+  }
+
+  // ── Unknown platform — return detection only ──────────────────────
+  let detectedPlatform = 'unknown'
+  if (url.includes('tiktok.com'))    detectedPlatform = 'tiktok'
+  if (url.includes('twitter.com') || url.includes('x.com')) detectedPlatform = 'twitter'
+
+  return c.json({
+    platform: detectedPlatform,
+    error: 'Auto-populate not available for this platform yet. Enter metrics manually.',
+    needs_manual: true,
+  })
+})
+
+/* ══════════════════════════════════════════════════════════════════
    TOOL ROUTES
 ══════════════════════════════════════════════════════════════════ */
 app.get('/tools/attention-engine',  (c) => c.redirect('/tools/attention-engine/'))
@@ -449,11 +576,186 @@ function attentionEnginePage(): string {
       Attention Engine
     </span>
   </div>
-  <a href="/" class="ae-nav-back">
-    <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M13 8H3M7 4l-4 4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    Suite
-  </a>
+  <div class="ae-nav-right">
+    <button class="ae-keys-btn" id="btn-open-keys" title="API Keys">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="5.5"/><path d="M21 2l-9.6 9.6"/><path d="M15.5 7.5l3 3"/><path d="M18 5l2 2"/></svg>
+      API Keys
+      <span class="ae-keys-status-dot" id="keys-status-dot"></span>
+    </button>
+    <a href="/" class="ae-nav-back">
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M13 8H3M7 4l-4 4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Suite
+    </a>
+  </div>
 </nav>
+
+<!-- ═══ API KEYS DRAWER ════════════════════════════════════════════ -->
+<div class="ae-drawer-overlay" id="keys-overlay"></div>
+<aside class="ae-keys-drawer" id="keys-drawer" aria-label="API Keys Configuration">
+
+  <div class="ae-drawer-header">
+    <div class="ae-drawer-title">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="5.5"/><path d="M21 2l-9.6 9.6"/><path d="M15.5 7.5l3 3"/><path d="M18 5l2 2"/></svg>
+      API Keys
+    </div>
+    <div class="ae-drawer-subtitle">Keys are stored in your browser only — never sent to our servers</div>
+    <button class="ae-drawer-close" id="btn-close-keys">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+
+  <div class="ae-drawer-body">
+
+    <!-- YOUTUBE -->
+    <div class="ae-key-block" data-platform="youtube">
+      <div class="ae-key-block-header">
+        <div class="ae-key-block-icon" style="--kc:#F87171">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M23 7s-.3-2-1.2-2.8c-1.1-1.2-2.4-1.2-3-1.3C16.6 2.8 12 2.8 12 2.8s-4.6 0-6.8.1c-.6.1-1.9.1-3 1.3C1.3 5 1 7 1 7S.7 9.1.7 11.3v2c0 2.1.3 4.2.3 4.2s.3 2 1.2 2.8c1.1 1.2 2.6 1.1 3.3 1.2C7.6 21.7 12 21.7 12 21.7s4.6 0 6.8-.2c.6-.1 1.9-.1 3-1.3.9-.8 1.2-2.8 1.2-2.8s.3-2.1.3-4.2v-2C23.3 9.1 23 7 23 7zM9.7 15.5V8.4l8.1 3.6-8.1 3.5z"/></svg>
+        </div>
+        <div class="ae-key-block-info">
+          <div class="ae-key-block-name">YouTube Data API v3</div>
+          <div class="ae-key-block-desc">Auto-fills title, duration, views, likes, comments from any YouTube URL</div>
+        </div>
+        <div class="ae-key-block-status" id="yt-status">
+          <span class="ae-key-dot inactive"></span>
+          <span class="ae-key-status-text">Not set</span>
+        </div>
+      </div>
+      <div class="ae-key-input-row">
+        <div class="ae-key-field">
+          <input type="password" class="ae-key-input" id="key-youtube" placeholder="AIzaSy..." autocomplete="off" spellcheck="false"/>
+          <button class="ae-key-toggle" data-target="key-youtube" title="Show/hide">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <button class="ae-key-save" data-key="youtube">Save</button>
+      </div>
+      <div class="ae-key-what-you-get">
+        <div class="ae-kwg-title">What auto-populates</div>
+        <div class="ae-kwg-tags">
+          <span class="ae-kwg-tag available">Title</span>
+          <span class="ae-kwg-tag available">Duration</span>
+          <span class="ae-kwg-tag available">Views</span>
+          <span class="ae-kwg-tag available">Likes</span>
+          <span class="ae-kwg-tag available">Comments</span>
+          <span class="ae-kwg-tag unavailable">Shares*</span>
+          <span class="ae-kwg-tag unavailable">Watch Time*</span>
+        </div>
+        <div class="ae-kwg-note">* Not available via public API — enter manually</div>
+      </div>
+      <a class="ae-key-get-link" href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" target="_blank" rel="noopener">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        Get free key → Google Cloud Console
+      </a>
+      <div class="ae-key-steps">
+        <div class="ae-key-step"><span class="ae-step-num">1</span>Create or open a Google Cloud project</div>
+        <div class="ae-key-step"><span class="ae-step-num">2</span>Enable <strong>YouTube Data API v3</strong></div>
+        <div class="ae-key-step"><span class="ae-step-num">3</span>Go to Credentials → Create API Key</div>
+        <div class="ae-key-step"><span class="ae-step-num">4</span>Paste it above and hit Save</div>
+      </div>
+    </div>
+
+    <!-- INSTAGRAM / FACEBOOK -->
+    <div class="ae-key-block" data-platform="meta">
+      <div class="ae-key-block-header">
+        <div class="ae-key-block-icon" style="--kc:#A78BFA">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1.2" fill="currentColor" stroke="none"/></svg>
+        </div>
+        <div class="ae-key-block-info">
+          <div class="ae-key-block-name">Meta Graph API</div>
+          <div class="ae-key-block-desc">Powers both Instagram and Facebook auto-population with one token</div>
+        </div>
+        <div class="ae-key-block-status" id="meta-status">
+          <span class="ae-key-dot inactive"></span>
+          <span class="ae-key-status-text">Not set</span>
+        </div>
+      </div>
+      <div class="ae-key-input-row">
+        <div class="ae-key-field">
+          <input type="password" class="ae-key-input" id="key-meta" placeholder="EAAGm0P..." autocomplete="off" spellcheck="false"/>
+          <button class="ae-key-toggle" data-target="key-meta" title="Show/hide">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <button class="ae-key-save" data-key="meta">Save</button>
+      </div>
+
+      <!-- Instagram what you get -->
+      <div class="ae-kwg-platform-split">
+        <div>
+          <div class="ae-kwg-title" style="color:var(--c-orange)">Instagram</div>
+          <div class="ae-kwg-tags">
+            <span class="ae-kwg-tag available">Views</span>
+            <span class="ae-kwg-tag available">Likes</span>
+            <span class="ae-kwg-tag available">Comments</span>
+            <span class="ae-kwg-tag available">Saves</span>
+            <span class="ae-kwg-tag available">Reach</span>
+            <span class="ae-kwg-tag unavailable">Watch Time*</span>
+          </div>
+        </div>
+        <div>
+          <div class="ae-kwg-title" style="color:var(--c-blue)">Facebook</div>
+          <div class="ae-kwg-tags">
+            <span class="ae-kwg-tag available">Views</span>
+            <span class="ae-kwg-tag available">Likes</span>
+            <span class="ae-kwg-tag available">Comments</span>
+            <span class="ae-kwg-tag available">Shares</span>
+            <span class="ae-kwg-tag unavailable">Saves*</span>
+            <span class="ae-kwg-tag unavailable">Watch Time*</span>
+          </div>
+        </div>
+      </div>
+      <div class="ae-kwg-note">* Requires Business Account connected. Watch time only in Insights dashboard.</div>
+
+      <a class="ae-key-get-link" href="https://developers.facebook.com/apps/" target="_blank" rel="noopener">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        Get token → Meta Developer Portal
+      </a>
+      <div class="ae-key-steps">
+        <div class="ae-key-step"><span class="ae-step-num">1</span>Create a <strong>Business</strong> app at developers.facebook.com</div>
+        <div class="ae-key-step"><span class="ae-step-num">2</span>Add products: <strong>Instagram Graph API</strong> + <strong>Facebook Graph API</strong></div>
+        <div class="ae-key-step"><span class="ae-step-num">3</span>Go to Tools → <strong>Graph API Explorer</strong></div>
+        <div class="ae-key-step"><span class="ae-step-num">4</span>Generate a User Token with <strong>instagram_basic, pages_read_engagement</strong> permissions</div>
+        <div class="ae-key-step"><span class="ae-step-num">5</span>Paste the token above and hit Save</div>
+      </div>
+    </div>
+
+    <!-- TIKTOK (via Instagram API note) -->
+    <div class="ae-key-block ae-key-block-inactive" data-platform="tiktok">
+      <div class="ae-key-block-header">
+        <div class="ae-key-block-icon" style="--kc:rgba(232,244,253,0.2)">
+          <svg viewBox="0 0 24 24" fill="currentColor" style="opacity:0.35"><path d="M19.59 6.69a4.83 4.83 0 01-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 01-2.88 2.5 2.89 2.89 0 01-2.89-2.89 2.89 2.89 0 012.89-2.89c.28 0 .54.04.79.1V9.01a6.27 6.27 0 00-.79-.05 6.34 6.34 0 00-6.34 6.34 6.34 6.34 0 006.34 6.34 6.34 6.34 0 006.33-6.34V8.69a8.18 8.18 0 004.78 1.52V6.75a4.85 4.85 0 01-1.01-.06z"/></svg>
+        </div>
+        <div class="ae-key-block-info">
+          <div class="ae-key-block-name" style="opacity:0.4">TikTok</div>
+          <div class="ae-key-block-desc" style="opacity:0.35">Available once Instagram is connected — TikTok uses the same Meta cross-posting pipeline</div>
+        </div>
+        <div class="ae-key-block-status">
+          <span class="ae-key-dot" style="background:rgba(255,255,255,0.12)"></span>
+          <span class="ae-key-status-text" style="opacity:0.35">Pending Instagram</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- STATUS SUMMARY -->
+    <div class="ae-keys-summary" id="keys-summary">
+      <div class="ae-summary-title">Connection Status</div>
+      <div class="ae-summary-row">
+        <span class="ae-sum-label">YouTube</span>
+        <span class="ae-sum-val" id="sum-youtube">—</span>
+      </div>
+      <div class="ae-summary-row">
+        <span class="ae-sum-label">Instagram</span>
+        <span class="ae-sum-val" id="sum-instagram">—</span>
+      </div>
+      <div class="ae-summary-row">
+        <span class="ae-sum-label">Facebook</span>
+        <span class="ae-sum-val" id="sum-facebook">—</span>
+      </div>
+    </div>
+
+  </div><!-- /ae-drawer-body -->
+</aside>
 
 <!-- MAIN LAYOUT -->
 <main id="ae-main">
@@ -502,11 +804,22 @@ function attentionEnginePage(): string {
 
       <div class="ae-tab-content active" id="tab-url">
         <div class="ae-field">
-          <label class="ae-label">Video / Post URL</label>
+          <label class="ae-label">Video / Post URL
+            <span class="ae-url-fetch-spinner" id="url-spinner"></span>
+          </label>
           <div class="ae-url-input-wrap">
             <svg class="ae-input-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 13a3 3 0 100-6 3 3 0 000 6z"/><path d="M10 2C5.58 2 2 5.58 2 10s3.58 8 8 8 8-3.58 8-8-3.58-8-8-8z"/></svg>
-            <input type="url" id="content-url" class="ae-input" placeholder="https://www.tiktok.com/@user/video/..."/>
+            <input type="url" id="content-url" class="ae-input" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off"/>
           </div>
+          <!-- Preview strip shown after successful fetch -->
+          <div class="ae-url-preview" id="url-preview">
+            <img class="ae-url-preview-thumb" id="url-thumb" src="" alt=""/>
+            <div class="ae-url-preview-info">
+              <div class="ae-url-preview-title" id="url-preview-title"></div>
+              <div class="ae-url-preview-meta" id="url-preview-meta"></div>
+            </div>
+          </div>
+          <div id="url-fetch-note" style="display:none;font-size:0.68rem;color:var(--ice-dim);margin-top:0.4rem;font-style:italic;line-height:1.5"></div>
         </div>
         <div class="ae-field">
           <label class="ae-label">Hook / Opening Line</label>
