@@ -1,30 +1,24 @@
 /**
- * SPECTRA — Full Cinematic Scroll Engine v2
+ * SPECTRA — Interactive Cinematic Engine v4
  * Pano Marketing Solutions
  *
- * Architecture:
- *   ┌─ One persistent WebGL world (fixed canvas, always rendering)
- *   ├─ GSAP ScrollTrigger → global progress 0→1 drives everything
- *   ├─ Scene 0  HERO       Particles scatter → form SPECTRA logo → camera pushes through
- *   ├─ Scene 1  NEURAL     Floating node network, energy pulses, scroll expands graph
- *   ├─ Scene 2  EXPLODED   Icosahedron assembles → explodes into feature pieces
- *   ├─ Scene 3  DASHBOARD  Floating data orbs, animated metrics, space visualization
- *   └─ Scene 4  PORTAL     Dark convergence, glowing portal, particles collapse inward
+ * Architecture: ONE unified 3D world, scroll-driven scenes,
+ * full bidirectional UI ↔ 3D interactivity.
  *
- *   Performance rules:
- *   - Single draw call per particle system (BufferGeometry + ShaderMaterial)
- *   - Objects hidden when off-screen via .visible flag
- *   - 62fps cap via RAF timestamp gate
- *   - No per-frame heap allocations in hot path
+ * Scene map:
+ *   0  HERO       Particle logo formation, atmospheric entry
+ *   1  SYSTEM     Clickable color-coded node graph ↔ UI tool list
+ *   2  EXPLODE    Icosahedron — hover/rotate, auto-explode/reassemble
+ *   3  METRICS    Floating data orbs, animated count-up
+ *   4  PORTAL     Convergence CTA, DNA collapse
  */
 
 (function () {
   'use strict';
 
-  /* ═══ dependency gate ═══════════════════════════════════════════ */
-  let _depsReady = 0;
-  function onDep() { if (++_depsReady >= 2) boot(); }
-
+  /* ═══ DEPENDENCY GATE ═══════════════════════════════════════════ */
+  let _deps = 0;
+  function onDep() { if (++_deps >= 2) boot(); }
   function waitDeps() {
     const ti = setInterval(() => {
       if (typeof THREE !== 'undefined') { clearInterval(ti); onDep(); }
@@ -38,167 +32,170 @@
     }, 20);
   }
 
-  /* ═══ palette / constants ═══════════════════════════════════════ */
+  /* ═══ TOOL DEFINITIONS ══════════════════════════════════════════ */
+  const TOOLS = [
+    {
+      id: 0, name: 'Attention Engine',
+      short: 'Analyzes video content for engagement drop-offs and attention patterns',
+      color: '#A78BFA', hex: 0xA78BFA, url: '/tools/attention-engine/',
+      nodePos: new THREE.Vector3(0, 2.1, 0.2),
+    },
+    {
+      id: 1, name: 'Video Generator',
+      short: 'AI-powered video creation and composition from raw scripts',
+      color: '#34D399', hex: 0x34D399, url: '/tools/video-generator/',
+      nodePos: new THREE.Vector3(-2.3, 0.5, 0.4),
+    },
+    {
+      id: 2, name: 'Distribution Engine',
+      short: 'Optimal timing and multi-platform content delivery',
+      color: '#60A5FA', hex: 0x60A5FA, url: '/tools/distribution-engine/',
+      nodePos: new THREE.Vector3(-1.5, -1.8, -0.3),
+    },
+    {
+      id: 3, name: 'Motion Engine',
+      short: 'Cinematic AI motion composition and editing system',
+      color: '#FB923C', hex: 0xFB923C, url: '/tools/motion-engine/',
+      nodePos: new THREE.Vector3(1.5, -1.8, 0.3),
+    },
+    {
+      id: 4, name: 'Persona Engine',
+      short: 'Adaptive brand voice and audience intelligence modeling',
+      color: '#F87171', hex: 0xF87171, url: '/tools/persona-engine/',
+      nodePos: new THREE.Vector3(2.3, 0.5, -0.4),
+    },
+  ];
+
+  /* ═══ PALETTE ═══════════════════════════════════════════════════ */
   const PAL = {
     BG:     0x060810,
     GLOW:   new THREE.Color(0xA8D8F0),
     ACCENT: new THREE.Color(0x7BB8D4),
-    CREAM:  new THREE.Color(0xF5F0E8),
     ICE:    new THREE.Color(0xE8F4FD),
+    CREAM:  new THREE.Color(0xF5F0E8),
     DEEP:   new THREE.Color(0x1A3A5C),
-    GREEN:  new THREE.Color(0x64DC96),
   };
 
-  const N_MAIN   = 8000;  // hero/morph particle count
-  const N_AMB    = 2500;  // ambient bg particles
-  const N_DUST   = 1200;  // per-scene dust
+  const N_MAIN = 8000;
+  const N_AMB  = 2400;
 
-  /* ═══ world globals ═════════════════════════════════════════════ */
-  let scene, camera, renderer, clock;
-  let mouse   = { x: 0, y: 0 };
+  /* ═══ WORLD STATE ════════════════════════════════════════════════ */
+  let scene, camera, renderer, clock, raycaster;
+  let mouse = { x: 0, y: 0 }, mouseNDC = new THREE.Vector2();
   let mouseEased = { x: 0, y: 0 };
+  let activeScene = -1;
+  let selectedTool = -1;
+  let hoveredNode  = -1;
+  let hoveredFrag  = -1;
 
-  // particle systems
-  let mainParticles, ambParticles, dustParticles;
+  // particles
+  let mainParticles, ambParticles;
   let morphFrom, morphTarget, morphTween = null;
 
   // scene groups
-  let nodeGroup, icoGroup, dashGroup, portalGroup;
+  let nodeGroup, nodeObjects = [], nodeLines = [];
+  let icoGroup, icoPieces = [], icoCore, icoWire;
+  let dashGroup;
+  let portalGroup;
 
-  // icosahedron pieces for explode
-  let icoPieces = [];
-
-  // energy line mesh (scene 1)
-  let energyLines;
-
-  // scrolled progress 0→1
-  let scrollProgress = 0;
-  let activeScene    = -1;
+  // morph shape cache
+  let pos_logo, pos_sphere, pos_torus, pos_wave, pos_dna, pos_scatter;
 
   // camera spring
   const camTarget = new THREE.Vector3(0, 0, 6.5);
-  const camLookAt = new THREE.Vector3(0, 0, 0);
-  const camLookAtTarget = new THREE.Vector3(0, 0, 0);
+  const camLook   = new THREE.Vector3(0, 0, 0);
+  let camLocked   = false;
 
-  // pre-built morph targets
-  let pos_logo, pos_sphere, pos_torus, pos_wave, pos_dna, pos_scatter;
-
-  /* ═══ camera waypoints ══════════════════════════════════════════ */
-  const CAM_WP = [
-    // scene 0 — hero: straight on
-    { pos: new THREE.Vector3(0,    0,    6.5),  look: new THREE.Vector3(0,   0,   0),    fov: 58 },
-    // scene 1 — neural: slight left tilt
-    { pos: new THREE.Vector3(-1.8, 0.4,  5.8),  look: new THREE.Vector3(0.3, 0,   0),    fov: 60 },
-    // scene 2 — exploded: closer, angled
-    { pos: new THREE.Vector3(1.6, -0.3,  5.0),  look: new THREE.Vector3(-0.2,0.1, 0),    fov: 62 },
-    // scene 3 — dashboard: elevated
-    { pos: new THREE.Vector3(0,    1.0,  6.2),  look: new THREE.Vector3(0,  -0.2, 0),    fov: 56 },
-    // scene 4 — portal: centered, compressed
-    { pos: new THREE.Vector3(0,    0,    4.8),  look: new THREE.Vector3(0,   0,   0),    fov: 54 },
+  /* ═══ CAMERA WAYPOINTS ══════════════════════════════════════════ */
+  const CAM = [
+    { pos: new THREE.Vector3(0,    0,    6.5), look: new THREE.Vector3(0,   0,    0),  fov: 58 },
+    { pos: new THREE.Vector3(-1.4, 0.3,  5.8), look: new THREE.Vector3(0.2, 0,    0),  fov: 60 },
+    { pos: new THREE.Vector3(1.2, -0.2,  5.2), look: new THREE.Vector3(-0.1,0.1,  0),  fov: 62 },
+    { pos: new THREE.Vector3(0,    0.8,  6.2), look: new THREE.Vector3(0,  -0.2,  0),  fov: 56 },
+    { pos: new THREE.Vector3(0,    0,    4.8), look: new THREE.Vector3(0,   0,    0),  fov: 54 },
   ];
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  BOOT                                                           */
-  /* ═══════════════════════════════════════════════════════════════ */
+  /* ═══ BOOT ═══════════════════════════════════════════════════════ */
   function boot() {
     initRenderer();
     buildMorphShapes();
     buildMainParticles();
     buildAmbParticles();
-    buildDustParticles();
-    buildNodeNetwork();
+    buildNodeSystem();
     buildIcoSystem();
-    buildDashGroup();
+    buildDashSystem();
     buildPortalSystem();
     bindEvents();
     runLoader();
     RAF();
   }
 
-  /* ─── renderer ──────────────────────────────────────────────── */
+  /* ─── RENDERER ───────────────────────────────────────────────── */
   function initRenderer() {
     const canvas = document.getElementById('world-canvas');
-
     scene = new THREE.Scene();
     scene.background = new THREE.Color(PAL.BG);
-    scene.fog = new THREE.FogExp2(PAL.BG, 0.024);
+    scene.fog = new THREE.FogExp2(0x060810, 0.024);
 
     camera = new THREE.PerspectiveCamera(58, innerWidth / innerHeight, 0.05, 200);
-    camera.position.copy(CAM_WP[0].pos);
+    camera.position.copy(CAM[0].pos);
 
-    renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: 'high-performance' });
+    renderer = new THREE.WebGLRenderer({
+      canvas, antialias: true, alpha: false,
+      powerPreference: 'high-performance'
+    });
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.setSize(innerWidth, innerHeight);
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.15;
+    renderer.toneMappingExposure = 1.18;
 
+    raycaster = new THREE.Raycaster();
+    raycaster.params.Points.threshold = 0.12;
     clock = new THREE.Clock();
 
-    // lighting rig
-    const pl1 = new THREE.PointLight(0xA8D8F0, 2.2, 22);
-    pl1.position.set(3, 5, 4);
-    scene.add(pl1);
-
-    const pl2 = new THREE.PointLight(0x3A6A9A, 1.4, 16);
-    pl2.position.set(-5, -3, 2);
-    scene.add(pl2);
-
-    const pl3 = new THREE.PointLight(0xF5F0E8, 0.6, 10);
-    pl3.position.set(0, 0, 8);
-    scene.add(pl3);
-
-    scene.add(new THREE.AmbientLight(0x1a2a3a, 1.8));
+    // Lighting rig
+    const pl1 = new THREE.PointLight(0xA8D8F0, 2.4, 24); pl1.position.set(3, 5, 4);
+    const pl2 = new THREE.PointLight(0x3A6A9A, 1.5, 18); pl2.position.set(-5, -3, 2);
+    const pl3 = new THREE.PointLight(0xF5F0E8, 0.6, 12); pl3.position.set(0, 0, 8);
+    scene.add(pl1, pl2, pl3);
+    scene.add(new THREE.AmbientLight(0x1a2a3a, 1.9));
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  PARTICLE SHADER (shared)                                       */
-  /* ═══════════════════════════════════════════════════════════════ */
-  function makeParticleMat(sizeBoost = 1.0, opacity = 1.0) {
+  /* ─── SHARED PARTICLE MATERIAL ──────────────────────────────── */
+  function makeParticleMat(boost = 1.0, opacity = 1.0) {
     return new THREE.ShaderMaterial({
-      uniforms: {
-        uOpacity: { value: opacity },
-        uTime:    { value: 0 },
-      },
+      uniforms: { uOpacity: { value: opacity }, uTime: { value: 0 } },
       vertexShader: `
         attribute float pSize;
         attribute vec3  pCol;
         varying   vec3  vCol;
         varying   float vAlpha;
-        uniform   float uTime;
         void main(){
           vCol = pCol;
           vec4 mv = modelViewMatrix * vec4(position,1.0);
-          float size = pSize * ${(sizeBoost * 420.0).toFixed(1)} / (-mv.z);
-          gl_PointSize = max(size, 0.5);
+          gl_PointSize = max(pSize * ${(boost*420).toFixed(1)} / (-mv.z), 0.5);
           vAlpha = clamp(1.0 + mv.z * 0.06, 0.15, 1.0);
           gl_Position = projectionMatrix * mv;
-        }
-      `,
+        }`,
       fragmentShader: `
         varying vec3  vCol;
         varying float vAlpha;
         uniform float uOpacity;
         void main(){
-          vec2  uv = gl_PointCoord - 0.5;
-          float d  = length(uv);
+          vec2 uv = gl_PointCoord - 0.5;
+          float d = length(uv);
           if(d > 0.5) discard;
           float a = smoothstep(0.5, 0.0, d);
-          float g = smoothstep(0.5, 0.0, d * 0.6);
-          vec3  c = mix(vCol * 0.5, vCol * 1.3, g);
-          gl_FragColor = vec4(c, a * vAlpha * uOpacity * 0.92);
-        }
-      `,
-      transparent: true,
-      depthWrite:  false,
-      blending:    THREE.AdditiveBlending,
+          float g = smoothstep(0.5, 0.0, d * 0.52);
+          gl_FragColor = vec4(mix(vCol*0.45, vCol*1.5, g), a * vAlpha * uOpacity * 0.92);
+        }`,
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
     });
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  MORPH SHAPE BUILDERS                                           */
-  /* ═══════════════════════════════════════════════════════════════ */
+  /* ═══ MORPH SHAPES ══════════════════════════════════════════════ */
   function buildMorphShapes() {
-    pos_logo    = buildLogoPositions(N_MAIN);
+    pos_logo    = buildLogoPos(N_MAIN);
     pos_sphere  = buildFibSphere(N_MAIN, 2.1);
     pos_torus   = buildTorusKnot(N_MAIN);
     pos_wave    = buildWaveGrid(N_MAIN);
@@ -206,7 +203,6 @@
     pos_scatter = buildScatter(N_MAIN, 14);
   }
 
-  /* ── SPECTRA logo in particle-bitmap space ─────────────────── */
   const GLYPHS = {
     S:[[0,1,1,0],[1,0,0,0],[0,1,1,0],[0,0,0,1],[1,1,1,0]],
     P:[[1,1,1,0],[1,0,0,1],[1,1,1,0],[1,0,0,0],[1,0,0,0]],
@@ -217,31 +213,24 @@
     A:[[0,1,1,0],[1,0,0,1],[1,1,1,1],[1,0,0,1],[1,0,0,1]],
   };
 
-  function buildLogoPositions(N) {
+  function buildLogoPos(N) {
     const word = ['S','P','E','C','T','R','A'];
-    const step = 0.82;
-    const startX = -(word.length - 1) * step * 0.5;
+    const step = 0.82, startX = -(word.length - 1) * step * 0.5;
     const ppt = Math.floor(N / word.length);
     const pts = [];
-
     word.forEach((ch, wi) => {
-      const grid = GLYPHS[ch];
-      const ox = startX + wi * step;
+      const grid = GLYPHS[ch], ox = startX + wi * step;
       const cells = [];
       grid.forEach((row, r) => row.forEach((on, c) => { if (on) cells.push([c, 4 - r]); }));
       const pp = Math.ceil(ppt / cells.length);
       cells.forEach(([cx, ry]) => {
-        for (let k = 0; k < pp; k++) {
-          pts.push(
-            ox + (cx / 3) * 0.52 + (Math.random() - 0.5) * 0.055,
-            (ry / 4) * 0.65 - 0.32 + (Math.random() - 0.5) * 0.055,
-            (Math.random() - 0.5) * 0.14
-          );
-        }
+        for (let k = 0; k < pp; k++) pts.push(
+          ox + (cx / 3) * 0.52 + (Math.random() - 0.5) * 0.055,
+          (ry / 4) * 0.65 - 0.32 + (Math.random() - 0.5) * 0.055,
+          (Math.random() - 0.5) * 0.14
+        );
       });
     });
-
-    // pad to N
     while (pts.length < N * 3) pts.push(
       (Math.random() - 0.5) * 4,
       (Math.random() - 0.5) * 0.8,
@@ -253,10 +242,8 @@
   function buildFibSphere(N, r) {
     const pts = [], phi = Math.PI * (3 - Math.sqrt(5));
     for (let i = 0; i < N; i++) {
-      const y = 1 - (i / (N - 1)) * 2;
-      const rad = Math.sqrt(1 - y * y);
-      const th  = phi * i;
-      const s   = r * (0.96 + Math.random() * 0.08);
+      const y = 1 - (i / (N - 1)) * 2, rad = Math.sqrt(1 - y * y);
+      const th = phi * i, s = r * (0.95 + Math.random() * 0.10);
       pts.push(Math.cos(th) * rad * s, y * s, Math.sin(th) * rad * s);
     }
     return new Float32Array(pts);
@@ -264,8 +251,7 @@
 
   function buildTorusKnot(N) {
     const geo = new THREE.TorusKnotGeometry(1.6, 0.46, 400, 28, 2, 3);
-    const v = geo.attributes.position.array, vc = v.length / 3;
-    const pts = [];
+    const v = geo.attributes.position.array, vc = v.length / 3, pts = [];
     for (let i = 0; i < N; i++) {
       const idx = Math.floor(Math.random() * vc) * 3;
       pts.push(
@@ -282,8 +268,7 @@
     const pts = [], s = Math.ceil(Math.sqrt(N));
     for (let i = 0; i < N; i++) {
       const col = i % s, row = Math.floor(i / s);
-      const x = (col / s - 0.5) * 5.8;
-      const z = (row / s - 0.5) * 3.6;
+      const x = (col / s - 0.5) * 5.8, z = (row / s - 0.5) * 3.6;
       const y = Math.sin(x * 1.4 + 0.3) * 0.55
               + Math.sin(x * 3.1 - 0.8) * 0.28
               + Math.cos(z * 1.1 + x * 0.4) * 0.22
@@ -294,25 +279,14 @@
   }
 
   function buildDNA(N) {
-    const pts = [];
-    const half = Math.floor(N * 0.47);
+    const pts = [], half = Math.floor(N * 0.47);
     for (let i = 0; i < half; i++) {
-      const t = (i / half) * Math.PI * 8;
-      const y = (i / half - 0.5) * 4.8;
-      pts.push(
-        Math.cos(t) * 1.25 + (Math.random() - 0.5) * 0.05,
-        y,
-        Math.sin(t) * 1.25 + (Math.random() - 0.5) * 0.05
-      );
+      const t = (i / half) * Math.PI * 8, y = (i / half - 0.5) * 4.8;
+      pts.push(Math.cos(t) * 1.25 + (Math.random() - 0.5) * 0.05, y, Math.sin(t) * 1.25 + (Math.random() - 0.5) * 0.05);
     }
     for (let i = 0; i < N - half; i++) {
-      const t = (i / (N - half)) * Math.PI * 8 + Math.PI;
-      const y = (i / (N - half) - 0.5) * 4.8;
-      pts.push(
-        Math.cos(t) * 1.25 + (Math.random() - 0.5) * 0.05,
-        y,
-        Math.sin(t) * 1.25 + (Math.random() - 0.5) * 0.05
-      );
+      const t = (i / (N - half)) * Math.PI * 8 + Math.PI, y = (i / (N - half) - 0.5) * 4.8;
+      pts.push(Math.cos(t) * 1.25 + (Math.random() - 0.5) * 0.05, y, Math.sin(t) * 1.25 + (Math.random() - 0.5) * 0.05);
     }
     while (pts.length < N * 3) pts.push((Math.random() - 0.5) * 0.5, (Math.random() - 0.5) * 4.5, 0);
     return new Float32Array(pts.slice(0, N * 3));
@@ -324,740 +298,740 @@
     return pts;
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  MAIN PARTICLE SYSTEM                                           */
-  /* ═══════════════════════════════════════════════════════════════ */
+  /* ═══ MAIN PARTICLES ════════════════════════════════════════════ */
   function buildMainParticles() {
     const sizes  = new Float32Array(N_MAIN);
     const colors = new Float32Array(N_MAIN * 3);
-
     for (let i = 0; i < N_MAIN; i++) {
       sizes[i] = 0.018 + Math.random() * 0.016;
       const t = Math.random();
       let c;
       if      (t < 0.40) c = PAL.GLOW.clone().lerp(PAL.ACCENT, t * 2.5);
-      else if (t < 0.72) c = PAL.ACCENT.clone().lerp(PAL.ICE,  (t - 0.40) * 3.1);
-      else               c = PAL.ICE.clone().lerp(PAL.CREAM,   (t - 0.72) * 3.6);
-      colors[i * 3]     = c.r;
-      colors[i * 3 + 1] = c.g;
-      colors[i * 3 + 2] = c.b;
+      else if (t < 0.72) c = PAL.ACCENT.clone().lerp(PAL.ICE, (t - 0.40) * 3.1);
+      else               c = PAL.ICE.clone().lerp(PAL.CREAM, (t - 0.72) * 3.6);
+      colors[i*3] = c.r; colors[i*3+1] = c.g; colors[i*3+2] = c.b;
     }
-
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(pos_scatter.slice(), 3));
     geo.setAttribute('pSize',    new THREE.BufferAttribute(sizes, 1));
     geo.setAttribute('pCol',     new THREE.BufferAttribute(colors, 3));
-
     mainParticles = new THREE.Points(geo, makeParticleMat(1.0, 1.0));
     mainParticles.frustumCulled = false;
     scene.add(mainParticles);
-
     morphFrom   = pos_scatter.slice();
     morphTarget = pos_logo;
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  AMBIENT + DUST PARTICLES                                       */
-  /* ═══════════════════════════════════════════════════════════════ */
   function buildAmbParticles() {
-    const pos = new Float32Array(N_AMB * 3);
-    const sz  = new Float32Array(N_AMB);
-    const col = new Float32Array(N_AMB * 3);
-    for (let i = 0; i < N_AMB; i++) {
-      pos[i*3]   = (Math.random() - 0.5) * 32;
-      pos[i*3+1] = (Math.random() - 0.5) * 22;
-      pos[i*3+2] = (Math.random() - 0.5) * 24 - 5;
-      sz[i] = 0.005 + Math.random() * 0.009;
-      const c = PAL.ACCENT.clone().lerp(PAL.DEEP, Math.random() * 0.75);
+    const N = N_AMB;
+    const pos = new Float32Array(N * 3);
+    const sz  = new Float32Array(N);
+    const col = new Float32Array(N * 3);
+    for (let i = 0; i < N; i++) {
+      pos[i*3]   = (Math.random() - 0.5) * 34;
+      pos[i*3+1] = (Math.random() - 0.5) * 24;
+      pos[i*3+2] = (Math.random() - 0.5) * 26 - 5;
+      sz[i] = 0.004 + Math.random() * 0.009;
+      const c = PAL.ACCENT.clone().lerp(PAL.DEEP, Math.random() * 0.80);
       col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
     }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     geo.setAttribute('pSize',    new THREE.BufferAttribute(sz, 1));
     geo.setAttribute('pCol',     new THREE.BufferAttribute(col, 3));
-    ambParticles = new THREE.Points(geo, makeParticleMat(0.5, 0.65));
+    ambParticles = new THREE.Points(geo, makeParticleMat(0.5, 0.50));
     ambParticles.frustumCulled = false;
     scene.add(ambParticles);
   }
 
-  function buildDustParticles() {
-    const pos = new Float32Array(N_DUST * 3);
-    const sz  = new Float32Array(N_DUST);
-    const col = new Float32Array(N_DUST * 3);
-    for (let i = 0; i < N_DUST; i++) {
-      pos[i*3]   = (Math.random() - 0.5) * 18;
-      pos[i*3+1] = (Math.random() - 0.5) * 12;
-      pos[i*3+2] = (Math.random() - 0.5) * 6;
-      sz[i] = 0.003 + Math.random() * 0.005;
-      const c = PAL.GLOW.clone().lerp(PAL.ICE, Math.random());
-      col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
-    }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    geo.setAttribute('pSize',    new THREE.BufferAttribute(sz, 1));
-    geo.setAttribute('pCol',     new THREE.BufferAttribute(col, 3));
-    dustParticles = new THREE.Points(geo, makeParticleMat(0.4, 0.4));
-    dustParticles.frustumCulled = false;
-    scene.add(dustParticles);
-  }
-
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  SCENE 1 — NEURAL NODE NETWORK                                 */
-  /* ═══════════════════════════════════════════════════════════════ */
-  function buildNodeNetwork() {
+  /* ═══ SCENE 1 — INTERACTIVE NODE GRAPH ═════════════════════════ */
+  function buildNodeSystem() {
     nodeGroup = new THREE.Group();
     nodeGroup.visible = false;
     scene.add(nodeGroup);
 
-    const nodePos = [
-      new THREE.Vector3( 0,    2.2,   0),
-      new THREE.Vector3(-2.4,  0.5,   0.4),
-      new THREE.Vector3(-1.5, -1.8,  -0.2),
-      new THREE.Vector3( 1.5, -1.8,   0.3),
-      new THREE.Vector3( 2.4,  0.5,  -0.4),
-      new THREE.Vector3( 0,    0,     0.6),  // center hub
-    ];
+    // Hub
+    const hubGeo = new THREE.SphereGeometry(0.26, 28, 28);
+    const hubMat = new THREE.MeshStandardMaterial({
+      color: 0xE8F4FD, emissive: 0xA8D8F0, emissiveIntensity: 1.6,
+      transparent: true, opacity: 0.96, roughness: 0.08, metalness: 0.45,
+    });
+    const hub = new THREE.Mesh(hubGeo, hubMat);
+    hub.position.set(0, 0, 0.5);
+    hub.userData = { isHub: true };
+    nodeGroup.add(hub);
 
-    // outer orbit rings per node
-    nodePos.forEach((pos, idx) => {
-      const isCentral = idx === 5;
-      const r = isCentral ? 0.28 : idx === 0 ? 0.20 : 0.13;
+    // hub halo (flat ring)
+    const haloGeo = new THREE.RingGeometry(0.40, 0.56, 48);
+    const haloMat = new THREE.MeshBasicMaterial({
+      color: 0xA8D8F0, transparent: true, opacity: 0.14,
+      blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+    });
+    const hubHalo = new THREE.Mesh(haloGeo, haloMat);
+    hubHalo.position.copy(hub.position);
+    hubHalo.userData = { isHubHalo: true };
+    nodeGroup.add(hubHalo);
 
-      // core sphere
-      const sg  = new THREE.SphereGeometry(r, 20, 20);
-      const sm  = new THREE.MeshStandardMaterial({
-        color:           isCentral ? 0xE8F4FD : 0x7BB8D4,
-        emissive:        isCentral ? 0xA8D8F0 : 0x3A6A8A,
-        emissiveIntensity: isCentral ? 1.8 : 0.9,
-        transparent: true,
-        opacity: 0.95,
-        roughness: 0.1,
-        metalness: 0.3,
+    // second outer halo (bigger, fainter)
+    const halo2 = new THREE.Mesh(
+      new THREE.RingGeometry(0.60, 0.72, 48),
+      new THREE.MeshBasicMaterial({
+        color: 0xA8D8F0, transparent: true, opacity: 0.06,
+        blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+      })
+    );
+    halo2.position.copy(hub.position);
+    halo2.userData = { isHubHalo2: true };
+    nodeGroup.add(halo2);
+
+    // Tool nodes + lines
+    nodeObjects = [];
+    nodeLines   = [];
+
+    TOOLS.forEach((tool, i) => {
+      // energy line hub → node
+      const linePts = [hub.position.clone(), tool.nodePos.clone()];
+      const lineGeo = new THREE.BufferGeometry().setFromPoints(linePts);
+      const lineMat = new THREE.LineBasicMaterial({
+        color: tool.hex, transparent: true, opacity: 0.22,
+        blending: THREE.AdditiveBlending,
+      });
+      const line = new THREE.Line(lineGeo, lineMat);
+      line.userData = { isLine: true, toolId: i };
+      nodeGroup.add(line);
+      nodeLines.push(line);
+
+      // node sphere
+      const sg = new THREE.SphereGeometry(0.17, 22, 22);
+      const sm = new THREE.MeshStandardMaterial({
+        color: tool.hex, emissive: tool.hex, emissiveIntensity: 0.85,
+        transparent: true, opacity: 0.96,
+        roughness: 0.12, metalness: 0.35,
       });
       const mesh = new THREE.Mesh(sg, sm);
-      mesh.position.copy(pos);
+      mesh.position.copy(tool.nodePos);
       mesh.scale.setScalar(0);
-      mesh.userData = { baseScale: 1.0, idx, isCentral, basePos: pos.clone() };
+      mesh.userData = { isNode: true, toolId: i };
       nodeGroup.add(mesh);
+      nodeObjects.push(mesh);
 
-      // glow halo
-      const rg = new THREE.RingGeometry(r * 1.7, r * 2.5, 36);
-      const rm = new THREE.MeshBasicMaterial({
-        color: isCentral ? 0xA8D8F0 : 0x7BB8D4,
-        transparent: true,
-        opacity: isCentral ? 0.18 : 0.10,
-        blending: THREE.AdditiveBlending,
-        side: THREE.DoubleSide,
+      // outer glow ring
+      const rg  = new THREE.RingGeometry(0.24, 0.36, 40);
+      const rm  = new THREE.MeshBasicMaterial({
+        color: tool.hex, transparent: true, opacity: 0.14,
+        blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
       });
-      const halo = new THREE.Mesh(rg, rm);
-      halo.position.copy(pos);
-      halo.userData = { isHalo: true };
-      nodeGroup.add(halo);
+      const ring = new THREE.Mesh(rg, rm);
+      ring.position.copy(tool.nodePos);
+      ring.userData = { isNodeRing: true, toolId: i };
+      nodeGroup.add(ring);
     });
-
-    // energy lines (all pairs)
-    const linePts = [];
-    for (let i = 0; i < nodePos.length; i++) {
-      for (let j = i + 1; j < nodePos.length; j++) {
-        linePts.push(nodePos[i].x, nodePos[i].y, nodePos[i].z);
-        linePts.push(nodePos[j].x, nodePos[j].y, nodePos[j].z);
-      }
-    }
-    const lgeo = new THREE.BufferGeometry();
-    lgeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(linePts), 3));
-    energyLines = new THREE.LineSegments(lgeo, new THREE.LineBasicMaterial({
-      color: 0x7BB8D4,
-      transparent: true,
-      opacity: 0.18,
-      blending: THREE.AdditiveBlending,
-    }));
-    energyLines.userData = { baseOpacity: 0.18 };
-    nodeGroup.add(energyLines);
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  SCENE 2 — ICOSAHEDRON EXPLODE                                 */
-  /* ═══════════════════════════════════════════════════════════════ */
+  /* ═══ SCENE 2 — CONTAINED ICO SYSTEM ═══════════════════════════ */
   function buildIcoSystem() {
     icoGroup = new THREE.Group();
     icoGroup.visible = false;
     scene.add(icoGroup);
 
-    // central icosahedron (wireframe)
-    const ig = new THREE.IcosahedronGeometry(1.4, 1);
+    const icoGeo = new THREE.IcosahedronGeometry(1.38, 1);
 
-    // solid inner
-    const solidMat = new THREE.MeshStandardMaterial({
-      color: 0x7BB8D4,
-      emissive: 0x3A6A8A,
-      emissiveIntensity: 0.7,
-      transparent: true,
-      opacity: 0.12,
-      wireframe: false,
-      roughness: 0.3,
-      metalness: 0.6,
-    });
-    const solid = new THREE.Mesh(ig, solidMat);
-    solid.userData = { isCore: true };
-    icoGroup.add(solid);
+    icoCore = new THREE.Mesh(icoGeo, new THREE.MeshStandardMaterial({
+      color: 0x7BB8D4, emissive: 0x3A6A8A, emissiveIntensity: 0.75,
+      transparent: true, opacity: 0.10, roughness: 0.28, metalness: 0.65,
+    }));
+    icoCore.userData = { isCore: true };
+    icoGroup.add(icoCore);
 
-    // wireframe overlay
-    const wireMat = new THREE.MeshBasicMaterial({
-      color: 0xA8D8F0,
-      wireframe: true,
-      transparent: true,
-      opacity: 0.4,
+    icoWire = new THREE.Mesh(icoGeo.clone(), new THREE.MeshBasicMaterial({
+      color: 0xA8D8F0, wireframe: true, transparent: true, opacity: 0.38,
       blending: THREE.AdditiveBlending,
-    });
-    const wire = new THREE.Mesh(ig.clone(), wireMat);
-    wire.userData = { isWire: true };
-    icoGroup.add(wire);
+    }));
+    icoWire.userData = { isWire: true };
+    icoGroup.add(icoWire);
 
-    // 6 explodable feature pieces (small icosahedra that fly out)
-    const featureColors = [0xA8D8F0, 0x64DC96, 0xF5F0E8, 0x7BB8D4, 0xE8F4FD, 0x3A9AD9];
-    const featureAxes = [
-      new THREE.Vector3( 1,  1,  0).normalize(),
-      new THREE.Vector3(-1,  1,  0).normalize(),
-      new THREE.Vector3( 0,  1,  1).normalize(),
-      new THREE.Vector3( 0, -1,  1).normalize(),
-      new THREE.Vector3( 1, -1,  0).normalize(),
-      new THREE.Vector3(-1, -1,  0).normalize(),
+    const featureData = [
+      { col: 0xA78BFA, axis: new THREE.Vector3(1,   1,  0).normalize() },
+      { col: 0x34D399, axis: new THREE.Vector3(-1,  1,  0).normalize() },
+      { col: 0x60A5FA, axis: new THREE.Vector3(0,   1,  1).normalize() },
+      { col: 0xFB923C, axis: new THREE.Vector3(0,  -1,  1).normalize() },
+      { col: 0xF87171, axis: new THREE.Vector3(1,  -1,  0).normalize() },
+      { col: 0xA8D8F0, axis: new THREE.Vector3(-1, -1,  0).normalize() },
     ];
 
     icoPieces = [];
-    featureColors.forEach((col, i) => {
-      const pg   = new THREE.IcosahedronGeometry(0.22, 0);
-      const pm   = new THREE.MeshStandardMaterial({
-        color: col,
-        emissive: col,
-        emissiveIntensity: 1.0,
-        transparent: true,
-        opacity: 0.9,
-        roughness: 0.2,
-        metalness: 0.4,
+    featureData.forEach(({ col, axis }, i) => {
+      const pg = new THREE.IcosahedronGeometry(0.21, 0);
+      const pm = new THREE.MeshStandardMaterial({
+        color: col, emissive: col, emissiveIntensity: 1.05,
+        transparent: true, opacity: 0.92,
+        roughness: 0.18, metalness: 0.42,
       });
-      const piece = new THREE.Mesh(pg, pm);
-      piece.position.copy(featureAxes[i].clone().multiplyScalar(0.1));
-      piece.scale.setScalar(0);
-      piece.userData = {
-        axis: featureAxes[i],
-        explodeDist: 2.6 + Math.random() * 0.8,
-        homePos: piece.position.clone(),
+      const p = new THREE.Mesh(pg, pm);
+      p.position.copy(axis.clone().multiplyScalar(0.1));
+      p.scale.setScalar(0);
+      p.userData = {
+        axis,
+        maxDist: 2.05 + Math.random() * 0.38,
         rotSpeed: new THREE.Vector3(
-          (Math.random() - 0.5) * 2,
-          (Math.random() - 0.5) * 2,
-          (Math.random() - 0.5) * 2
+          (Math.random() - 0.5) * 2.2,
+          (Math.random() - 0.5) * 2.2,
+          (Math.random() - 0.5) * 2.2
         ),
       };
-      icoPieces.push(piece);
-      icoGroup.add(piece);
+      icoPieces.push(p);
+      icoGroup.add(p);
     });
+
+    // boundary ring
+    const bRing = new THREE.TorusGeometry(2.65, 0.005, 6, 80);
+    icoGroup.add(new THREE.Mesh(bRing, new THREE.MeshBasicMaterial({
+      color: 0x7BB8D4, transparent: true, opacity: 0.05,
+      blending: THREE.AdditiveBlending,
+    })));
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  SCENE 3 — FLOATING DASHBOARDS                                  */
-  /* ═══════════════════════════════════════════════════════════════ */
-  function buildDashGroup() {
+  /* ═══ SCENE 3 — DATA ORB SYSTEM ════════════════════════════════ */
+  function buildDashSystem() {
     dashGroup = new THREE.Group();
     dashGroup.visible = false;
     scene.add(dashGroup);
 
-    // 4 wireframe data orbs in 3D space
     const orbData = [
-      { r: 0.58, pos: new THREE.Vector3(-2.4,  1.0,  0.2), spd: 0.38 },
-      { r: 0.42, pos: new THREE.Vector3(-0.8, -0.7,  0.5), spd: 0.55 },
-      { r: 0.68, pos: new THREE.Vector3( 1.1,  0.9, -0.4), spd: 0.30 },
-      { r: 0.44, pos: new THREE.Vector3( 2.5, -0.4,  0.1), spd: 0.48 },
+      { r: 0.55, pos: new THREE.Vector3(-2.2,  0.9,  0.2), spd: 0.38 },
+      { r: 0.40, pos: new THREE.Vector3(-0.7, -0.6,  0.5), spd: 0.55 },
+      { r: 0.65, pos: new THREE.Vector3( 1.0,  0.9, -0.4), spd: 0.30 },
+      { r: 0.42, pos: new THREE.Vector3( 2.4, -0.4,  0.1), spd: 0.48 },
     ];
 
     orbData.forEach(({ r, pos, spd }) => {
-      // outer wireframe sphere
       const og  = new THREE.SphereGeometry(r, 18, 18);
-      const om  = new THREE.MeshStandardMaterial({
-        color: 0x7BB8D4, emissive: 0x3A6A8A, emissiveIntensity: 0.5,
-        transparent: true, opacity: 0.12, wireframe: true,
-      });
-      const orb = new THREE.Mesh(og, om);
-      orb.position.copy(pos);
-      orb.scale.setScalar(0);
+      const orb = new THREE.Mesh(og, new THREE.MeshStandardMaterial({
+        color: 0x7BB8D4, emissive: 0x3A6A8A, emissiveIntensity: 0.55,
+        transparent: true, opacity: 0.13, wireframe: true,
+      }));
+      orb.position.copy(pos); orb.scale.setScalar(0);
       orb.userData = { basePos: pos.clone(), spd };
       dashGroup.add(orb);
 
-      // inner glow core
-      const cg  = new THREE.SphereGeometry(r * 0.3, 12, 12);
-      const cm  = new THREE.MeshStandardMaterial({
-        color: 0xA8D8F0, emissive: 0xA8D8F0, emissiveIntensity: 2.0,
-        transparent: true, opacity: 0.85,
-      });
-      const core = new THREE.Mesh(cg, cm);
-      core.position.copy(pos);
-      core.scale.setScalar(0);
+      const cg   = new THREE.SphereGeometry(r * 0.28, 12, 12);
+      const core = new THREE.Mesh(cg, new THREE.MeshStandardMaterial({
+        color: 0xA8D8F0, emissive: 0xA8D8F0, emissiveIntensity: 2.4,
+        transparent: true, opacity: 0.88,
+      }));
+      core.position.copy(pos); core.scale.setScalar(0);
       core.userData = { basePos: pos.clone(), spd, isCore: true };
       dashGroup.add(core);
 
-      // orbit ring
-      const rg  = new THREE.TorusGeometry(r * 1.4, 0.008, 6, 60);
-      const rm  = new THREE.MeshBasicMaterial({
+      const rg   = new THREE.TorusGeometry(r * 1.42, 0.007, 6, 64);
+      const ring = new THREE.Mesh(rg, new THREE.MeshBasicMaterial({
         color: 0x7BB8D4, transparent: true, opacity: 0.22,
         blending: THREE.AdditiveBlending,
-      });
-      const ring = new THREE.Mesh(rg, rm);
-      ring.position.copy(pos);
+      }));
+      ring.position.copy(pos); ring.scale.setScalar(0);
       ring.rotation.x = Math.random() * Math.PI;
       ring.rotation.z = Math.random() * Math.PI;
-      ring.scale.setScalar(0);
       ring.userData = { basePos: pos.clone(), spd, isRing: true, rotAx: Math.random() > 0.5 ? 'y' : 'z' };
       dashGroup.add(ring);
     });
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  SCENE 4 — PORTAL                                               */
-  /* ═══════════════════════════════════════════════════════════════ */
+  /* ═══ SCENE 4 — PORTAL ══════════════════════════════════════════ */
   function buildPortalSystem() {
     portalGroup = new THREE.Group();
     portalGroup.visible = false;
     scene.add(portalGroup);
 
-    // concentric rotating rings
     for (let i = 0; i < 7; i++) {
-      const r    = 0.8 + i * 0.38;
-      const geo  = new THREE.TorusGeometry(r, 0.012, 8, 90);
-      const mat  = new THREE.MeshBasicMaterial({
+      const r   = 0.82 + i * 0.40;
+      const geo = new THREE.TorusGeometry(r, 0.012, 8, 96);
+      const mat = new THREE.MeshBasicMaterial({
         color: i < 3 ? 0xA8D8F0 : 0x7BB8D4,
         transparent: true,
-        opacity: Math.max(0.06, 0.42 - i * 0.055),
+        opacity: Math.max(0.05, 0.44 - i * 0.055),
         blending: THREE.AdditiveBlending,
       });
       const ring = new THREE.Mesh(geo, mat);
       ring.rotation.x = Math.PI / 2 + (Math.random() - 0.5) * 0.6;
       ring.rotation.y = (Math.random() - 0.5) * 0.4;
       ring.scale.setScalar(0);
-      ring.userData = {
-        rotSpeed: (i % 2 === 0 ? 1 : -1) * (0.12 + i * 0.06),
-        baseOpacity: mat.opacity,
-      };
+      ring.userData = { rotSpeed: (i % 2 === 0 ? 1 : -1) * (0.12 + i * 0.06), baseOpacity: mat.opacity };
       portalGroup.add(ring);
     }
 
-    // central glow disk
-    const dg  = new THREE.CircleGeometry(0.9, 64);
-    const dm  = new THREE.MeshBasicMaterial({
-      color: 0xA8D8F0, transparent: true, opacity: 0.05,
-      blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
-    });
-    const disk = new THREE.Mesh(dg, dm);
+    const disk = new THREE.Mesh(
+      new THREE.CircleGeometry(0.92, 72),
+      new THREE.MeshBasicMaterial({
+        color: 0xA8D8F0, transparent: true, opacity: 0.05,
+        blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+      })
+    );
     disk.scale.setScalar(0);
     disk.userData = { isDisk: true };
     portalGroup.add(disk);
-
-    // outer radiance halo
-    const hg  = new THREE.CircleGeometry(2.2, 64);
-    const hm  = new THREE.MeshBasicMaterial({
-      color: 0x7BB8D4, transparent: true, opacity: 0.025,
-      blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
-    });
-    const halo = new THREE.Mesh(hg, hm);
-    halo.scale.setScalar(0);
-    halo.userData = { isHalo: true };
-    portalGroup.add(halo);
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  MORPH ENGINE                                                   */
-  /* ═══════════════════════════════════════════════════════════════ */
+  /* ═══ MORPH ENGINE ══════════════════════════════════════════════ */
   function morphTo(target, dur = 2200) {
     if (morphTween) { morphTween.kill(); morphTween = null; }
-
     const posAttr = mainParticles.geometry.attributes.position;
-    morphFrom = posAttr.array.slice();
+    morphFrom   = posAttr.array.slice();
     morphTarget = target;
-
     const proxy = { t: 0 };
     morphTween = gsap.to(proxy, {
-      t: 1,
-      duration: dur / 1000,
-      ease: 'power3.inOut',
+      t: 1, duration: dur / 1000, ease: 'power3.inOut',
       onUpdate() {
         const e = proxy.t;
-        for (let i = 0; i < posAttr.array.length; i++) {
+        for (let i = 0; i < posAttr.array.length; i++)
           posAttr.array[i] = morphFrom[i] + (morphTarget[i] - morphFrom[i]) * e;
-        }
         posAttr.needsUpdate = true;
       },
     });
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  CAMERA CINEMATIC MOVE                                          */
-  /* ═══════════════════════════════════════════════════════════════ */
-  function moveCameraTo(idx, dur = 2.4) {
-    const wp = CAM_WP[idx];
+  /* ═══ CAMERA ════════════════════════════════════════════════════ */
+  function moveCameraTo(idx, dur = 2.4, lock = false) {
+    const wp = CAM[idx];
+    if (lock) camLocked = true;
     gsap.to(camera.position, {
       x: wp.pos.x, y: wp.pos.y, z: wp.pos.z,
-      duration: dur,
-      ease: 'power3.inOut',
+      duration: dur, ease: 'power3.inOut',
+      onComplete: () => { if (lock) camLocked = false; },
     });
-    gsap.to(camLookAtTarget, {
-      x: wp.look.x, y: wp.look.y, z: wp.look.z,
-      duration: dur,
-      ease: 'power3.inOut',
-    });
+    gsap.to(camLook, { x: wp.look.x, y: wp.look.y, z: wp.look.z, duration: dur, ease: 'power3.inOut' });
     gsap.to(camera, {
-      fov: wp.fov,
-      duration: dur,
-      ease: 'power2.inOut',
+      fov: wp.fov, duration: dur, ease: 'power2.inOut',
       onUpdate: () => camera.updateProjectionMatrix(),
     });
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  SCENE ACTIVATIONS                                              */
-  /* ═══════════════════════════════════════════════════════════════ */
+  function zoomToNode(toolId) {
+    const pos = TOOLS[toolId].nodePos;
+    gsap.to(camera.position, {
+      x: pos.x * 0.52 - 1.0,
+      y: pos.y * 0.34,
+      z: CAM[1].pos.z - 0.82,
+      duration: 1.2, ease: 'power3.inOut',
+    });
+    gsap.to(camLook, { x: pos.x * 0.28, y: pos.y * 0.18, z: 0, duration: 1.2, ease: 'power3.inOut' });
+  }
+
+  /* ═══ SCENE ACTIVATIONS ═════════════════════════════════════════ */
   function activateScene(idx) {
     if (idx === activeScene) return;
     const prev = activeScene;
     activeScene = idx;
 
-    // toggle nav style
+    if (prev === 4) onLeaveScene4();
+
     document.getElementById('nav')?.classList.toggle('scrolled', idx > 0);
 
-    // camera move
+    // update scene dot nav
+    document.querySelectorAll('.sn-dot').forEach(d => {
+      d.classList.toggle('active', parseInt(d.dataset.scene) === idx);
+    });
+
+    // update nav-link active state
+    const navMap = ['scene-hero','scene-tools','scene-features','scene-about','scene-cta'];
+    const linkMap = [null, 'System', 'Architecture', 'Intelligence', 'Launch'];
+    document.querySelectorAll('.nav-link').forEach(a => {
+      const href = a.getAttribute('href');
+      a.classList.toggle('active', href === '#' + navMap[idx]);
+    });
+
     moveCameraTo(idx);
+    if (idx !== 1) hideHUD();
 
-    // scene 3D transitions
     switch (idx) {
-      case 0: enterScene0(prev); break;
-      case 1: enterScene1(prev); break;
-      case 2: enterScene2(prev); break;
-      case 3: enterScene3(prev); break;
-      case 4: enterScene4(prev); break;
+      case 0: enterScene0(); break;
+      case 1: enterScene1(); break;
+      case 2: enterScene2(); break;
+      case 3: enterScene3(); break;
+      case 4: enterScene4(); break;
     }
   }
 
-  /* ── Scene 0: HERO — logo formation ────────────────────────── */
-  function enterScene0(from) {
-    nodeGroup.visible  = false;
-    icoGroup.visible   = false;
-    dashGroup.visible  = false;
-    portalGroup.visible= false;
+  /* ─── Scene 0: HERO ──────────────────────────────────────────── */
+  function enterScene0() {
+    nodeGroup.visible = false; icoGroup.visible = false;
+    dashGroup.visible = false; portalGroup.visible = false;
     mainParticles.visible = true;
-
     setFog(0x060810, 0.022);
+    morphTo(pos_logo, 2800);
 
-    if (from < 0) {
-      // first entry: scatter → logo
-      morphTo(pos_logo, 2800);
-    } else {
-      // returning from scene 1+
-      morphTo(pos_logo, 2000);
-    }
-
-    // UI entrance
-    gsap.fromTo('.hero-eyebrow',
-      { opacity: 0, y: 15 },
-      { opacity: 1, y: 0, duration: 0.9, ease: 'power2.out', delay: 0.3 }
-    );
-    gsap.fromTo('.ht-line',
-      { opacity: 0, y: 55 },
-      { opacity: 1, y: 0, duration: 1.2, stagger: 0.2, ease: 'power3.out', delay: 0.55 }
-    );
-    gsap.fromTo('.hero-sub',
-      { opacity: 0, y: 22 },
-      { opacity: 1, y: 0, duration: 0.9, ease: 'power2.out', delay: 1.05 }
-    );
-    gsap.fromTo('.hero-ctas',
-      { opacity: 0, y: 18 },
-      { opacity: 1, y: 0, duration: 0.85, ease: 'power2.out', delay: 1.30 }
-    );
+    gsap.fromTo('.hero-pre',  { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.7, ease: 'power2.out', delay: 0.3 });
+    gsap.fromTo('.ht-line',   { opacity: 0, y: 65 }, { opacity: 1, y: 0, duration: 1.3, stagger: 0.22, ease: 'power3.out', delay: 0.5 });
+    gsap.fromTo('.hero-sub',  { opacity: 0, y: 24 }, { opacity: 1, y: 0, duration: 0.9, ease: 'power2.out', delay: 1.0 });
+    gsap.fromTo('.hero-ctas', { opacity: 0, y: 18 }, { opacity: 1, y: 0, duration: 0.85, ease: 'power2.out', delay: 1.3 });
   }
 
-  /* ── Scene 1: NEURAL ────────────────────────────────────────── */
-  function enterScene1(from) {
-    nodeGroup.visible  = true;
-    icoGroup.visible   = false;
-    dashGroup.visible  = false;
-    portalGroup.visible= false;
+  /* ─── Scene 1: INTERACTIVE SYSTEM MAP ───────────────────────── */
+  function enterScene1() {
+    nodeGroup.visible = true; icoGroup.visible = false;
+    dashGroup.visible = false; portalGroup.visible = false;
     mainParticles.visible = true;
-
     setFog(0x060d1c, 0.020);
     morphTo(pos_sphere, 2200);
 
-    // animate nodes in
-    nodeGroup.children.forEach((child, i) => {
-      if (child.type === 'Mesh' && !child.userData.isHalo) {
-        const bs = child.userData.baseScale || 1;
-        gsap.to(child.scale, {
-          x: bs, y: bs, z: bs,
-          duration: 0.85,
-          delay: i * 0.07,
-          ease: 'back.out(1.7)',
-        });
-      }
+    // animate nodes in with stagger
+    nodeObjects.forEach((mesh, i) => {
+      gsap.to(mesh.scale, { x: 1, y: 1, z: 1, duration: 0.9, delay: 0.2 + i * 0.1, ease: 'back.out(1.7)' });
     });
 
-    // animate energy lines opacity
-    if (energyLines) {
-      gsap.fromTo(energyLines.material, { opacity: 0 }, { opacity: 0.18, duration: 1.2, delay: 0.3, ease: 'power2.out' });
-    }
+    // energy lines fade in
+    nodeGroup.children.forEach(c => {
+      if (c.userData.isLine)
+        gsap.fromTo(c.material, { opacity: 0 }, { opacity: 0.22, duration: 1.1, delay: 0.5, ease: 'power2.out' });
+    });
 
     // UI
-    gsap.fromTo('.tool-node',
-      { opacity: 0, x: 55 },
-      { opacity: 1, x: 0, stagger: 0.12, duration: 0.7, ease: 'power3.out', delay: 0.25 }
-    );
     gsap.fromTo('#ui-tools .section-eyebrow, #ui-tools .section-title',
-      { opacity: 0, y: 30 },
-      { opacity: 1, y: 0, stagger: 0.1, duration: 0.8, ease: 'power2.out', delay: 0.1 }
-    );
+      { opacity: 0, y: 32 }, { opacity: 1, y: 0, stagger: 0.12, duration: 0.85, ease: 'power2.out', delay: 0.1 });
+    gsap.fromTo('.tool-node',
+      { opacity: 0, x: 55 }, { opacity: 1, x: 0, stagger: 0.1, duration: 0.65, ease: 'power3.out', delay: 0.25 });
+
+    if (selectedTool >= 0) highlightTool(selectedTool, false);
   }
 
-  /* ── Scene 2: EXPLODED ICOSAHEDRON ──────────────────────────── */
+  /* ─── Scene 2: CONTAINED ICO ─────────────────────────────────── */
+  let _explodeTimer = null;
   let icoExploded = false;
+  let _icoHovered = false;
 
-  function enterScene2(from) {
-    icoGroup.visible   = true;
-    nodeGroup.visible  = false;
-    dashGroup.visible  = false;
-    portalGroup.visible= false;
+  function enterScene2() {
+    icoGroup.visible = true; nodeGroup.visible = false;
+    dashGroup.visible = false; portalGroup.visible = false;
     mainParticles.visible = true;
-
     setFog(0x080916, 0.018);
     morphTo(pos_torus, 2000);
     icoExploded = false;
 
-    // assemble icosahedron core first
-    icoGroup.children.forEach(child => {
-      if (child.userData.isCore || child.userData.isWire) {
-        gsap.to(child.scale, { x: 1, y: 1, z: 1, duration: 1.1, ease: 'back.out(1.4)', delay: 0.2 });
-        if (child.rotation) gsap.to(child.rotation, { y: Math.PI * 2, duration: 3.5, ease: 'power2.inOut', delay: 0.2 });
-      }
+    gsap.to(icoCore.scale, { x: 1, y: 1, z: 1, duration: 1.1, ease: 'back.out(1.4)', delay: 0.2 });
+    gsap.to(icoWire.scale, { x: 1, y: 1, z: 1, duration: 1.1, ease: 'back.out(1.4)', delay: 0.2 });
+
+    icoPieces.forEach((p, i) => {
+      p.position.copy(p.userData.axis.clone().multiplyScalar(0.1));
+      gsap.to(p.scale, { x: 1, y: 1, z: 1, duration: 0.65, delay: 0.3 + i * 0.06, ease: 'back.out(1.3)' });
     });
 
-    // scale pieces back to center first
-    icoPieces.forEach((piece, i) => {
-      piece.position.copy(piece.userData.axis.clone().multiplyScalar(0.1));
-      gsap.to(piece.scale, { x: 1, y: 1, z: 1, duration: 0.6, delay: 0.3 + i * 0.06, ease: 'back.out(1.3)' });
-    });
-
-    // UI
     gsap.fromTo('.frag',
-      { opacity: 0, scale: 0.6, y: 25 },
-      { opacity: 1, scale: 1, y: 0, stagger: 0.1, duration: 0.7, ease: 'back.out(1.4)', delay: 0.3 }
+      { opacity: 0, scale: 0.76, y: 18 },
+      { opacity: 1, scale: 1, y: 0, stagger: 0.09, duration: 0.65, ease: 'back.out(1.4)', delay: 0.3 }
     );
     gsap.fromTo('#ui-features .section-eyebrow, #ui-features .section-title',
-      { opacity: 0, y: 30 },
-      { opacity: 1, y: 0, stagger: 0.12, duration: 0.8, ease: 'power2.out', delay: 0.1 }
-    );
+      { opacity: 0, y: 32 }, { opacity: 1, y: 0, stagger: 0.12, duration: 0.8, ease: 'power2.out', delay: 0.1 });
 
-    // auto-explode after 2.5s then reassemble
     scheduleExplode();
   }
 
-  let _explodeTimeout = null;
   function scheduleExplode() {
-    if (_explodeTimeout) clearTimeout(_explodeTimeout);
-    _explodeTimeout = setTimeout(() => {
-      if (activeScene === 2) explodeIco();
-    }, 2500);
+    if (_explodeTimer) clearTimeout(_explodeTimer);
+    _explodeTimer = setTimeout(() => {
+      if (activeScene === 2 && !_icoHovered) explodeIco();
+    }, 2800);
   }
 
   function explodeIco() {
     icoExploded = true;
-    icoPieces.forEach((piece, i) => {
-      const target = piece.userData.axis.clone().multiplyScalar(piece.userData.explodeDist);
-      gsap.to(piece.position, {
-        x: target.x, y: target.y, z: target.z,
-        duration: 1.4,
-        delay: i * 0.08,
-        ease: 'power4.out',
-      });
-      gsap.to(piece.material, { emissiveIntensity: 2.5, duration: 0.6, delay: i * 0.08 });
+    icoPieces.forEach((p, i) => {
+      const target = p.userData.axis.clone().multiplyScalar(p.userData.maxDist);
+      gsap.to(p.position, { x: target.x, y: target.y, z: target.z, duration: 1.35, delay: i * 0.07, ease: 'power4.out' });
+      gsap.to(p.material,  { emissiveIntensity: 3.0, duration: 0.5, delay: i * 0.07 });
     });
-    // core fades
-    icoGroup.children.forEach(c => {
-      if (c.userData.isCore || c.userData.isWire) {
-        gsap.to(c.material, { opacity: c.userData.isCore ? 0.03 : 0.08, duration: 1.0, delay: 0.2 });
-      }
-    });
-    // reassemble after 3.5s
-    _explodeTimeout = setTimeout(() => {
-      if (activeScene === 2) reassembleIco();
-    }, 3500);
+    gsap.to(icoCore.material, { opacity: 0.03, duration: 0.9, delay: 0.2 });
+    gsap.to(icoWire.material, { opacity: 0.06, duration: 0.9, delay: 0.2 });
+    _explodeTimer = setTimeout(() => { if (activeScene === 2) reassembleIco(); }, 3200);
   }
 
   function reassembleIco() {
     icoExploded = false;
-    icoPieces.forEach((piece, i) => {
-      const home = piece.userData.axis.clone().multiplyScalar(0.1);
-      gsap.to(piece.position, {
-        x: home.x, y: home.y, z: home.z,
-        duration: 1.6,
-        delay: i * 0.06,
-        ease: 'power3.inOut',
-      });
-      gsap.to(piece.material, { emissiveIntensity: 1.0, duration: 0.5, delay: i * 0.06 });
+    icoPieces.forEach((p, i) => {
+      const home = p.userData.axis.clone().multiplyScalar(0.1);
+      gsap.to(p.position, { x: home.x, y: home.y, z: home.z, duration: 1.5, delay: i * 0.05, ease: 'power3.inOut' });
+      gsap.to(p.material,  { emissiveIntensity: 1.05, duration: 0.4, delay: i * 0.05 });
     });
-    icoGroup.children.forEach(c => {
-      if (c.userData.isCore || c.userData.isWire) {
-        gsap.to(c.material, { opacity: c.userData.isCore ? 0.12 : 0.4, duration: 1.0, delay: 0.3 });
-      }
-    });
-    // loop
-    _explodeTimeout = setTimeout(() => {
-      if (activeScene === 2) explodeIco();
-    }, 3000);
+    gsap.to(icoCore.material, { opacity: 0.10, duration: 0.9, delay: 0.3 });
+    gsap.to(icoWire.material, { opacity: 0.38, duration: 0.9, delay: 0.3 });
+    _explodeTimer = setTimeout(() => { if (activeScene === 2 && !_icoHovered) explodeIco(); }, 2800);
   }
 
-  /* ── Scene 3: DASHBOARD / METRICS ──────────────────────────── */
-  function enterScene3(from) {
-    dashGroup.visible  = true;
-    nodeGroup.visible  = false;
-    icoGroup.visible   = false;
-    portalGroup.visible= false;
+  /* ─── Scene 3: METRICS ───────────────────────────────────────── */
+  function enterScene3() {
+    dashGroup.visible = true; nodeGroup.visible = false;
+    icoGroup.visible = false; portalGroup.visible = false;
     mainParticles.visible = true;
-
     setFog(0x050a14, 0.016);
     morphTo(pos_wave, 2400);
 
-    // orbs scale in
-    dashGroup.children.forEach((child, i) => {
-      gsap.to(child.scale, {
-        x: 1, y: 1, z: 1,
-        duration: 1.0,
-        delay: i * 0.06,
-        ease: 'back.out(1.4)',
-      });
+    dashGroup.children.forEach((c, i) => {
+      gsap.to(c.scale, { x: 1, y: 1, z: 1, duration: 1.05, delay: i * 0.06, ease: 'back.out(1.4)' });
     });
 
-    // count-up metrics
     document.querySelectorAll('.metric-val[data-count]').forEach(el => {
       const target = parseInt(el.dataset.count);
-      gsap.fromTo({ val: 0 }, { val: target },
-        { duration: 2.0, ease: 'power2.out', delay: 0.5,
-          onUpdate: function () { el.textContent = Math.round(this.targets()[0].val); }
-        }
-      );
+      gsap.fromTo({ val: 0 }, { val: target }, {
+        duration: 2.4, ease: 'power2.out', delay: 0.6,
+        onUpdate: function () { el.textContent = Math.round(this.targets()[0].val); },
+      });
     });
 
     gsap.fromTo('.metric',
-      { opacity: 0, y: 45 },
-      { opacity: 1, y: 0, stagger: 0.14, duration: 0.8, ease: 'power2.out', delay: 0.4 }
-    );
+      { opacity: 0, y: 46 }, { opacity: 1, y: 0, stagger: 0.14, duration: 0.8, ease: 'power2.out', delay: 0.4 });
     gsap.fromTo('#ui-about .section-eyebrow, #ui-about .section-title, #ui-about .section-body',
-      { opacity: 0, y: 32 },
-      { opacity: 1, y: 0, stagger: 0.12, duration: 0.8, ease: 'power2.out', delay: 0.15 }
-    );
+      { opacity: 0, y: 32 }, { opacity: 1, y: 0, stagger: 0.10, duration: 0.8, ease: 'power2.out', delay: 0.15 });
   }
 
-  /* ── Scene 4: PORTAL CTA ────────────────────────────────────── */
-  function enterScene4(from) {
-    portalGroup.visible = true;
-    dashGroup.visible   = false;
-    nodeGroup.visible   = false;
-    icoGroup.visible    = false;
+  /* ─── Scene 4: PORTAL ────────────────────────────────────────── */
+  function enterScene4() {
+    portalGroup.visible = true; dashGroup.visible = false;
+    nodeGroup.visible = false; icoGroup.visible = false;
     mainParticles.visible = true;
-
     setFog(0x04060a, 0.014);
     morphTo(pos_dna, 2800);
 
-    // portal rings spiral in
-    portalGroup.children.forEach((child, i) => {
-      gsap.to(child.scale, {
-        x: 1, y: 1, z: 1,
-        duration: 1.3,
-        delay: i * 0.1,
-        ease: 'back.out(1.2)',
-      });
+    portalGroup.children.forEach((c, i) => {
+      gsap.to(c.scale, { x: 1, y: 1, z: 1, duration: 1.3, delay: i * 0.10, ease: 'back.out(1.2)' });
     });
+    // particles converge
+    gsap.to(mainParticles.scale, { z: 0.52, duration: 3.2, ease: 'power2.inOut' });
 
-    // main particles converge inward (reduce rotation, tighten)
-    gsap.to(mainParticles.rotation, {
-      z: Math.PI * 0.5,
-      duration: 3.0,
-      ease: 'power2.inOut',
-    });
-
-    // CTA UI
-    gsap.fromTo('.cta-title',
-      { opacity: 0, y: 48 },
-      { opacity: 1, y: 0, duration: 1.1, ease: 'power3.out', delay: 0.4 }
-    );
-    gsap.fromTo('.cta-body',
-      { opacity: 0, y: 24 },
-      { opacity: 1, y: 0, duration: 0.9, ease: 'power2.out', delay: 0.7 }
-    );
-    gsap.fromTo('.cta-actions',
-      { opacity: 0, y: 18 },
-      { opacity: 1, y: 0, duration: 0.85, ease: 'power2.out', delay: 0.95 }
-    );
-    gsap.fromTo('.cta-footer-note',
-      { opacity: 0 },
-      { opacity: 1, duration: 0.8, ease: 'power2.out', delay: 1.25 }
-    );
+    gsap.fromTo('.cta-title',    { opacity: 0, y: 52 }, { opacity: 1, y: 0, duration: 1.1, ease: 'power3.out', delay: 0.4 });
+    gsap.fromTo('.cta-body',     { opacity: 0, y: 26 }, { opacity: 1, y: 0, duration: 0.9, ease: 'power2.out', delay: 0.75 });
+    gsap.fromTo('.cta-actions',  { opacity: 0, y: 18 }, { opacity: 1, y: 0, duration: 0.85, ease: 'power2.out', delay: 1.0 });
+    gsap.fromTo('.cta-brand',    { opacity: 0 },        { opacity: 1,        duration: 0.8,  ease: 'power2.out', delay: 1.35 });
   }
 
-  /* ─── fog helper ────────────────────────────────────────────── */
+  function onLeaveScene4() {
+    gsap.to(mainParticles.scale, { z: 1.0, duration: 1.5, ease: 'power2.out' });
+  }
+
   function setFog(hex, density) {
     if (!scene.fog) return;
     gsap.to(scene.fog.color, {
       r: ((hex >> 16) & 255) / 255,
       g: ((hex >> 8)  & 255) / 255,
-      b:  (hex        & 255) / 255,
-      duration: 2.2, ease: 'power2.inOut',
+      b: ((hex)       & 255) / 255,
+      duration: 2.4, ease: 'power2.inOut',
     });
-    gsap.to(scene.fog, { density, duration: 2.2, ease: 'power2.inOut' });
+    gsap.to(scene.fog, { density, duration: 2.4, ease: 'power2.inOut' });
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  GSAP SCROLL TIMELINE                                           */
-  /* ═══════════════════════════════════════════════════════════════ */
-  function buildScrollTimeline() {
-    const SCENE_IDS = ['scene-hero', 'scene-tools', 'scene-features', 'scene-about', 'scene-cta'];
+  /* ═══ TOOL INTERACTION ═══════════════════════════════════════════ */
+  function selectTool(toolId) {
+    if (selectedTool === toolId) {
+      selectedTool = -1;
+      resetAllNodes();
+      hideHUD();
+      moveCameraTo(1, 1.4);
+      return;
+    }
+    selectedTool = toolId;
+    highlightTool(toolId, true);
+    showHUD(toolId);
 
-    SCENE_IDS.forEach((id, idx) => {
+    document.querySelectorAll('.tool-node').forEach(el => {
+      const n = parseInt(el.dataset.node);
+      el.classList.toggle('selected', n === toolId);
+      el.classList.toggle('dimmed',   n !== toolId);
+    });
+  }
+
+  function highlightTool(toolId, withCamera = false) {
+    const tool = TOOLS[toolId];
+
+    nodeObjects.forEach((mesh, i) => {
+      if (i === toolId) {
+        gsap.to(mesh.material, { emissiveIntensity: 3.2, opacity: 1.0, duration: 0.5 });
+        gsap.to(mesh.scale,    { x: 1.55, y: 1.55, z: 1.55, duration: 0.5, ease: 'back.out(1.5)' });
+      } else {
+        gsap.to(mesh.material, { emissiveIntensity: 0.28, opacity: 0.38, duration: 0.5 });
+        gsap.to(mesh.scale,    { x: 0.68, y: 0.68, z: 0.68, duration: 0.4, ease: 'power2.inOut' });
+      }
+    });
+
+    nodeGroup.children.forEach(c => {
+      if (c.userData.isLine)
+        gsap.to(c.material, { opacity: c.userData.toolId === toolId ? 0.75 : 0.05, duration: 0.5 });
+    });
+
+    const hub = nodeGroup.children.find(c => c.userData.isHub);
+    if (hub) {
+      const col = new THREE.Color(tool.hex);
+      gsap.to(hub.material.color,    { r: col.r, g: col.g, b: col.b, duration: 0.6 });
+      gsap.to(hub.material.emissive, { r: col.r, g: col.g, b: col.b, duration: 0.6 });
+      gsap.to(hub.material,          { emissiveIntensity: 2.8, duration: 0.5 });
+    }
+
+    const fog = scene.fog;
+    if (fog) {
+      const fc = new THREE.Color(tool.hex);
+      gsap.to(fog.color, { r: fc.r * 0.06, g: fc.g * 0.06, b: fc.b * 0.06 + 0.04, duration: 1.1 });
+    }
+
+    if (withCamera) zoomToNode(toolId);
+  }
+
+  function resetAllNodes() {
+    nodeObjects.forEach(mesh => {
+      gsap.to(mesh.material, { emissiveIntensity: 0.85, opacity: 0.96, duration: 0.5 });
+      gsap.to(mesh.scale,    { x: 1, y: 1, z: 1, duration: 0.5, ease: 'back.out(1.3)' });
+    });
+    nodeGroup.children.forEach(c => {
+      if (c.userData.isLine) gsap.to(c.material, { opacity: 0.22, duration: 0.5 });
+    });
+    const hub = nodeGroup.children.find(c => c.userData.isHub);
+    if (hub) {
+      gsap.to(hub.material.color,    { r: PAL.ICE.r, g: PAL.ICE.g, b: PAL.ICE.b, duration: 0.6 });
+      gsap.to(hub.material.emissive, { r: PAL.GLOW.r, g: PAL.GLOW.g, b: PAL.GLOW.b, duration: 0.6 });
+      gsap.to(hub.material,          { emissiveIntensity: 1.6, duration: 0.5 });
+    }
+    setFog(0x060d1c, 0.020);
+    document.querySelectorAll('.tool-node').forEach(el => el.classList.remove('selected', 'dimmed'));
+  }
+
+  /* ═══ HUD ════════════════════════════════════════════════════════ */
+  function showHUD(toolId) {
+    const tool = TOOLS[toolId];
+    const hud  = document.getElementById('tool-hud');
+    if (!hud) return;
+    hud.querySelector('.hud-name').textContent = tool.name;
+    hud.querySelector('.hud-desc').textContent = tool.short;
+    const link = hud.querySelector('.hud-link');
+    link.href = tool.url;
+    link.style.borderColor  = tool.color;
+    link.style.color        = tool.color;
+    hud.querySelector('.hud-color-dot').style.background = tool.color;
+    hud.querySelector('.hud-color-dot').style.boxShadow  = `0 0 10px ${tool.color}`;
+    hud.style.setProperty('--hud-color', tool.color);
+    hud.classList.add('visible');
+  }
+
+  function hideHUD() {
+    document.getElementById('tool-hud')?.classList.remove('visible');
+  }
+
+  /* ═══ TOOLTIP ════════════════════════════════════════════════════ */
+  function showTooltip(toolId, screenX, screenY) {
+    const tt = document.getElementById('node-tooltip');
+    if (!tt) return;
+    tt.textContent = TOOLS[toolId].name;
+    tt.style.left  = (screenX + 18) + 'px';
+    tt.style.top   = (screenY - 12) + 'px';
+    tt.style.setProperty('--tc', TOOLS[toolId].color);
+    tt.style.borderColor = TOOLS[toolId].color;
+    tt.classList.add('visible');
+  }
+
+  function hideTooltip() {
+    document.getElementById('node-tooltip')?.classList.remove('visible');
+  }
+
+  /* ═══ RAYCASTING ════════════════════════════════════════════════ */
+  function checkNodeHover(e) {
+    if (activeScene !== 1) return;
+    raycaster.setFromCamera(mouseNDC, camera);
+    const hits = raycaster.intersectObjects(nodeObjects);
+
+    if (hits.length > 0) {
+      const mesh = hits[0].object;
+      const tId  = mesh.userData.toolId;
+      if (tId !== hoveredNode) {
+        hoveredNode = tId;
+        document.body.classList.add('cur-hover');
+        showTooltip(tId, e.clientX, e.clientY);
+        if (tId !== selectedTool) {
+          gsap.to(mesh.material, { emissiveIntensity: 2.2, duration: 0.22 });
+          gsap.to(mesh.scale,    { x: 1.35, y: 1.35, z: 1.35, duration: 0.22, ease: 'back.out(1.5)' });
+        }
+      }
+    } else {
+      if (hoveredNode >= 0) {
+        const prev = nodeObjects[hoveredNode];
+        if (hoveredNode !== selectedTool) {
+          const ei = selectedTool >= 0 ? 0.28 : 0.85;
+          const sc = selectedTool >= 0 ? 0.68 : 1.0;
+          gsap.to(prev.material, { emissiveIntensity: ei, duration: 0.22 });
+          gsap.to(prev.scale,    { x: sc, y: sc, z: sc, duration: 0.22 });
+        }
+        hoveredNode = -1;
+        document.body.classList.remove('cur-hover');
+        hideTooltip();
+      }
+    }
+  }
+
+  function checkIcoHover() {
+    if (activeScene !== 2) return;
+    raycaster.setFromCamera(mouseNDC, camera);
+    const hits = raycaster.intersectObjects([icoCore, icoWire, ...icoPieces]);
+    if (hits.length > 0) {
+      if (!_icoHovered) {
+        _icoHovered = true;
+        document.body.classList.add('cur-hover');
+        // pause auto-explode while hovered
+        if (_explodeTimer) { clearTimeout(_explodeTimer); _explodeTimer = null; }
+        // brighten wire on hover
+        gsap.to(icoWire.material, { opacity: 0.65, duration: 0.3 });
+      }
+    } else {
+      if (_icoHovered) {
+        _icoHovered = false;
+        document.body.classList.remove('cur-hover');
+        gsap.to(icoWire.material, { opacity: icoExploded ? 0.06 : 0.38, duration: 0.3 });
+        // restart explode cycle
+        scheduleExplode();
+      }
+    }
+  }
+
+  function handleNodeClick(e) {
+    if (activeScene !== 1) return;
+    raycaster.setFromCamera(mouseNDC, camera);
+    const hits = raycaster.intersectObjects(nodeObjects);
+    if (hits.length > 0) {
+      const tId = hits[0].object.userData.toolId;
+      selectTool(tId);
+    }
+  }
+
+  function handleIcoClick() {
+    if (activeScene !== 2) return;
+    raycaster.setFromCamera(mouseNDC, camera);
+    const hits = raycaster.intersectObjects([icoCore, icoWire, ...icoPieces]);
+    if (hits.length > 0) {
+      if (icoExploded) reassembleIco();
+      else              explodeIco();
+    }
+  }
+
+  /* ═══ GSAP SCROLL TIMELINE ══════════════════════════════════════ */
+  function buildScrollTimeline() {
+    const SCENES = ['scene-hero','scene-tools','scene-features','scene-about','scene-cta'];
+    SCENES.forEach((id, idx) => {
       const el = document.getElementById(id);
       if (!el) return;
       ScrollTrigger.create({
-        trigger:    el,
-        start:      'top 62%',
-        end:        'bottom 38%',
+        trigger:   el,
+        start:     'top 62%',
+        end:       'bottom 38%',
         onEnter:      () => activateScene(idx),
         onEnterBack:  () => activateScene(idx),
+        onLeave:      () => { if (idx === 4) onLeaveScene4(); },
+        onLeaveBack:  () => { if (idx === 4) onLeaveScene4(); },
       });
     });
 
-    // global scroll progress → nav bar
+    // scroll progress bar
     ScrollTrigger.create({
-      trigger: '#scroll-container',
-      start:   'top top',
-      end:     'bottom bottom',
-      scrub:   true,
+      trigger: '#scroll-container', start: 'top top', end: 'bottom bottom', scrub: true,
       onUpdate(self) {
-        scrollProgress = self.progress;
         const fill = document.querySelector('.nav-progress-fill');
         if (fill) fill.style.width = (self.progress * 100) + '%';
       },
     });
-
-    // Section UI fade-in on scroll reveal (sections other than hero)
-    ['#ui-tools','#ui-features','#ui-about','#ui-cta'].forEach(sel => {
-      const el = document.querySelector(sel);
-      if (!el) return;
-      ScrollTrigger.create({
-        trigger: el,
-        start:   'top 75%',
-        once:    true,
-        onEnter() {
-          gsap.fromTo(el, { opacity: 0 }, { opacity: 1, duration: 0.6, ease: 'power2.out' });
-        },
-      });
-    });
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  RENDER LOOP                                                    */
-  /* ═══════════════════════════════════════════════════════════════ */
+  /* ═══ RENDER LOOP ════════════════════════════════════════════════ */
   let _lastFrame = 0;
   const FRAME_MS = 1000 / 62;
 
@@ -1065,112 +1039,110 @@
     requestAnimationFrame(RAF);
     if (now - _lastFrame < FRAME_MS) return;
     _lastFrame = now;
-    const dt = clock.getDelta();
-    const t  = clock.elapsedTime;
+    const t = clock.getElapsedTime();
 
-    // mouse parallax — always smooth
+    // mouse easing
     mouseEased.x += (mouse.x * 0.20 - mouseEased.x) * 0.04;
     mouseEased.y += (mouse.y * 0.12 - mouseEased.y) * 0.04;
 
-    // camera spring look-at
-    camera.lookAt(
-      camLookAtTarget.x + mouseEased.x * 0.12,
-      camLookAtTarget.y + mouseEased.y * 0.08,
-      camLookAtTarget.z
-    );
-
-    // main particles gentle drift
-    if (mainParticles) {
-      mainParticles.rotation.y += (mouseEased.x * 0.22 - mainParticles.rotation.y) * 0.03;
-      mainParticles.rotation.x += (mouseEased.y * 0.14 - mainParticles.rotation.x) * 0.03;
-      if (activeScene !== 4) {
-        mainParticles.rotation.z = Math.sin(t * 0.07) * 0.03;
-      }
+    // camera look-at with parallax
+    if (!camLocked) {
+      camera.lookAt(
+        camLook.x + mouseEased.x * 0.10,
+        camLook.y + mouseEased.y * 0.07,
+        camLook.z
+      );
     }
 
-    // ambient drift
+    // particle global drift
+    if (mainParticles && activeScene !== 4) {
+      mainParticles.rotation.y += (mouseEased.x * 0.22 - mainParticles.rotation.y) * 0.03;
+      mainParticles.rotation.x += (mouseEased.y * 0.14 - mainParticles.rotation.x) * 0.03;
+      mainParticles.rotation.z  = Math.sin(t * 0.07) * 0.025;
+    }
     if (ambParticles) {
       ambParticles.rotation.y = t * 0.005;
       ambParticles.rotation.x = Math.sin(t * 0.035) * 0.018;
     }
-    if (dustParticles) {
-      dustParticles.rotation.y  = t * 0.009;
-      dustParticles.rotation.x  = Math.cos(t * 0.028) * 0.014;
-      dustParticles.position.y  = Math.sin(t * 0.12) * 0.08;
-    }
 
-    // update shader time uniform
     if (mainParticles?.material.uniforms) mainParticles.material.uniforms.uTime.value = t;
 
-    // scene-specific animations
-    if (nodeGroup?.visible) tickNodes(t);
+    if (nodeGroup?.visible)  tickNodes(t);
+    if (icoGroup?.visible)   tickIco(t);
     if (dashGroup?.visible)  tickDash(t);
     if (portalGroup?.visible) tickPortal(t);
-    if (icoGroup?.visible)   tickIco(t);
 
     renderer.render(scene, camera);
   }
 
-  /* ─── scene tick helpers ────────────────────────────────────── */
+  /* ─── TICK HELPERS ───────────────────────────────────────────── */
   function tickNodes(t) {
-    nodeGroup.children.forEach((c, i) => {
-      if (c.userData.isHalo) {
-        c.rotation.z = t * 0.35 + i;
-        c.material.opacity = 0.10 + Math.sin(t * 1.2 + i) * 0.04;
-      } else if (c.type === 'Mesh' && c.scale.x > 0.05) {
-        const bs = c.userData.baseScale || 1;
-        const pulse = 1 + Math.sin(t * 1.6 + i * 1.05) * 0.055;
-        c.scale.setScalar(bs * pulse);
-        if (c.userData.isCentral) {
-          c.rotation.y = t * 0.4;
-          c.rotation.x = t * 0.2;
-        }
+    const hub = nodeGroup.children.find(c => c.userData.isHub);
+    if (hub && hub.scale.x > 0.05) {
+      const pulse = 1 + Math.sin(t * 1.8) * 0.065;
+      hub.scale.setScalar(pulse);
+    }
+    const hubHalo = nodeGroup.children.find(c => c.userData.isHubHalo);
+    if (hubHalo) {
+      hubHalo.rotation.z = t * 0.36;
+      hubHalo.material.opacity = 0.10 + Math.sin(t * 1.6) * 0.055;
+    }
+    const hubHalo2 = nodeGroup.children.find(c => c.userData.isHubHalo2);
+    if (hubHalo2) {
+      hubHalo2.rotation.z = -t * 0.18;
+      hubHalo2.material.opacity = 0.04 + Math.sin(t * 0.9) * 0.025;
+    }
+
+    nodeObjects.forEach((mesh, i) => {
+      if (i === selectedTool) return;
+      if (mesh.scale.x < 0.08) return;
+      const bs    = selectedTool >= 0 ? 0.68 : 1.0;
+      const pulse = 1 + Math.sin(t * 1.5 + i * 1.1) * 0.055;
+      mesh.scale.setScalar(bs * pulse);
+    });
+
+    nodeGroup.children.forEach(c => {
+      if (c.userData.isNodeRing) c.rotation.z = t * 0.42 + c.userData.toolId;
+    });
+
+    nodeGroup.children.forEach(c => {
+      if (c.userData.isLine && c.userData.toolId !== selectedTool) {
+        const base = selectedTool >= 0 ? 0.05 : 0.22;
+        c.material.opacity = base + Math.sin(t * 1.2 + c.userData.toolId * 0.7) * 0.04;
       }
     });
-    nodeGroup.rotation.y = mouseEased.x * 0.3 + t * 0.012;
-    nodeGroup.rotation.x = mouseEased.y * 0.15;
-    if (energyLines) {
-      const pulse = 0.14 + Math.sin(t * 1.4) * 0.06;
-      energyLines.material.opacity = pulse;
-    }
+
+    nodeGroup.rotation.y = mouseEased.x * 0.30 + t * 0.010;
+    nodeGroup.rotation.x = mouseEased.y * 0.14;
   }
 
   function tickIco(t) {
-    icoGroup.children.forEach(c => {
-      if (c.userData.isWire) {
-        c.rotation.y = t * 0.25;
-        c.rotation.x = t * 0.15;
-      }
-      if (c.userData.isCore) {
-        c.rotation.y = -t * 0.18;
-        c.rotation.z =  t * 0.10;
-      }
-    });
-    icoPieces.forEach((piece, i) => {
-      if (icoExploded) {
-        const rs = piece.userData.rotSpeed;
-        piece.rotation.x += rs.x * 0.015;
-        piece.rotation.y += rs.y * 0.015;
-        piece.rotation.z += rs.z * 0.015;
-      }
-    });
-    icoGroup.rotation.y = mouseEased.x * 0.25 + t * 0.008;
+    icoWire.rotation.y = t * 0.22;
+    icoWire.rotation.x = t * 0.14;
+    icoCore.rotation.y = -t * 0.16;
+    icoCore.rotation.z = t * 0.09;
+
+    if (icoExploded) {
+      icoPieces.forEach(p => {
+        const rs = p.userData.rotSpeed;
+        p.rotation.x += rs.x * 0.014;
+        p.rotation.y += rs.y * 0.014;
+        p.rotation.z += rs.z * 0.014;
+      });
+    }
+
+    // mouse parallax on ico group
+    icoGroup.rotation.y = mouseEased.x * 0.24 + t * 0.008;
     icoGroup.rotation.x = mouseEased.y * 0.12;
   }
 
   function tickDash(t) {
     dashGroup.children.forEach(c => {
-      if (c.userData.basePos) {
-        const sp = c.userData.spd || 0.4;
-        const bp = c.userData.basePos;
-        c.position.y = bp.y + Math.sin(t * sp + bp.x) * 0.20;
-        if (c.userData.isRing) {
-          c.rotation[c.userData.rotAx] = t * sp * 0.8;
-        } else {
-          c.rotation.y = t * sp * 0.5;
-          c.rotation.x = t * sp * 0.3;
-        }
-      }
+      if (!c.userData.basePos) return;
+      const sp = c.userData.spd || 0.4, bp = c.userData.basePos;
+      c.position.y = bp.y + Math.sin(t * sp + bp.x) * 0.20;
+      if (c.userData.isRing) c.rotation[c.userData.rotAx] = t * sp * 0.8;
+      else { c.rotation.y = t * sp * 0.5; c.rotation.x = t * sp * 0.3; }
     });
     dashGroup.rotation.y = mouseEased.x * 0.18;
     dashGroup.rotation.x = mouseEased.y * 0.10;
@@ -1180,120 +1152,176 @@
     portalGroup.children.forEach(c => {
       if (c.userData.rotSpeed) {
         c.rotation.z += c.userData.rotSpeed * 0.012;
-        // pulse opacity
-        if (c.userData.baseOpacity) {
+        if (c.userData.baseOpacity)
           c.material.opacity = c.userData.baseOpacity * (0.85 + Math.sin(t * 1.1 + c.userData.rotSpeed) * 0.18);
-        }
       }
     });
-    // converge: portal tilts toward mouse
-    portalGroup.rotation.y = mouseEased.x * 0.12 + Math.sin(t * 0.15) * 0.04;
-    portalGroup.rotation.x = mouseEased.y * 0.08;
+    portalGroup.rotation.y = mouseEased.x * 0.10 + Math.sin(t * 0.15) * 0.04;
+    portalGroup.rotation.x = mouseEased.y * 0.07;
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  EVENTS                                                         */
-  /* ═══════════════════════════════════════════════════════════════ */
+  /* ═══ EVENTS ════════════════════════════════════════════════════ */
   function bindEvents() {
-    // mouse
+
+    /* mouse move ───────────────────────────────────────────────── */
     window.addEventListener('mousemove', e => {
-      mouse.x = (e.clientX / innerWidth)  * 2 - 1;
-      mouse.y = (e.clientY / innerHeight) * 2 - 1;
+      mouse.x = (e.clientX / innerWidth)  *  2 - 1;
+      mouse.y = (e.clientY / innerHeight) * -2 + 1;
+      mouseNDC.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+
       const dot  = document.getElementById('cursor-dot');
       const ring = document.getElementById('cursor-ring');
       if (dot)  { dot.style.left  = e.clientX + 'px'; dot.style.top  = e.clientY + 'px'; }
       if (ring) { ring.style.left = e.clientX + 'px'; ring.style.top = e.clientY + 'px'; }
+
+      const tt = document.getElementById('node-tooltip');
+      if (tt?.classList.contains('visible')) {
+        tt.style.left = (e.clientX + 18) + 'px';
+        tt.style.top  = (e.clientY - 12) + 'px';
+      }
+
+      checkNodeHover(e);
+      checkIcoHover();
     }, { passive: true });
 
+    /* click ────────────────────────────────────────────────────── */
+    window.addEventListener('click', e => {
+      // cursor click flash
+      document.body.classList.add('cur-click');
+      setTimeout(() => document.body.classList.remove('cur-click'), 150);
+
+      handleNodeClick(e);
+      handleIcoClick();
+    });
+
+    /* touch ────────────────────────────────────────────────────── */
     window.addEventListener('touchmove', e => {
       if (!e.touches[0]) return;
-      mouse.x = (e.touches[0].clientX / innerWidth)  * 2 - 1;
-      mouse.y = (e.touches[0].clientY / innerHeight) * 2 - 1;
+      const tx = e.touches[0].clientX, ty = e.touches[0].clientY;
+      mouse.x  = (tx / innerWidth)  *  2 - 1;
+      mouse.y  = (ty / innerHeight) * -2 + 1;
+      mouseNDC.set((tx / innerWidth) * 2 - 1, -(ty / innerHeight) * 2 + 1);
     }, { passive: true });
 
-    // resize
+    /* resize ───────────────────────────────────────────────────── */
+    let _resizeTimer;
     window.addEventListener('resize', () => {
-      camera.aspect = innerWidth / innerHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(innerWidth, innerHeight);
+      clearTimeout(_resizeTimer);
+      _resizeTimer = setTimeout(() => {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      }, 80);
     }, { passive: true });
 
-    // hover state for custom cursor
-    document.querySelectorAll('a,button,.tool-node,.frag,.btn-primary,.btn-ghost').forEach(el => {
+    /* tool list buttons ────────────────────────────────────────── */
+    document.querySelectorAll('.tool-node').forEach(el => {
+      el.addEventListener('click', e => {
+        e.preventDefault();
+        const tId = parseInt(el.dataset.node);
+        if (activeScene === 1) {
+          selectTool(tId);
+        } else {
+          document.getElementById('scene-tools')?.scrollIntoView({ behavior: 'smooth' });
+          setTimeout(() => selectTool(tId), 820);
+        }
+      });
       el.addEventListener('mouseenter', () => document.body.classList.add('cur-hover'));
       el.addEventListener('mouseleave', () => document.body.classList.remove('cur-hover'));
     });
 
-    // smooth anchor scroll
-    document.querySelectorAll('a[href^="#"]').forEach(a => {
-      a.addEventListener('click', e => {
-        const t = document.querySelector(a.getAttribute('href'));
-        if (!t) return;
-        e.preventDefault();
-        t.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    /* HUD close button ─────────────────────────────────────────── */
+    document.getElementById('hud-close')?.addEventListener('click', () => {
+      if (selectedTool >= 0) {
+        selectedTool = -1;
+        resetAllNodes();
+        hideHUD();
+        moveCameraTo(1, 1.4);
+      }
+    });
+
+    /* frag cards — click to activate ───────────────────────────── */
+    document.querySelectorAll('.frag').forEach((el, i) => {
+      el.addEventListener('click', () => {
+        const isActive = el.classList.contains('frag-active');
+        document.querySelectorAll('.frag').forEach(f => f.classList.remove('frag-active'));
+        if (!isActive) el.classList.add('frag-active');
+      });
+      el.addEventListener('mouseenter', () => {
+        document.body.classList.add('cur-hover');
+        hoveredFrag = i;
+      });
+      el.addEventListener('mouseleave', () => {
+        document.body.classList.remove('cur-hover');
+        hoveredFrag = -1;
+      });
+      el.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.click(); }
       });
     });
 
-    // node click → camera zoom to node
-    document.querySelectorAll('.tool-node').forEach((el, i) => {
-      el.addEventListener('click', () => {
-        if (activeScene !== 1) return;
-        // mini camera punch toward node
-        const wp = CAM_WP[1];
-        gsap.to(camera.position, {
-          z: wp.pos.z - 0.9,
-          duration: 0.5,
-          ease: 'power2.inOut',
-          yoyo: true,
-          repeat: 1,
-        });
+    /* scene dot nav ────────────────────────────────────────────── */
+    document.querySelectorAll('.sn-dot').forEach(dot => {
+      dot.addEventListener('click', () => {
+        const idx  = parseInt(dot.dataset.scene);
+        const ids  = ['scene-hero','scene-tools','scene-features','scene-about','scene-cta'];
+        document.getElementById(ids[idx])?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+      dot.addEventListener('mouseenter', () => document.body.classList.add('cur-hover'));
+      dot.addEventListener('mouseleave', () => document.body.classList.remove('cur-hover'));
+    });
+
+    /* metric cards ─────────────────────────────────────────────── */
+    document.querySelectorAll('.metric').forEach(el => {
+      el.addEventListener('mouseenter', () => document.body.classList.add('cur-hover'));
+      el.addEventListener('mouseleave', () => document.body.classList.remove('cur-hover'));
+    });
+
+    /* general hover for interactive elements ───────────────────── */
+    document.querySelectorAll('a, button, .btn-primary, .btn-ghost, .hud-link').forEach(el => {
+      el.addEventListener('mouseenter', () => document.body.classList.add('cur-hover'));
+      el.addEventListener('mouseleave', () => document.body.classList.remove('cur-hover'));
+    });
+
+    /* smooth anchor scroll ─────────────────────────────────────── */
+    document.querySelectorAll('a[href^="#"]').forEach(a => {
+      a.addEventListener('click', e => {
+        const target = document.querySelector(a.getAttribute('href'));
+        if (!target) return;
+        e.preventDefault();
+        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
       });
     });
   }
 
-  /* ═══════════════════════════════════════════════════════════════ */
-  /*  LOADER → HERO KICKOFF                                          */
-  /* ═══════════════════════════════════════════════════════════════ */
+  /* ═══ LOADER ════════════════════════════════════════════════════ */
   function runLoader() {
     const loader = document.getElementById('loader');
     const bar    = document.querySelector('.loader-bar-fill');
     const status = document.querySelector('.loader-status');
     if (!loader) return;
 
-    const stages = [
-      'Initializing AI Suite',
-      'Loading 3D Engine',
-      'Calibrating Particles',
-      'Syncing Modules',
-      'Ready',
-    ];
-    let p = 0, stageIdx = 0;
+    const stages = ['Initializing', 'Loading Engine', 'Building World', 'Syncing Systems', 'Ready'];
+    let p = 0, si = 0;
 
     const iv = setInterval(() => {
-      p = Math.min(p + 7 + Math.random() * 16, 100);
+      p = Math.min(p + 6 + Math.random() * 14, 100);
       if (bar) bar.style.width = p + '%';
-
-      const si = Math.floor(p / 25);
-      if (si !== stageIdx && si < stages.length) {
-        stageIdx = si;
-        if (status) status.textContent = stages[stageIdx];
-      }
+      const s = Math.min(Math.floor(p / 25), stages.length - 1);
+      if (s !== si) { si = s; if (status) status.textContent = stages[si]; }
 
       if (p >= 100) {
         clearInterval(iv);
         if (status) status.textContent = 'Ready';
         setTimeout(() => {
           loader.classList.add('out');
-          setTimeout(() => {
-            activateScene(0);
-            buildScrollTimeline();
-          }, 700);
+          setTimeout(() => { activateScene(0); buildScrollTimeline(); }, 700);
         }, 380);
       }
     }, 90);
   }
 
-  /* ─── kick off ──────────────────────────────────────────────── */
+  /* ═══ ENTRY ═════════════════════════════════════════════════════ */
   document.addEventListener('DOMContentLoaded', waitDeps);
 
 })();
