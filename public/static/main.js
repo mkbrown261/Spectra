@@ -516,10 +516,10 @@
     nodeGroup.visible=false; icoGroup.visible=false; dashGroup.visible=false; portalGroup.visible=false;
     mainParticles.visible=true;
     setFog(0x060810,0.022); morphTo(pos_logo,2800);
-    gsap.fromTo('.hero-pre',{opacity:0,y:12},{opacity:1,y:0,duration:0.7,ease:'power2.out',delay:0.3});
-    gsap.fromTo('.ht-line',{opacity:0,y:55},{opacity:1,y:0,stagger:0.18,duration:1.3,ease:'power3.out',delay:0.5});
-    gsap.fromTo('.hero-sub',{opacity:0,y:22},{opacity:1,y:0,duration:0.9,ease:'power2.out',delay:1.0});
-    gsap.fromTo('.hero-ctas',{opacity:0,y:18},{opacity:1,y:0,duration:0.85,ease:'power2.out',delay:1.25});
+    // No HTML title — particles spell SPECTRA. Just animate the support text.
+    gsap.fromTo('.hero-pre', {opacity:0,y:10},{opacity:1,y:0,duration:0.8,ease:'power2.out',delay:2.4});
+    gsap.fromTo('.hero-sub', {opacity:0,y:18},{opacity:1,y:0,duration:0.9,ease:'power2.out',delay:2.7});
+    gsap.fromTo('.hero-ctas',{opacity:0,y:14},{opacity:1,y:0,duration:0.85,ease:'power2.out',delay:3.0});
   }
 
   /* ── Scene 1: TOOL GRAPH ────────────────────────────────────── */

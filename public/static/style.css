@@ -330,8 +330,14 @@ body.cur-tool #cursor-ring { border-color: var(--tc, var(--glow)); }
 #ui-hero {
   text-align: center;
   display: flex; flex-direction: column; align-items: center;
-  gap: 2rem; padding-top: 2vh;
+  gap: 1.6rem;
   max-width: 820px;
+  /* Push UI to bottom third — particles own the center */
+  position: absolute;
+  bottom: 10vh;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 100%;
 }
 
 .hero-pre {
@@ -349,31 +355,7 @@ body.cur-tool #cursor-ring { border-color: var(--tc, var(--glow)); }
 }
 @keyframes pip-blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
 
-/* ── Dominant title — no "Pano" branding, just SPECTRA at scale ── */
-.hero-title {
-  display: flex; flex-direction: column; align-items: center; gap: 0;
-  font-size: clamp(5.5rem, 16vw, 13rem);
-  font-weight: 300; letter-spacing: -0.04em; line-height: 0.92;
-  margin: 0;
-}
-.ht-line {
-  display: block; opacity: 0; transform: translateY(55px);
-}
-.ht-main {
-  font-size: clamp(5.5rem, 16vw, 13rem);
-  font-weight: 300; letter-spacing: -0.045em;
-  background: linear-gradient(130deg,
-    var(--glow)   0%,
-    var(--cream)  35%,
-    var(--accent) 65%,
-    var(--glow)   100%);
-  background-size: 280% auto;
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
-  animation: shimmer 9s linear infinite;
-}
-@keyframes shimmer { 0%{background-position:0% center} 100%{background-position:280% center} }
-
-/* Secondary subtitle — clean hierarchy below dominant title */
+/* Subtitle — sits below the 3D particle SPECTRA */
 .hero-sub {
   font-size: clamp(1rem, 1.75vw, 1.18rem);
   color: var(--ice-dim); max-width: 420px;
@@ -873,8 +855,6 @@ body.cur-tool #cursor-ring { border-color: var(--tc, var(--glow)); }
 }
 @media (max-width: 640px) {
   .nav-links { display: none; }
-  .hero-title { font-size: clamp(4.2rem, 20vw, 8rem); letter-spacing: -0.04em; }
-  .ht-main    { font-size: clamp(4.2rem, 20vw, 8rem); }
   .hero-ctas  { flex-direction: column; width: 100%; }
   .btn-primary, .btn-ghost { justify-content: center; }
   .section-title { font-size: clamp(2rem, 7.5vw, 3rem); }
