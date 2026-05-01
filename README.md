@@ -9,8 +9,10 @@
 
 Spectra is Pano Marketing Solutions' proprietary AI-powered creative suite, built as part of the Mason Externship Program. The platform houses five AI tools designed to give Pano and its clients an unfair creative advantage in content creation, analysis, and distribution.
 
-## Live Preview (Sandbox)
-- **Landing Page:** `https://3000-ioetnae159awyvdahg3ow-c81df28e.sandbox.novita.ai`
+## Live URLs
+- **Production (Cloudflare Pages):** https://spectra-b8s.pages.dev
+- **GitHub Repo:** https://github.com/mkbrown261/Spectra
+- **Dev Sandbox:** `https://3000-ioetnae159awyvdahg3ow-c81df28e.sandbox.novita.ai`
 
 ---
 
