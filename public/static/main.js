@@ -43,7 +43,7 @@
   let icoGroup, icoPieces = [], icoCore, icoWire;
   let dashGroup, portalGroup;
 
-  /* ── DRAG-TO-SPIN state (scene 3 — big sphere) ─────────────────── */
+  /* ── DRAG-TO-SPIN state (scene 1 — big particle sphere) ──────────── */
   const drag = {
     active:    false,
     lastX:     0,
@@ -515,8 +515,8 @@
     document.getElementById('nav')?.classList.toggle('scrolled',idx>0);
     if(prev===4) onLeaveScene4();
     if(idx!==1) hideHUD();
-    // Reset grab cursor when leaving scene 3
-    if(prev===3 && idx!==3) {
+    // Reset grab cursor when leaving scene 1
+    if(prev===1 && idx!==1) {
       const canvas = document.getElementById('world-canvas');
       if(canvas) canvas.style.cursor = '';
       drag.active = false; drag.velX = 0; drag.velY = 0;
@@ -561,6 +561,12 @@
       {opacity:0,x:50},{opacity:1,x:0,stagger:0.1,duration:0.65,ease:'power3.out',delay:0.25});
 
     if(selectedTool>=0) highlightTool(selectedTool,false);
+
+    // Enable grab cursor + preserve spin state on scene 1
+    const canvas1 = document.getElementById('world-canvas');
+    if(canvas1) canvas1.style.cursor = 'grab';
+    // Reset velocity but keep accumulated spin so re-entering doesn't snap
+    drag.velX = 0; drag.velY = 0;
   }
 
   /* ── Scene 2: ARCHITECTURE / ICO ───────────────────────────── */
@@ -627,10 +633,6 @@
     gsap.fromTo('.metric',{opacity:0,y:44},{opacity:1,y:0,stagger:0.14,duration:0.8,ease:'power2.out',delay:0.4});
     gsap.fromTo('#ui-about .section-eyebrow,#ui-about .section-title,#ui-about .section-body',
       {opacity:0,y:30},{opacity:1,y:0,stagger:0.1,duration:0.8,ease:'power2.out',delay:0.15});
-    // Enable grab cursor + reset spin momentum
-    const canvas = document.getElementById('world-canvas');
-    if(canvas) canvas.style.cursor = 'grab';
-    drag.velX = 0; drag.velY = 0;
   }
 
   /* ── Scene 4: PORTAL / CTA ──────────────────────────────────── */
@@ -887,11 +889,31 @@
     /* spring look-at */
     camera.lookAt(camLook.x+mouseEased.x*0.10, camLook.y+mouseEased.y*0.07, camLook.z);
 
-    /* particle rotation */
+    /* particle rotation — drag overrides mouse-eased parallax on scene 1 */
     if(mainParticles&&activeScene!==4){
-      mainParticles.rotation.y+=(mouseEased.x*0.22-mainParticles.rotation.y)*0.03;
-      mainParticles.rotation.x+=(mouseEased.y*0.14-mainParticles.rotation.x)*0.03;
-      mainParticles.rotation.z=Math.sin(t*0.07)*0.025;
+      if(activeScene===1){
+        // Apply drag momentum decay
+        if(!drag.active){
+          drag.velX*=0.92; drag.velY*=0.92;
+          drag.spinY+=drag.velX; drag.spinX+=drag.velY;
+          // When momentum dies, gentle idle drift
+          if(Math.abs(drag.velX)+Math.abs(drag.velY)<0.002){
+            drag.spinY+=0.003;
+          }
+        }
+        mainParticles.rotation.y=drag.spinY;
+        mainParticles.rotation.x=drag.spinX;
+        mainParticles.rotation.z=Math.sin(t*0.07)*0.025;
+        // Keep nodeGroup locked to same rotation so tools spin with sphere
+        if(nodeGroup){
+          nodeGroup.rotation.y=drag.spinY;
+          nodeGroup.rotation.x=drag.spinX;
+        }
+      } else {
+        mainParticles.rotation.y+=(mouseEased.x*0.22-mainParticles.rotation.y)*0.03;
+        mainParticles.rotation.x+=(mouseEased.y*0.14-mainParticles.rotation.x)*0.03;
+        mainParticles.rotation.z=Math.sin(t*0.07)*0.025;
+      }
     }
     if(ambParticles){
       ambParticles.rotation.y=t*0.005;
@@ -956,8 +978,8 @@
       }
     });
 
-    nodeGroup.rotation.y=mouseEased.x*0.28+t*0.010;
-    nodeGroup.rotation.x=mouseEased.y*0.14;
+    // nodeGroup rotation is handled by drag system in RAF when scene===1
+    // (no override here — drag.spinY/X already applied above)
   }
 
   function tickIco(t) {
@@ -984,22 +1006,9 @@
       }
     });
 
-    // If not dragging, apply momentum decay then idle drift
-    if (!drag.active) {
-      drag.velX *= 0.92;
-      drag.velY *= 0.92;
-      drag.spinX += drag.velY;
-      drag.spinY += drag.velX;
-      // When momentum dies out, gently nudge with mouse parallax
-      const momentum = Math.abs(drag.velX) + Math.abs(drag.velY);
-      if (momentum < 0.002) {
-        drag.spinY += mouseEased.x * 0.012;
-        drag.spinX += mouseEased.y * 0.006;
-      }
-    }
-
-    dashGroup.rotation.y = drag.spinY;
-    dashGroup.rotation.x = drag.spinX;
+    // dashGroup has its own simple auto-rotate (drag moved to scene 1)
+    dashGroup.rotation.y = mouseEased.x * 0.18 + t * 0.008;
+    dashGroup.rotation.x = mouseEased.y * 0.10;
   }
 
   function tickPortal(t) {
@@ -1043,8 +1052,8 @@
       mouse.y=(e.touches[0].clientY/innerHeight)*2-1;
       mouseNDC.set(mouse.x,-mouse.y);
 
-      // drag-to-spin on scene 3 (touch)
-      if(drag.active && drag.touch && dashGroup?.visible) {
+      // drag-to-spin on scene 1 (touch)
+      if(drag.active && drag.touch && nodeGroup?.visible) {
         const dx = e.touches[0].clientX - drag.lastX;
         const dy = e.touches[0].clientY - drag.lastY;
         drag.velX = dx * 0.012;
@@ -1056,11 +1065,11 @@
       }
     },{passive:true});
 
-    /* drag-to-spin — mouse (scene 3 only) */
+    /* drag-to-spin — mouse (scene 1: particle sphere) */
     const canvas = document.getElementById('world-canvas');
 
     window.addEventListener('mousedown', e => {
-      if(!dashGroup?.visible) return;
+      if(!nodeGroup?.visible) return;
       drag.active = true;
       drag.touch  = false;
       drag.lastX  = e.clientX;
@@ -1071,7 +1080,7 @@
     });
 
     window.addEventListener('mousemove', e => {
-      if(!drag.active || !dashGroup?.visible) return;
+      if(!drag.active || !nodeGroup?.visible) return;
       const dx = e.clientX - drag.lastX;
       const dy = e.clientY - drag.lastY;
       drag.velX   = dx * 0.010;
@@ -1085,16 +1094,16 @@
     window.addEventListener('mouseup', () => {
       if(!drag.active) return;
       drag.active = false;
-      if(canvas && dashGroup?.visible) canvas.style.cursor = 'grab';
+      if(canvas && nodeGroup?.visible) canvas.style.cursor = 'grab';
     });
 
     window.addEventListener('mouseleave', () => {
       drag.active = false;
     });
 
-    /* drag-to-spin — touch (scene 3 only) */
+    /* drag-to-spin — touch (scene 1: particle sphere) */
     window.addEventListener('touchstart', e => {
-      if(!dashGroup?.visible || !e.touches[0]) return;
+      if(!nodeGroup?.visible || !e.touches[0]) return;
       drag.active = true;
       drag.touch  = true;
       drag.lastX  = e.touches[0].clientX;
