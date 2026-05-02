@@ -534,7 +534,7 @@ app.get('/tools/attention-engine',  (c) => c.redirect('/tools/attention-engine/'
 app.get('/tools/attention-engine/', (c) => c.html(attentionEnginePage()))
 
 app.get('/tools/video-generator',   (c) => c.redirect('/tools/video-generator/'))
-app.get('/tools/video-generator/',  (c) => c.html(toolShell('AI Video Generator', 'video', '#34D399')))
+app.get('/tools/video-generator/',  (c) => c.html(toolShell('Intelligent Video Generator', 'video', '#34D399')))
 app.get('/tools/distribution-engine',  (c) => c.redirect('/tools/distribution-engine/'))
 app.get('/tools/distribution-engine/', (c) => c.html(toolShell('Content Distribution Engine', 'distribution', '#60A5FA')))
 app.get('/tools/motion-engine',  (c) => c.redirect('/tools/motion-engine/'))
@@ -556,7 +556,7 @@ function attentionEnginePage(): string {
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Attention Engine — Spectra</title>
-  <meta name="description" content="AI-powered content performance analysis. Drop-off detection, engagement scoring, and script optimization.">
+  <meta name="description" content="Intelligent content performance analysis. Drop-off detection, engagement scoring, and script optimization.">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
@@ -947,7 +947,7 @@ function attentionEnginePage(): string {
       <p class="ae-empty-sub">Enter your content details and performance metrics on the left, then run the analysis to get a full breakdown.</p>
       <div class="ae-empty-chips">
         <span class="ae-chip">Drop-off Detection</span>
-        <span class="ae-chip">AI Diagnosis</span>
+        <span class="ae-chip">Intelligent Diagnosis</span>
         <span class="ae-chip">Hook Scoring</span>
         <span class="ae-chip">Script Rewrite</span>
         <span class="ae-chip">Platform Weights</span>
@@ -1003,7 +1003,7 @@ function attentionEnginePage(): string {
           <div class="ae-signal-bars" id="signal-bars"></div>
         </div>
         <div class="ae-verdict-card" id="verdict-card" style="display:none">
-          <div class="ae-verdict-label">AI VERDICT</div>
+          <div class="ae-verdict-label">INTELLIGENT VERDICT</div>
           <div class="ae-verdict-text" id="verdict-text"></div>
         </div>
       </div>
@@ -1052,7 +1052,7 @@ function attentionEnginePage(): string {
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
             Generate Rewrites
           </button>
-          <span class="ae-rewrite-note">AI will generate 3 hooks + 2 full script rewrites</span>
+          <span class="ae-rewrite-note">Engine will generate 3 hooks + 2 full script rewrites</span>
         </div>
         <div class="ae-rewrite-output" id="rewrite-output"></div>
       </div>
@@ -1127,8 +1127,8 @@ function landingPage(): string {
 <html lang="en">
 <head>
   <meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Spectra — AI Creative Suite</title>
-  <meta name="description" content="Spectra — Five AI systems. One unified platform. Infinite creative output.">
+  <title>Spectra — Intelligent Creative Suite</title>
+  <meta name="description" content="Spectra — Five Intelligent systems. One unified platform. Infinite creative output.">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
@@ -1137,6 +1137,7 @@ function landingPage(): string {
 <body>
 <div id="loader"><div class="loader-inner"><div class="loader-word"><span>S</span><span>P</span><span>E</span><span>C</span><span>T</span><span>R</span><span>A</span></div><div class="loader-bar-track"><div class="loader-bar-fill"></div></div><div class="loader-status">Initializing</div></div></div>
 <div id="cursor-dot"></div><div id="cursor-ring"></div>
+<div id="hyper-overlay"></div>
 <div id="node-tooltip"></div>
 <nav id="nav" role="navigation">
   <a href="/" class="nav-logo"><span class="nav-logo-mark">S</span><span class="nav-logo-text">SPECTRA</span></a>
@@ -1156,8 +1157,8 @@ function landingPage(): string {
 <div id="scroll-container">
   <section class="scene" id="scene-hero" data-scene="0">
     <div class="scene-ui" id="ui-hero">
-      <p class="hero-pre">AI Creative Suite</p>
-      <p class="hero-sub">Five AI systems. One platform.<br>Infinite creative output.</p>
+      <p class="hero-pre">Intelligent Creative Suite</p>
+      <p class="hero-sub">Five Intelligent systems. One platform.<br>Infinite creative output.</p>
       <div class="hero-ctas">
         <a href="#scene-tools" class="btn-primary btn-glow cta-scroll"><span>Enter the System</span><svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
         <a href="#scene-about" class="btn-ghost cta-scroll">Learn More</a>
@@ -1167,7 +1168,7 @@ function landingPage(): string {
   </section>
   <section class="scene" id="scene-tools" data-scene="1">
     <div class="scene-ui" id="ui-tools">
-      <div class="section-eyebrow"><span class="eyebrow-pip"></span>AI SUITE — SELECT A SYSTEM</div>
+      <div class="section-eyebrow"><span class="eyebrow-pip"></span>INTELLIGENT SUITE — SELECT A SYSTEM</div>
       <h2 class="section-title">Five Tools.<br><em>One Platform.</em></h2>
       <div class="tools-orbital" role="list" id="tools-list">
         <button class="tool-node" data-node="0" data-color="purple" role="listitem"><div class="node-accent-bar"></div><div class="node-core"><svg viewBox="0 0 32 32" fill="none"><circle cx="16" cy="16" r="6" stroke="currentColor" stroke-width="1.5"/><circle cx="16" cy="16" r="12" stroke="currentColor" stroke-width="1" stroke-dasharray="2 3" opacity="0.5"/><circle cx="16" cy="16" r="2" fill="currentColor"/></svg></div><div class="node-label"><span class="node-num">01</span><span class="node-name">Attention Engine</span></div><span class="node-status active">Active</span></button>
@@ -1183,22 +1184,22 @@ function landingPage(): string {
       <div class="section-eyebrow"><span class="eyebrow-pip"></span>ARCHITECTURE</div>
       <h2 class="section-title">Built Different.<br><em>By Design.</em></h2>
       <div class="feature-fragments" id="feature-grid">
-        <button class="frag" data-frag="0"><div class="frag-icon-wrap" style="--fc:#A78BFA"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13 10V3L4 14h7v7l9-11h-7z" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div class="frag-body"><div class="frag-title">Real-Time Analysis</div><div class="frag-label">AI processes content at inference speed</div></div></button>
+        <button class="frag" data-frag="0"><div class="frag-icon-wrap" style="--fc:#A78BFA"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13 10V3L4 14h7v7l9-11h-7z" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div class="frag-body"><div class="frag-title">Real-Time Analysis</div><div class="frag-label">Intelligently processes content at inference speed</div></div></button>
         <button class="frag" data-frag="1"><div class="frag-icon-wrap" style="--fc:#34D399"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg></div><div class="frag-body"><div class="frag-title">Drop-Off Detection</div><div class="frag-label">Pinpoints engagement loss moments</div></div></button>
         <button class="frag" data-frag="2"><div class="frag-icon-wrap" style="--fc:#60A5FA"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></div><div class="frag-body"><div class="frag-title">Script Rewrite Engine</div><div class="frag-label">GPT-powered content optimization</div></div></button>
         <button class="frag" data-frag="3"><div class="frag-icon-wrap" style="--fc:#FB923C"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></div><div class="frag-body"><div class="frag-title">Performance Scoring</div><div class="frag-label">Quantified content quality metrics</div></div></button>
         <button class="frag" data-frag="4"><div class="frag-icon-wrap" style="--fc:#F472B6"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg></div><div class="frag-body"><div class="frag-title">Multi-Platform Distribution</div><div class="frag-label">Optimal timing across all channels</div></div></button>
-        <button class="frag" data-frag="5"><div class="frag-icon-wrap" style="--fc:#A8D8F0"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg></div><div class="frag-body"><div class="frag-title">Cinematic Motion AI</div><div class="frag-label">AI-composed video motion systems</div></div></button>
+        <button class="frag" data-frag="5"><div class="frag-icon-wrap" style="--fc:#A8D8F0"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg></div><div class="frag-body"><div class="frag-title">Cinematic Motion Intelligence</div><div class="frag-label">Intelligently composed video motion systems</div></div></button>
       </div>
     </div>
   </section>
   <section class="scene" id="scene-about" data-scene="3">
     <div class="scene-ui" id="ui-about">
       <div class="section-eyebrow"><span class="eyebrow-pip"></span>SPECTRA</div>
-      <h2 class="section-title">AI at the Speed<br><em>of Thought.</em></h2>
-      <p class="section-body">A closed-loop AI creative system — content is analyzed, generated, optimized, and distributed at machine speed.</p>
+      <h2 class="section-title">Intelligent at the Speed<br><em>of Thought.</em></h2>
+      <p class="section-body">A closed-loop intelligent creative system — content is analyzed, generated, optimized, and distributed at machine speed.</p>
       <div class="metric-row" role="list">
-        <div class="metric" role="listitem"><div class="metric-val" data-count="5">0</div><div class="metric-label">AI Engines</div></div>
+        <div class="metric" role="listitem"><div class="metric-val" data-count="5">0</div><div class="metric-label">Intelligent Engines</div></div>
         <div class="metric" role="listitem"><div class="metric-val" data-count="100">0</div><div class="metric-label">% Automated</div></div>
         <div class="metric" role="listitem"><div class="metric-val">∞</div><div class="metric-label">Scale</div></div>
         <div class="metric" role="listitem"><div class="metric-val" data-count="1">0</div><div class="metric-label">Unified Platform</div></div>
@@ -1209,7 +1210,7 @@ function landingPage(): string {
     <div class="scene-ui" id="ui-cta">
       <div class="section-eyebrow"><span class="eyebrow-pip"></span>BEGIN</div>
       <h2 class="cta-title">The system<br><em>is ready.</em></h2>
-      <p class="cta-body">Launch the AI Attention Engine — your first portal into the Spectra suite.</p>
+      <p class="cta-body">Launch the Intelligent Attention Engine — your first portal into the Spectra suite.</p>
       <div class="cta-actions">
         <a href="/tools/attention-engine/" class="btn-primary btn-glow"><span>Launch Attention Engine</span><svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
         <a href="#scene-tools" class="btn-ghost cta-scroll">Explore Systems</a>

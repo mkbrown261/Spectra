@@ -22,9 +22,9 @@
   /* ── Tool definitions ────────────────────────────────────────── */
   const TOOLS = [
     { id:0, name:'Attention Engine',    short:'Analyzes video content for engagement drop-offs in real time', color:'#A78BFA', hex:0xA78BFA, url:'/tools/attention-engine/',    nodePos:null },
-    { id:1, name:'Video Generator',     short:'AI-powered video creation from scripts and prompts',           color:'#34D399', hex:0x34D399, url:'/tools/video-generator/',     nodePos:null },
+    { id:1, name:'Video Generator',     short:'Intelligent video creation from scripts and prompts',           color:'#34D399', hex:0x34D399, url:'/tools/video-generator/',     nodePos:null },
     { id:2, name:'Distribution Engine', short:'Optimal timing and multi-platform content delivery',           color:'#60A5FA', hex:0x60A5FA, url:'/tools/distribution-engine/', nodePos:null },
-    { id:3, name:'Motion Engine',       short:'Cinematic AI motion composition system',                       color:'#FB923C', hex:0xFB923C, url:'/tools/motion-engine/',       nodePos:null },
+    { id:3, name:'Motion Engine',       short:'Cinematic intelligent motion composition system',                       color:'#FB923C', hex:0xFB923C, url:'/tools/motion-engine/',       nodePos:null },
     { id:4, name:'Persona Engine',      short:'Adaptive brand voice and audience intelligence',               color:'#F87171', hex:0xF87171, url:'/tools/persona-engine/',      nodePos:null },
   ];
 
@@ -1115,24 +1115,42 @@
       renderer.setSize(innerWidth,innerHeight);
     },{passive:true});
 
-    /* UI tool node buttons */
+    /* UI tool node buttons — single click selects, double-click launches with hyper thrust */
     document.querySelectorAll('.tool-node').forEach(el => {
+      let clickTimer = null;
+
       el.addEventListener('click', e => {
         e.preventDefault(); e.stopPropagation();
-        const tId=parseInt(el.dataset.node);
-        if(activeScene===1) selectTool(tId);
-        else {
-          document.getElementById('scene-tools')?.scrollIntoView({behavior:'smooth'});
-          setTimeout(()=>selectTool(tId),800);
+        const tId = parseInt(el.dataset.node);
+
+        // Ripple on every click
+        spawnRipple(el, e);
+
+        if (clickTimer) {
+          // ── DOUBLE-CLICK → hyper-thrust navigate ──────────────
+          clearTimeout(clickTimer); clickTimer = null;
+          if (activeScene === 1) launchToTool(tId, el, e);
+          return;
         }
+
+        // ── SINGLE-CLICK → select / highlight ──────────────────
+        clickTimer = setTimeout(() => {
+          clickTimer = null;
+          if (activeScene === 1) selectTool(tId);
+          else {
+            document.getElementById('scene-tools')?.scrollIntoView({behavior:'smooth'});
+            setTimeout(() => selectTool(tId), 800);
+          }
+        }, 240);
       });
-      el.addEventListener('mouseenter',()=>document.body.classList.add('cur-hover'));
-      el.addEventListener('mouseleave',()=>document.body.classList.remove('cur-hover'));
+
+      el.addEventListener('mouseenter', () => document.body.classList.add('cur-hover'));
+      el.addEventListener('mouseleave', () => document.body.classList.remove('cur-hover'));
     });
 
     /* Feature fragments */
     document.querySelectorAll('.frag').forEach((el,i) => {
-      el.addEventListener('click', e=>{ e.stopPropagation(); handleFragClick(i); });
+      el.addEventListener('click', e=>{ e.stopPropagation(); spawnRipple(el,e); handleFragClick(i); });
       el.addEventListener('mouseenter',()=>document.body.classList.add('cur-hover'));
       el.addEventListener('mouseleave',()=>document.body.classList.remove('cur-hover'));
     });
@@ -1141,10 +1159,11 @@
     document.querySelector('.hud-link')?.addEventListener('mouseenter',()=>document.body.classList.add('cur-hover'));
     document.querySelector('.hud-link')?.addEventListener('mouseleave',()=>document.body.classList.remove('cur-hover'));
 
-    /* Generic interactive elements */
+    /* Generic interactive elements — ripple + cursor */
     document.querySelectorAll('a,button,.btn-primary,.btn-ghost,.metric,.cta-brand').forEach(el => {
       el.addEventListener('mouseenter',()=>document.body.classList.add('cur-hover'));
       el.addEventListener('mouseleave',()=>document.body.classList.remove('cur-hover'));
+      el.addEventListener('click', e => spawnRipple(el, e));
     });
 
     /* Smooth scroll for anchor links */
@@ -1155,6 +1174,54 @@
         t.scrollIntoView({behavior:'smooth',block:'start'});
       });
     });
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     RIPPLE + HYPER-THRUST NAVIGATION
+  ══════════════════════════════════════════════════════════════ */
+
+  /* Spawn a ripple ring at the click point inside an element */
+  function spawnRipple(el, e) {
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const x = (e?.clientX ?? rect.left + rect.width / 2) - rect.left;
+    const y = (e?.clientY ?? rect.top + rect.height / 2) - rect.top;
+    const ring = document.createElement('span');
+    ring.className = 'ripple-ring';
+    ring.style.left = x + 'px';
+    ring.style.top  = y + 'px';
+    el.appendChild(ring);
+    ring.addEventListener('animationend', () => ring.remove(), { once: true });
+  }
+
+  /* Hyper-thrust: flash white from click origin, then navigate */
+  function launchToTool(toolId, el, e) {
+    const url = TOOLS[toolId]?.url;
+    if (!url) return;
+
+    const overlay = document.getElementById('hyper-overlay');
+    if (!overlay) { window.location.href = url; return; }
+
+    // Calc click origin as % of viewport
+    const cx = e ? (e.clientX / innerWidth  * 100).toFixed(1) + '%' : '50%';
+    const cy = e ? (e.clientY / innerHeight * 100).toFixed(1) + '%' : '50%';
+    overlay.style.setProperty('--ox', cx);
+    overlay.style.setProperty('--oy', cy);
+
+    // Play launch animation on the node itself
+    el?.classList.add('launching');
+
+    // Camera: thrust forward (FOV squeeze + zoom in)
+    gsap.to(camera, { fov: 30, duration: 0.45, ease: 'power4.in',
+      onUpdate: () => camera.updateProjectionMatrix() });
+    gsap.to(camera.position, { z: camera.position.z - 3.5, duration: 0.45, ease: 'power4.in' });
+
+    // Flash the overlay
+    overlay.classList.remove('settle');
+    overlay.classList.add('fire');
+
+    // Navigate after the flash peaks
+    setTimeout(() => { window.location.href = url; }, 420);
   }
 
   /* ══════════════════════════════════════════════════════════════
