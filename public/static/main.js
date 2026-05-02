@@ -42,6 +42,18 @@
   let nodeGroup, nodeObjects = [], nodeLines = [], nodeRings = [], nodeHub, nodeHubHalo;
   let icoGroup, icoPieces = [], icoCore, icoWire;
   let dashGroup, portalGroup;
+
+  /* ── DRAG-TO-SPIN state (scene 3 — big sphere) ─────────────────── */
+  const drag = {
+    active:    false,
+    lastX:     0,
+    lastY:     0,
+    velX:      0,    // momentum X
+    velY:      0,    // momentum Y
+    spinX:     0,    // accumulated rotation X
+    spinY:     0,    // accumulated rotation Y
+    touch:     false,
+  };
   let pos_logo, pos_sphere, pos_torus, pos_wave, pos_dna, pos_scatter;
   const camPos  = new THREE.Vector3();
   const camLook = new THREE.Vector3(0,0,0);
@@ -503,6 +515,12 @@
     document.getElementById('nav')?.classList.toggle('scrolled',idx>0);
     if(prev===4) onLeaveScene4();
     if(idx!==1) hideHUD();
+    // Reset grab cursor when leaving scene 3
+    if(prev===3 && idx!==3) {
+      const canvas = document.getElementById('world-canvas');
+      if(canvas) canvas.style.cursor = '';
+      drag.active = false; drag.velX = 0; drag.velY = 0;
+    }
     moveCameraTo(idx);
     if(idx===0) enterScene0();
     else if(idx===1) enterScene1();
@@ -609,6 +627,10 @@
     gsap.fromTo('.metric',{opacity:0,y:44},{opacity:1,y:0,stagger:0.14,duration:0.8,ease:'power2.out',delay:0.4});
     gsap.fromTo('#ui-about .section-eyebrow,#ui-about .section-title,#ui-about .section-body',
       {opacity:0,y:30},{opacity:1,y:0,stagger:0.1,duration:0.8,ease:'power2.out',delay:0.15});
+    // Enable grab cursor + reset spin momentum
+    const canvas = document.getElementById('world-canvas');
+    if(canvas) canvas.style.cursor = 'grab';
+    drag.velX = 0; drag.velY = 0;
   }
 
   /* ── Scene 4: PORTAL / CTA ──────────────────────────────────── */
@@ -961,8 +983,23 @@
         else { c.rotation.y=t*sp*0.5; c.rotation.x=t*sp*0.3; }
       }
     });
-    dashGroup.rotation.y=mouseEased.x*0.18;
-    dashGroup.rotation.x=mouseEased.y*0.10;
+
+    // If not dragging, apply momentum decay then idle drift
+    if (!drag.active) {
+      drag.velX *= 0.92;
+      drag.velY *= 0.92;
+      drag.spinX += drag.velY;
+      drag.spinY += drag.velX;
+      // When momentum dies out, gently nudge with mouse parallax
+      const momentum = Math.abs(drag.velX) + Math.abs(drag.velY);
+      if (momentum < 0.002) {
+        drag.spinY += mouseEased.x * 0.012;
+        drag.spinX += mouseEased.y * 0.006;
+      }
+    }
+
+    dashGroup.rotation.y = drag.spinY;
+    dashGroup.rotation.x = drag.spinX;
   }
 
   function tickPortal(t) {
@@ -1005,7 +1042,71 @@
       mouse.x=(e.touches[0].clientX/innerWidth)*2-1;
       mouse.y=(e.touches[0].clientY/innerHeight)*2-1;
       mouseNDC.set(mouse.x,-mouse.y);
+
+      // drag-to-spin on scene 3 (touch)
+      if(drag.active && drag.touch && dashGroup?.visible) {
+        const dx = e.touches[0].clientX - drag.lastX;
+        const dy = e.touches[0].clientY - drag.lastY;
+        drag.velX = dx * 0.012;
+        drag.velY = dy * 0.012;
+        drag.spinY += drag.velX;
+        drag.spinX += drag.velY;
+        drag.lastX = e.touches[0].clientX;
+        drag.lastY = e.touches[0].clientY;
+      }
     },{passive:true});
+
+    /* drag-to-spin — mouse (scene 3 only) */
+    const canvas = document.getElementById('world-canvas');
+
+    window.addEventListener('mousedown', e => {
+      if(!dashGroup?.visible) return;
+      drag.active = true;
+      drag.touch  = false;
+      drag.lastX  = e.clientX;
+      drag.lastY  = e.clientY;
+      drag.velX   = 0;
+      drag.velY   = 0;
+      if(canvas) canvas.style.cursor = 'grabbing';
+    });
+
+    window.addEventListener('mousemove', e => {
+      if(!drag.active || !dashGroup?.visible) return;
+      const dx = e.clientX - drag.lastX;
+      const dy = e.clientY - drag.lastY;
+      drag.velX   = dx * 0.010;
+      drag.velY   = dy * 0.010;
+      drag.spinY += drag.velX;
+      drag.spinX += drag.velY;
+      drag.lastX  = e.clientX;
+      drag.lastY  = e.clientY;
+    }, {passive:true});
+
+    window.addEventListener('mouseup', () => {
+      if(!drag.active) return;
+      drag.active = false;
+      if(canvas && dashGroup?.visible) canvas.style.cursor = 'grab';
+    });
+
+    window.addEventListener('mouseleave', () => {
+      drag.active = false;
+    });
+
+    /* drag-to-spin — touch (scene 3 only) */
+    window.addEventListener('touchstart', e => {
+      if(!dashGroup?.visible || !e.touches[0]) return;
+      drag.active = true;
+      drag.touch  = true;
+      drag.lastX  = e.touches[0].clientX;
+      drag.lastY  = e.touches[0].clientY;
+      drag.velX   = 0;
+      drag.velY   = 0;
+    }, {passive:true});
+
+    window.addEventListener('touchend', () => {
+      drag.active = false;
+      drag.touch  = false;
+    }, {passive:true});
 
     /* resize */
     window.addEventListener('resize', () => {
