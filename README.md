@@ -1,207 +1,242 @@
-# Spectra — Intelligent Creative Suite
+# Spectra — AI Filmmaking Production Suite
 
 ## Project Overview
-- **Name**: Spectra
-- **Goal**: A cinematic 5-scene scroll engine landing page housing a full 5-tool AI creative suite for Pano Marketing
-- **Platform**: Cloudflare Pages
+- **Codename**: `spectra`
+- **Goal**: Professional AI video production platform — persistent projects, character memory, encrypted BYOK API keys, multi-model generation via Higgsfield
 - **Production URL**: https://spectra-b8s.pages.dev
-- **Deployment**: `spectra` project on Cloudflare Pages (account: mkbrown261@gmail.com)
+- **Latest Deploy**: https://c5a4022c.spectra-b8s.pages.dev
+- **Platform**: Cloudflare Pages + Workers + D1 + R2
 
 ---
 
-## Live URLs
+## Tools
 
-| Route | Status | Description |
-|-------|--------|-------------|
-| `https://spectra-b8s.pages.dev/` | ✅ Live | Cinematic landing (5-scene Three.js scroll engine) |
-| `https://spectra-b8s.pages.dev/tools/attention-engine/` | ✅ Live | Tool 01 — Attention Engine (full) |
-| `https://spectra-b8s.pages.dev/tools/video-generator/` | ✅ Live | Tool 02 — Video Generator (full) |
-| `https://spectra-b8s.pages.dev/tools/distribution-engine/` | 🔄 Shell | Tool 03 — Coming Soon placeholder |
-| `https://spectra-b8s.pages.dev/tools/motion-engine/` | 🔄 Shell | Tool 04 — Coming Soon placeholder |
-| `https://spectra-b8s.pages.dev/tools/persona-engine/` | 🔄 Shell | Tool 05 — Coming Soon placeholder |
-
----
-
-## Tools Status
-
-### ✅ Tool 01 — Attention Engine (`/tools/attention-engine/`)
-**Color**: Purple `#A78BFA`
-
-Full functional tool. Features:
-- 6-platform selector (TikTok, Instagram, YouTube, Twitter, Facebook, Paid Ads)
-- URL auto-population (YouTube API, Meta Graph API via user-provided keys)
-- Performance metrics input (views, likes, comments, shares, saves, watch time %)
-- Platform-weighted composite scoring (calibrated per-platform algorithm weights)
-- Drop-off point detection + timeline segment analysis
-- Streaming GPT-4o diagnosis (hook, pacing, visual, messaging, emotion, CTA)
-- 6-tab output: Scores, Timeline, Diagnosis, Optimize, Rewrite
-- Script Rewrite Engine (3 hooks + 2 full rewrites, streaming)
-- API keys drawer (localStorage, YouTube + Meta tokens)
-- Export / copy results
-
-**API routes:**
-- `POST /api/attention/analyze` — streaming SSE, full diagnosis JSON
-- `POST /api/attention/rewrite` — streaming SSE, hooks + rewrites JSON
-- `POST /api/attention/score` — instant JSON score
-- `GET /api/fetch-url?url=` — YouTube/Instagram/Facebook auto-populate
+| Tool | Route | Status |
+|------|-------|--------|
+| Landing (3D Spectra) | `/` | ✅ Live |
+| Video Generator | `/tools/video-generator/` | ✅ Live — Auth + Projects + Higgsfield |
+| Attention Engine | `/tools/attention-engine/` | ✅ Live |
+| Distribution Engine | `/tools/distribution-engine/` | 🔲 Shell only |
+| Motion Engine | `/tools/motion-engine/` | 🔲 Shell only |
+| Persona Engine | `/tools/persona-engine/` | 🔲 Shell only |
 
 ---
 
-### ✅ Tool 02 — Video Generator (`/tools/video-generator/`)
-**Color**: Green `#34D399`
+## Video Generator — Feature Status
 
-Full functional tool. Features:
-- 6-platform selector with auto aspect-ratio mapping
-- 8 video style chips (Cinematic, Documentary, Talking Head, UGC, Animation, etc.)
-- 4 aspect ratio buttons (9:16, 16:9, 1:1, 4:5)
-- Concept textarea, existing script/notes, audience, tone, duration, mood, music inputs
-- Generate Brief → streaming GPT-4o production brief (concept, scripts ×2, shot list, music, b-roll, voiceover, technical, captions)
-- 5 Hooks Only → streaming GPT-4o, 5 platform-native hook variations
-- 6-tab output: Brief, Script, Shot List, Hooks, Production, Captions
-- Brief tab: concept card, 8-field brief grid, director's note
-- Script tab: 2 full script versions with copy buttons
-- Shots tab: numbered shot list (type, description, direction, duration)
-- Hooks tab: 5 cards (strategy, text, why-it-works, copy button)
-- Production tab: music brief, b-roll suggestions, voiceover direction, technical specs
-- Captions tab: per-platform caption copy + hashtags, copy buttons
-- Markdown export of full brief
-- Re-run button
+### ✅ Completed
+- **Auth system** — register/login/logout, PBKDF2 password hashing (Web Crypto), 30-day session tokens in D1
+- **Encrypted key storage** — AES-256-GCM via Web Crypto, IV + ciphertext stored in D1, key NEVER returned to client
+- **Project CRUD** — create/list/get/patch/delete, tier-gated project count
+- **Style bible** — JSON per-project (style, mood, palette, camera language), injected into every prompt enhancement
+- **Character memory** — create/delete characters per project with ref image URLs (Soul ID ready)
+- **Higgsfield generation pipeline** — submit job → poll to completion → store in D1
+- **GPT-4o prompt enhancement** — style bible injection, cinema camera language, model/aspect context
+- **Shot polling** — 4s interval, updates card live on completion/failure/NSFW
+- **Shot grid** — cards with status overlays (queued/generating/failed), video preview on hover, play/download/delete/copy actions
+- **Tier enforcement** — free(1 proj/10 shots), creator(5/100), studio(25/500), pro(∞/∞)
+- **Settings drawer** — encrypted key save/status, account info, tier limits grid, upgrade teaser
+- **Auth gate** — login/register with tab switch, tier info strip
+- **Full frontend JS** — auth flow, project management, shot submission, polling, DOM rendering
+- **Model hint** — warns when i2v model needs reference image, clears for text-to-image models
 
-**API routes:**
-- `POST /api/video/generate` — streaming SSE, full production brief JSON
-- `POST /api/video/hooks` — streaming SSE, 5 hook variations JSON
-
----
-
-### 🔄 Tool 03 — Distribution Engine (`/tools/distribution-engine/`)
-**Color**: Blue `#60A5FA` — Coming Soon shell
-
-### 🔄 Tool 04 — Motion Engine (`/tools/motion-engine/`)
-**Color**: Orange `#FB923C` — Coming Soon shell
-
-### 🔄 Tool 05 — Persona Engine (`/tools/persona-engine/`)
-**Color**: Red `#F87171` — Coming Soon shell
+### 🔲 Not Yet Built
+- Stripe payment integration (upgrade tiers)
+- R2 permanent video copy (videos currently served direct from Higgsfield CDN)
+- Character Soul training flow
+- Shot comparison / reorder
+- Thumbnail extraction from completed videos
+- Export / sequence editor
 
 ---
 
-## Landing Page — 5-Scene Scroll Engine
+## API Routes
 
-Built with Three.js + GSAP ScrollTrigger. Five scroll-locked scenes:
-
-| Scene | ID | Content | 3D Object |
-|-------|----|---------|-----------|
-| 0 | `scene-hero` | Hero — "Intelligent Creative Suite" | Particle field (sparse) |
-| 1 | `scene-tools` | Tool selector — 5 node buttons | Particle sphere (`mainParticles` morphed to `pos_sphere`) + `nodeGroup` (5 tool nodes orbiting) |
-| 2 | `scene-features` | Architecture — 6 feature fragments | Floating geometric shards (`dashGroup`) |
-| 3 | `scene-about` | Metrics — 5/100%/∞/1 counters | Orbit ring system |
-| 4 | `scene-cta` | CTA — "The system is ready" | Hyperspace tunnel |
-
-**Drag-to-spin**: Scene 1 only — drags `mainParticles.rotation` and `nodeGroup.rotation` in sync. Momentum decay + idle auto-rotation.
-
----
-
-## Architecture
-
-### Tech Stack
-- **Framework**: Hono v4 on Cloudflare Workers (edge runtime)
-- **Build**: Vite + `@hono/vite-cloudflare-pages`
-- **3D**: Three.js r158 (CDN), GSAP 3.12.5 + ScrollTrigger (CDN)
-- **Fonts**: Space Grotesk + Space Mono (Google Fonts)
-- **AI**: OpenAI SDK (`openai` npm) — GPT-4o, streaming SSE
-
-### Cloudflare Workers Compatibility
-- **No Node.js APIs**: No `fs`, `path`, `os`, `child_process` — pure Workers runtime
-- **Static files**: Served by Cloudflare Pages CDN from `public/` automatically — no routes needed
-- **Env vars**: `c.env.OPENAI_API_KEY` pattern via `Hono<{ Bindings: T }>`
-- **Streaming**: `ReadableStream` + `TextEncoder` SSE pattern
-
-### Required Environment Variables (Cloudflare Secrets)
+### Auth
 ```
-OPENAI_API_KEY       # OpenAI API key
-OPENAI_BASE_URL      # Optional custom base URL (default: https://api.openai.com/v1)
-YOUTUBE_API_KEY      # Optional — YouTube Data API v3 (for URL auto-populate)
-FB_ACCESS_TOKEN      # Optional — Meta Graph API token (for Instagram/Facebook)
+POST /api/auth/register    { email, password } → { ok, user: { id, email, tier, credits } }
+POST /api/auth/login       { email, password } → { ok, user: { ... } }
+POST /api/auth/logout      → { ok }
+GET  /api/auth/me          → { id, email, tier, credits, limits }
 ```
 
-Set via: `npx wrangler pages secret put OPENAI_API_KEY --project-name spectra`
+### API Keys (encrypted at rest)
+```
+POST   /api/keys/save        { provider, key } → { ok, provider }
+GET    /api/keys/status      → { higgsfield: { connected, saved_at } }
+DELETE /api/keys/:provider   → { ok }
+```
+
+### Projects
+```
+POST   /api/projects             { name, style_bible, default_model } → { ok, id, name }
+GET    /api/projects             → [ { id, name, shot_count, default_model, ... } ]
+GET    /api/projects/:id         → { ...project, shots: [...], characters: [...] }
+PATCH  /api/projects/:id         { name?, style_bible?, default_model? } → { ok }
+DELETE /api/projects/:id         → { ok }
+```
+
+### Characters
+```
+POST   /api/projects/:id/characters                  { name, description, ref_image_url }
+DELETE /api/projects/:projectId/characters/:charId
+```
+
+### Generation
+```
+GET  /api/models                    → [ { id, label, category, type, requires_image } ]
+POST /api/generate                  { project_id, prompt, model, aspect_ratio, duration, image_url? }
+                                    → { ok, shot_id, request_id, status: 'queued', prompt_enhanced }
+GET  /api/shots/:shotId/status      → { id, status, video_url, hf_video_url, error_message }
+DELETE /api/shots/:shotId           → { ok }
+POST /api/enhance-prompt            { prompt, model, aspect_ratio, style_bible? }
+                                    → { original, enhanced }
+```
+
+### Attention Engine (preserved)
+```
+POST /api/attention/analyze
+POST /api/attention/rewrite
+POST /api/attention/score
+GET  /api/fetch-url
+```
+
+---
+
+## Data Models
+
+### D1 Database: `spectra-production` (ID: f6f517a3-46eb-4837-bc84-9dbd4b61d66c)
+
+| Table | Key Fields |
+|-------|-----------|
+| `users` | id, email, password_hash, tier, credits, stripe fields |
+| `api_keys` | user_id, provider, encrypted_key (AES-GCM), iv — UNIQUE(user_id, provider) |
+| `projects` | user_id, name, style_bible (JSON), default_model, shot_count |
+| `characters` | project_id, name, description, ref_image_url, soul_id |
+| `shots` | project_id, user_id, prompt_raw, prompt_enhanced, model, aspect_ratio, hf_request_id, status, video_url, hf_video_url |
+| `sessions` | id (token), user_id, expires_at |
+
+### R2 Bucket: `spectra-assets` (binding: `STORAGE`)
+- Future: permanent video copies, thumbnails, character ref images
+
+---
+
+## Higgsfield Models (Validated)
+
+| Model ID | Label | Type | Requires Image |
+|----------|-------|------|----------------|
+| `higgsfield-ai/dop/lite` | DoP Lite | image-to-video | ✅ |
+| `higgsfield-ai/dop/standard` | DoP Standard | image-to-video | ✅ |
+| `higgsfield-ai/dop/turbo` | DoP Turbo | image-to-video | ✅ |
+| `kling-video/v2.1/pro/image-to-video` | Kling 2.1 Pro | image-to-video | ✅ |
+| `kling-video/v2.1/standard/image-to-video` | Kling 2.1 Std | image-to-video | ✅ |
+| `bytedance/seedance/v1/pro/image-to-video` | Seedance Pro | image-to-video | ✅ |
+| `bytedance/seedance/v1/lite/image-to-video` | Seedance Lite | image-to-video | ✅ |
+| `higgsfield-ai/soul/standard` | Soul | text-to-image | ❌ |
+| `flux-pro/kontext/max/text-to-image` | Flux Kontext Max | text-to-image | ❌ |
+
+**API format**: `POST https://platform.higgsfield.ai/{model_id}`  
+**Auth**: `Authorization: Key KEY_ID:KEY_SECRET`  
+**Poll**: `GET https://platform.higgsfield.ai/requests/{request_id}/status`
+
+---
+
+## Cloudflare Secrets (Production)
+
+| Secret | Purpose |
+|--------|---------|
+| `ENCRYPTION_KEY` | 32-byte hex — AES-256-GCM key for encrypting user API keys at rest |
+| `JWT_SECRET` | 32-byte hex — reserved for future JWT use |
+| `OPENAI_API_KEY` | GPT-4o prompt enhancement |
+| `OPENAI_BASE_URL` | OpenAI base URL (default: https://api.openai.com/v1) |
+
+Set via: `npx wrangler pages secret put SECRET_NAME --project-name spectra`
+
+---
+
+## Security Architecture
+
+- **Passwords**: PBKDF2 (100k iterations, SHA-256, random 16-byte salt) — pure Web Crypto
+- **Sessions**: 32-byte random tokens stored in D1, `httpOnly Secure SameSite=Lax` cookie
+- **API keys**: AES-256-GCM encrypted before storage, IV stored alongside. Key is decrypted server-side ONLY at generation time. Never returned to client in any response.
+- **Constant-time compare**: HMAC-based safeCompare for session token validation
 
 ---
 
 ## File Structure
 
 ```
-webapp/
-├── src/
-│   └── index.tsx                    # All Hono routes + page HTML functions
-├── public/
-│   ├── favicon.svg
-│   └── static/
-│       ├── style.css                # Landing page styles (5-scene scroll engine)
-│       ├── main.js                  # Landing page Three.js + GSAP engine
-│       ├── attention-engine.css     # Tool 01 stylesheet
-│       ├── attention-engine.js      # Tool 01 frontend logic
-│       ├── video-generator.css      # Tool 02 stylesheet (green #34D399)
-│       └── video-generator.js       # Tool 02 frontend logic
-├── dist/                            # Built output (wrangler deploy target)
-├── ecosystem.config.cjs             # PM2 config (app name: spectra, port: 3000)
-├── wrangler.jsonc                   # Cloudflare Pages config
-├── vite.config.ts                   # Vite build config
-├── tsconfig.json                    # TypeScript config
-└── package.json                     # Dependencies
+src/
+  index.tsx             — Full backend: auth, keys, projects, characters, generation,
+                          Attention Engine, all page HTML functions
+  renderer.tsx          — JSX renderer
+
+public/static/
+  video-generator.css   — Complete new CSS: auth gate, drawer, project selector,
+                          shot grid with status states, modals, usage bar
+  video-generator.js    — Complete new frontend JS: auth flow, project CRUD,
+                          shot generation + polling, settings drawer, model hints
+  attention-engine.css  — Attention Engine styles
+  attention-engine.js   — Attention Engine frontend
+  main.js               — Landing page Three.js particle engine
+
+migrations/
+  0001_initial.sql      — Full schema applied to production D1 ✅
+
+wrangler.jsonc          — D1 (DB → spectra-production) + R2 (STORAGE → spectra-assets)
+ecosystem.config.cjs    — PM2: app=spectra, wrangler pages dev dist :3000
+.dev.vars               — Local secrets (gitignored)
 ```
 
 ---
 
-## Development
+## Dev Commands
 
 ```bash
 # Build
-cd /home/user/webapp
-node -e "const cp=require('child_process');const p=cp.spawn('npx',['vite','build'],{cwd:process.cwd(),env:{...process.env},stdio:'inherit'});p.on('exit',c=>process.exit(c||0));setTimeout(()=>{p.kill();process.exit(1)},60000);"
+npm run build
 
-# Start local dev server (port 3000)
-fuser -k 3000/tcp 2>/dev/null || true
-pm2 delete all 2>/dev/null || true
-pm2 start ecosystem.config.cjs
+# Local dev (with DB + STORAGE bindings)
+npm run build && pm2 start ecosystem.config.cjs
+# or: npx wrangler pages dev dist --d1=spectra-production --local --ip 0.0.0.0 --port 3000
 
-# Test
-curl http://localhost:3000/
-curl http://localhost:3000/tools/video-generator/
-```
+# Apply DB migrations locally
+npx wrangler d1 migrations apply spectra-production --local
 
-## Deploy to Cloudflare
+# Apply DB migrations to production
+npx wrangler d1 migrations apply spectra-production
 
-```bash
-CLOUDFLARE_API_TOKEN="<token>" node -e "
-const cp=require('child_process');
-const p=cp.spawn('npx',['wrangler','pages','deploy','dist','--project-name','spectra'],{
-  env:{...process.env,CLOUDFLARE_API_TOKEN:process.env.CLOUDFLARE_API_TOKEN},stdio:'inherit'
-});
-p.on('exit',c=>{setTimeout(()=>process.exit(0),300)});
-setTimeout(()=>{p.kill();process.exit(1)},120000);
-"
+# Query local DB
+npx wrangler d1 execute spectra-production --local --command="SELECT * FROM users"
+
+# Deploy
+npx wrangler pages deploy dist --project-name spectra
+
+# Set secret
+npx wrangler pages secret put ENCRYPTION_KEY --project-name spectra
 ```
 
 ---
 
-## Git History (recent)
-| Commit | Message |
-|--------|---------|
-| `1c84723` | feat: Tool 02 Video Generator — full page, CSS, JS, streaming API routes |
-| `e47b3d3` | fix: Cloudflare compatibility — remove Node.js imports, pure Workers runtime, gpt-4o model |
-| *(earlier)* | fix: drag-to-spin — target Scene 1 mainParticles + nodeGroup |
+## Tier System
+
+| Tier | Price | Projects | Shots/mo | Storage |
+|------|-------|----------|----------|---------|
+| Free | $0 | 1 | 10 | 500 MB |
+| Creator | $29/mo | 5 | 100 | 5 GB |
+| Studio | $79/mo | 25 | 500 | 25 GB |
+| Pro | $149/mo | ∞ | ∞ | 100 GB |
+
+Monetization model: BYOK (user provides Higgsfield key) + infrastructure upcharge via tiers.
 
 ---
 
-## Recommended Next Steps
+## Next Steps
 
-1. **Tool 03 — Distribution Engine**: Multi-platform scheduling, optimal post time analysis, cross-channel content adaptation
-2. **Tool 04 — Motion Engine**: AI-driven motion composition briefs, keyframe suggestions, transition planning
-3. **Tool 05 — Persona Engine**: Audience persona builder, content voice calibration, brand tone analysis
-4. **Landing page node links**: Wire tool node buttons in Scene 1 to navigate to their respective `/tools/` routes on click
-5. **OpenAI key UI on Video Generator**: Add an API key drawer (same pattern as Attention Engine) so users can supply their own key client-side
-6. **Error state polish**: Surface cleaner error messages when OpenAI key is missing or rate-limited
-
----
-
-*Last updated: 2026-05-12 — Tool 02 Video Generator deployed*
+1. **Stripe integration** — upgrade flow, webhook for tier changes
+2. **R2 video copy** — copy HF CDN videos to R2 after completion for permanence
+3. **Thumbnail extraction** — generate poster frame from completed video
+4. **Shot reorder / sequence editor** — drag to arrange shots into timeline
+5. **Character Soul training** — UI to train Higgsfield Soul from reference images
+6. **Dreamina adapter** — add second provider behind VideoProvider interface
+7. **Admin panel** — user management, credit top-ups
