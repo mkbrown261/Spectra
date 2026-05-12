@@ -1142,3 +1142,573 @@ function bindUI() {
     }
   });
 }
+
+/* ════════════════════════════════════════════════════════════════
+   ANALYTICS MODULE
+   - View switcher (Studio ↔ Analytics)
+   - Data fetching from /api/analytics
+   - SVG activity chart, model table, comparison bars,
+     duration dist, aspect ratio chips, project velocity,
+     status breakdown, per-model deep dive
+   ════════════════════════════════════════════════════════════════ */
+
+'use strict';
+
+/* ── ANALYTICS STATE ──────────────────────────────────────────── */
+const AN = {
+  data:          null,   // last fetched analytics response
+  range:         '30d',
+  modelFilter:   'all',  // 'all' | 'dop' | 'soul' | 'kling' | 'seedance' | 'flux'
+  focusedModel:  null,   // model id currently drilled into
+  loading:       false,
+};
+
+/* ── MODEL FAMILY COLOURS ─────────────────────────────────────── */
+const MODEL_COLOURS = {
+  dop:      '#7C6AF7',
+  soul:     '#34D399',
+  kling:    '#60A5FA',
+  seedance: '#FB923C',
+  flux:     '#F472B6',
+  other:    '#6B7280',
+};
+
+/* ── VIEW SWITCHER ────────────────────────────────────────────── */
+function initViewSwitcher() {
+  const btnStudio    = $('btn-show-studio');
+  const btnAnalytics = $('btn-show-analytics');
+  const studioEl     = $('vg-app');
+  const analyticsEl  = $('vg-analytics');
+
+  if (!btnStudio || !btnAnalytics) return;
+
+  btnStudio.addEventListener('click', () => {
+    btnStudio.classList.add('active');
+    btnAnalytics.classList.remove('active');
+    studioEl.style.display    = 'flex';
+    analyticsEl.style.display = 'none';
+  });
+
+  btnAnalytics.addEventListener('click', () => {
+    // Only available if logged in
+    if (!VG.user) { showToast('Sign in to view analytics', true); return; }
+    btnAnalytics.classList.add('active');
+    btnStudio.classList.remove('active');
+    studioEl.style.display    = 'none';
+    analyticsEl.style.display = 'block';
+    // Load analytics if not yet loaded
+    if (!AN.data) loadAnalytics();
+  });
+
+  // Default: studio active
+  btnStudio.classList.add('active');
+}
+
+/* ── RANGE BUTTONS ────────────────────────────────────────────── */
+function initAnalyticsControls() {
+  // Range tabs
+  document.querySelectorAll('.an-range-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.an-range-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      AN.range = btn.dataset.range;
+      loadAnalytics();
+    });
+  });
+
+  // Model filter tabs
+  document.querySelectorAll('.an-model-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.an-model-tab').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      AN.modelFilter  = btn.dataset.model;
+      AN.focusedModel = null;
+      if (AN.data) renderAnalytics(AN.data);
+    });
+  });
+
+  // Refresh button
+  const refreshBtn = $('btn-an-refresh');
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', () => {
+      refreshBtn.classList.add('spinning');
+      loadAnalytics().finally(() => {
+        refreshBtn.classList.remove('spinning');
+      });
+    });
+  }
+}
+
+/* ── LOAD ANALYTICS ───────────────────────────────────────────── */
+async function loadAnalytics() {
+  if (AN.loading) return;
+  AN.loading = true;
+
+  // Show skeleton loading states
+  setAnalyticsLoading(true);
+
+  try {
+    const res  = await api('GET', `/api/analytics?range=${AN.range}`);
+    const data = await res.json();
+
+    if (!res.ok) {
+      showToast(data.error || 'Failed to load analytics', true);
+      setAnalyticsLoading(false);
+      return;
+    }
+
+    AN.data = data;
+    renderAnalytics(data);
+  } catch (err) {
+    console.error('Analytics load error:', err);
+    showToast('Failed to load analytics', true);
+    setAnalyticsLoading(false);
+  } finally {
+    AN.loading = false;
+  }
+}
+
+function setAnalyticsLoading(loading) {
+  const loadingHtml = '<div class="an-loading-state">Loading…</div>';
+  if (loading) {
+    ['an-model-table-wrap','an-compare-bars','an-project-list',
+     'an-status-row','an-dur-bars','an-aspect-wrap','an-deep-cards'].forEach(id => {
+      const el = $(id);
+      if (el) el.innerHTML = loadingHtml;
+    });
+  }
+}
+
+/* ── FILTER MODELS BY FAMILY ──────────────────────────────────── */
+function filteredModels(allModels) {
+  if (AN.modelFilter === 'all') return allModels;
+  return allModels.filter(m => m.family === AN.modelFilter);
+}
+
+/* ── RENDER ALL ANALYTICS ─────────────────────────────────────── */
+function renderAnalytics(data) {
+  const models = filteredModels(data.models || []);
+
+  renderSummaryCards(data, models);
+  renderActivityChart(data.daily || []);
+  renderModelTable(models);
+  renderCompareBars(models);
+  renderDurationBars(data.duration || []);
+  renderAspectRatio(data.aspect_ratio || []);
+  renderProjectVelocity(data.projects || []);
+  renderStatusBreakdown(data.overview || {}, models);
+  renderDeepDive(AN.focusedModel, models);
+
+  // Update activity period badge
+  const periodBadge = $('an-activity-period');
+  if (periodBadge) {
+    const rangeLabels = { '7d': 'Last 7 days', '30d': 'Last 30 days', '90d': 'Last 90 days', 'all': 'All time' };
+    periodBadge.textContent = rangeLabels[AN.range] || AN.range;
+  }
+}
+
+/* ── SUMMARY CARDS ────────────────────────────────────────────── */
+function renderSummaryCards(data, filteredMods) {
+  const ov = data.overview || {};
+
+  // Aggregate filtered model stats if filter is active
+  let totalReqs   = ov.total_shots  || 0;
+  let successRate = ov.success_rate || 0;
+  let totalSecs   = ov.total_seconds || 0;
+  let totalCost   = parseFloat(ov.total_cost_usd || 0);
+
+  if (AN.modelFilter !== 'all' && filteredMods.length > 0) {
+    totalReqs   = filteredMods.reduce((a, m) => a + (m.total || 0), 0);
+    const totalCompleted = filteredMods.reduce((a, m) => a + (m.completed || 0), 0);
+    successRate = totalReqs > 0 ? Math.round((totalCompleted / totalReqs) * 100) : 0;
+    totalSecs   = filteredMods.reduce((a, m) => a + (m.total_seconds_gen || 0), 0);
+    totalCost   = filteredMods.reduce((a, m) => a + parseFloat(m.est_cost_usd || 0), 0);
+  }
+
+  // P50 / P90 — weighted average across filtered models
+  let p50 = null, p90 = null;
+  const modelsWithSpeed = filteredMods.filter(m => m.p50_gen_sec != null && m.total > 0);
+  if (modelsWithSpeed.length > 0) {
+    const totalWeight = modelsWithSpeed.reduce((a, m) => a + m.total, 0);
+    p50 = Math.round(modelsWithSpeed.reduce((a, m) => a + (m.p50_gen_sec * m.total), 0) / totalWeight);
+    p90 = Math.round(modelsWithSpeed.reduce((a, m) => a + (m.p90_gen_sec * m.total), 0) / totalWeight);
+  } else if (AN.modelFilter === 'all') {
+    // Fallback to overview avg
+    p50 = ov.avg_gen_time_sec ? Math.round(ov.avg_gen_time_sec) : null;
+    p90 = ov.avg_gen_time_sec ? Math.round(ov.avg_gen_time_sec * 1.3) : null;
+  }
+
+  setText('an-total-requests', totalReqs.toLocaleString());
+  setText('an-total-sub', `${filteredMods.length || data.models?.length || 0} model${(filteredMods.length || 1) !== 1 ? 's' : ''} active`);
+  setText('an-success-rate', `${successRate}%`);
+  setText('an-speed-p50',   p50 != null ? `${p50}s` : '—');
+  setText('an-speed-p90',   p90 != null ? `${p90}s` : '—');
+  setText('an-total-cost',  `$${totalCost.toFixed(2)}`);
+  setText('an-total-seconds', `${totalSecs}s`);
+
+  // Animate success bar
+  const bar = $('an-success-bar');
+  if (bar) {
+    // Colour based on rate
+    bar.style.background = successRate >= 80 ? 'var(--green)' : successRate >= 50 ? 'var(--yellow)' : 'var(--red)';
+    // Defer to allow CSS transition
+    requestAnimationFrame(() => { bar.style.width = `${successRate}%`; });
+  }
+}
+
+/* ── ACTIVITY CHART (SVG bar chart) ──────────────────────────── */
+function renderActivityChart(dailyData) {
+  const svg      = $('an-activity-svg');
+  const emptyEl  = $('an-activity-empty');
+  if (!svg) return;
+
+  if (!dailyData.length) {
+    svg.innerHTML = '';
+    if (emptyEl) emptyEl.style.display = 'flex';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  const W = 700, H = 100, LABEL_H = 18;
+  const padL = 4, padR = 4;
+  const chartW = W - padL - padR;
+  const chartH = H - LABEL_H;
+
+  const maxVal = Math.max(...dailyData.map(d => (d.total || 0)), 1);
+  const n      = dailyData.length;
+  const bw     = Math.max(2, (chartW / n) - 2);
+  const gap    = (chartW - bw * n) / Math.max(n - 1, 1);
+
+  let svgContent = '';
+
+  // Axis line
+  svgContent += `<line class="bar-axis" x1="${padL}" y1="${H - LABEL_H}" x2="${W - padR}" y2="${H - LABEL_H}"/>`;
+
+  dailyData.forEach((d, i) => {
+    const x        = padL + i * (bw + gap);
+    const total    = d.total    || 0;
+    const completed = d.completed || 0;
+    const failed   = d.failed   || 0;
+    const active   = total - completed - failed;
+
+    const hTotal    = total    > 0 ? Math.max((total    / maxVal) * chartH, 2) : 0;
+    const hCompleted= completed> 0 ? Math.max((completed/ maxVal) * chartH, 2) : 0;
+    const hFailed   = failed   > 0 ? Math.max((failed   / maxVal) * chartH, 2) : 0;
+
+    // Stacked: completed (bottom) + failed (top) — proportional
+    if (hTotal > 0) {
+      svgContent += `<rect class="bar-completed" x="${x}" y="${(H - LABEL_H) - hCompleted}" width="${bw}" height="${hCompleted}" rx="1"/>`;
+      if (hFailed > 0) {
+        svgContent += `<rect class="bar-failed" x="${x}" y="${(H - LABEL_H) - hCompleted - hFailed}" width="${bw}" height="${hFailed}" rx="1"/>`;
+      }
+    }
+
+    // Label every Nth bar depending on density
+    const step = n <= 10 ? 1 : n <= 20 ? 2 : n <= 31 ? 3 : 7;
+    if (i % step === 0) {
+      const dayLabel = d.day ? d.day.slice(5) : '';   // MM-DD
+      svgContent += `<text class="bar-label" x="${x + bw / 2}" y="${H}">${escHtml(dayLabel)}</text>`;
+    }
+  });
+
+  svg.innerHTML = svgContent;
+}
+
+/* ── MODEL TABLE ──────────────────────────────────────────────── */
+function renderModelTable(models) {
+  const wrap = $('an-model-table-wrap');
+  if (!wrap) return;
+
+  if (!models.length) {
+    wrap.innerHTML = '<div class="an-empty-state">No generation data yet.<br>Generate some shots to see model analytics here.</div>';
+    return;
+  }
+
+  const rows = models.map(m => {
+    const rateClass = m.success_rate >= 80 ? 'an-rate-high' : m.success_rate >= 50 ? 'an-rate-mid' : 'an-rate-low';
+    const p50       = m.p50_gen_sec != null ? `${m.p50_gen_sec}s` : '—';
+    const p90       = m.p90_gen_sec != null ? `${m.p90_gen_sec}s` : '—';
+    const focused   = AN.focusedModel === m.model ? ' class="focused"' : '';
+    return `
+      <tr data-model-id="${escAttr(m.model)}"${focused}>
+        <td>
+          <div class="an-model-name">
+            <span class="an-model-family-pip an-family-${escAttr(m.family)}"></span>
+            ${escHtml(m.label)}
+          </div>
+        </td>
+        <td style="text-align:right;font-family:'Space Mono',monospace;color:var(--ice);font-weight:700">${m.total}</td>
+        <td><span class="an-rate-pill ${rateClass}">${m.success_rate}%</span></td>
+        <td><span class="an-speed-val">${p50}</span></td>
+        <td><span class="an-speed-val">${p90}</span></td>
+        <td><span class="an-cost-val">$${m.est_cost_usd}</span></td>
+      </tr>`;
+  }).join('');
+
+  wrap.innerHTML = `
+    <table class="an-model-table">
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th style="text-align:right">Reqs</th>
+          <th>Success</th>
+          <th>P50</th>
+          <th>P90</th>
+          <th>Est. Cost</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+
+  // Click row → deep dive
+  wrap.querySelectorAll('tr[data-model-id]').forEach(row => {
+    row.addEventListener('click', () => {
+      const mid = row.dataset.modelId;
+      AN.focusedModel = AN.focusedModel === mid ? null : mid;
+      // Re-render table highlighting + deep dive
+      renderModelTable(models);
+      renderDeepDive(AN.focusedModel, models);
+    });
+  });
+}
+
+/* ── COMPARE BARS ─────────────────────────────────────────────── */
+function renderCompareBars(models) {
+  const wrap = $('an-compare-bars');
+  if (!wrap) return;
+
+  if (!models.length) {
+    wrap.innerHTML = '<div class="an-empty-state">No data yet.</div>';
+    return;
+  }
+
+  const sorted = [...models].sort((a, b) => b.success_rate - a.success_rate);
+
+  wrap.innerHTML = sorted.map(m => {
+    const colour = MODEL_COLOURS[m.family] || MODEL_COLOURS.other;
+    return `
+      <div class="an-cmp-row">
+        <div class="an-cmp-label" title="${escAttr(m.label)}">${escHtml(m.label)}</div>
+        <div class="an-cmp-track">
+          <div class="an-cmp-fill" style="width:${m.success_rate}%;background:${colour}"></div>
+        </div>
+        <div class="an-cmp-pct">${m.success_rate}%</div>
+      </div>`;
+  }).join('');
+}
+
+/* ── DURATION DISTRIBUTION ────────────────────────────────────── */
+function renderDurationBars(durationData) {
+  const wrap = $('an-dur-bars');
+  if (!wrap) return;
+
+  if (!durationData.length) {
+    wrap.innerHTML = '<div class="an-empty-state">No data yet.</div>';
+    return;
+  }
+
+  const maxCount = Math.max(...durationData.map(d => d.count || 0), 1);
+
+  wrap.innerHTML = durationData.map(d => {
+    const pct = Math.round(((d.count || 0) / maxCount) * 100);
+    return `
+      <div class="an-dur-row">
+        <div class="an-dur-label">${d.duration || '?'}s</div>
+        <div class="an-dur-bar-track">
+          <div class="an-dur-bar-fill" style="width:${pct}%"></div>
+        </div>
+        <div class="an-dur-count">${d.count}</div>
+      </div>`;
+  }).join('');
+}
+
+/* ── ASPECT RATIO CHIPS ───────────────────────────────────────── */
+function renderAspectRatio(aspectData) {
+  const wrap = $('an-aspect-wrap');
+  if (!wrap) return;
+
+  if (!aspectData.length) {
+    wrap.innerHTML = '<div class="an-empty-state">No data yet.</div>';
+    return;
+  }
+
+  const total = aspectData.reduce((a, d) => a + (d.count || 0), 0) || 1;
+
+  // Visual dimensions for aspect ratio icons
+  const dims = {
+    '16:9': { w: 32, h: 18 }, '9:16': { w: 16, h: 28 },
+    '1:1':  { w: 24, h: 24 }, '4:5':  { w: 20, h: 25 },
+    '4:3':  { w: 28, h: 21 }, '3:4':  { w: 21, h: 28 },
+  };
+
+  wrap.innerHTML = aspectData.map(d => {
+    const pct = Math.round(((d.count || 0) / total) * 100);
+    const dim = dims[d.aspect_ratio] || { w: 24, h: 24 };
+    return `
+      <div class="an-aspect-chip">
+        <div class="an-aspect-ratio-vis" style="width:${dim.w}px;height:${dim.h}px"></div>
+        <div class="an-aspect-chip-label">${escHtml(d.aspect_ratio || '?')}</div>
+        <div class="an-aspect-chip-count">${d.count}</div>
+        <div class="an-aspect-chip-pct">${pct}%</div>
+      </div>`;
+  }).join('');
+}
+
+/* ── PROJECT VELOCITY ─────────────────────────────────────────── */
+function renderProjectVelocity(projects) {
+  const wrap = $('an-project-list');
+  if (!wrap) return;
+
+  const active = projects.filter(p => (p.total_shots || 0) > 0);
+
+  if (!active.length) {
+    wrap.innerHTML = '<div class="an-proj-empty">No projects with shots yet.</div>';
+    return;
+  }
+
+  // Header row
+  let html = `
+    <div class="an-proj-row" style="opacity:0.5;font-size:0.62rem;text-transform:uppercase;letter-spacing:0.06em">
+      <div style="color:var(--ice-ghost)">Project</div>
+      <div style="color:var(--ice-ghost);text-align:right">Shots</div>
+      <div style="color:var(--ice-ghost);text-align:right">Done</div>
+    </div>`;
+
+  html += active.map(p => {
+    const pct = p.total_shots > 0
+      ? Math.round(((p.completed_shots || 0) / p.total_shots) * 100)
+      : 0;
+    const rateStyle = pct >= 80 ? 'color:var(--green)' : pct >= 50 ? 'color:var(--yellow)' : 'color:var(--red)';
+    return `
+      <div class="an-proj-row">
+        <div class="an-proj-name" title="${escAttr(p.name)}">${escHtml(p.name)}</div>
+        <div class="an-proj-shots">${p.total_shots}</div>
+        <div class="an-proj-rate" style="${rateStyle}">${pct}%</div>
+      </div>`;
+  }).join('');
+
+  wrap.innerHTML = html;
+}
+
+/* ── STATUS BREAKDOWN ─────────────────────────────────────────── */
+function renderStatusBreakdown(overview, models) {
+  const wrap = $('an-status-row');
+  if (!wrap) return;
+
+  let completed = overview.completed || 0;
+  let failed    = overview.failed    || 0;
+  let nsfw      = overview.nsfw      || 0;
+  let active    = overview.active    || 0;
+
+  // Aggregate from filtered models if filter is active
+  if (AN.modelFilter !== 'all' && models.length > 0) {
+    completed = models.reduce((a, m) => a + (m.completed || 0), 0);
+    failed    = models.reduce((a, m) => a + (m.failed    || 0), 0);
+    nsfw      = models.reduce((a, m) => a + (m.nsfw      || 0), 0);
+    active    = models.reduce((a, m) => a + (m.active    || 0), 0);
+  }
+
+  const total = completed + failed + nsfw + active || 1;
+
+  wrap.innerHTML = `
+    <div class="an-status-seg completed" title="${completed} completed">
+      <div class="an-seg-val">${completed}</div>
+      <div class="an-seg-label">Done</div>
+    </div>
+    <div class="an-status-seg active" title="${active} in progress">
+      <div class="an-seg-val">${active}</div>
+      <div class="an-seg-label">Active</div>
+    </div>
+    <div class="an-status-seg failed" title="${failed} failed">
+      <div class="an-seg-val">${failed}</div>
+      <div class="an-seg-label">Failed</div>
+    </div>
+    <div class="an-status-seg nsfw" title="${nsfw} blocked">
+      <div class="an-seg-val">${nsfw}</div>
+      <div class="an-seg-label">NSFW</div>
+    </div>`;
+}
+
+/* ── PER-MODEL DEEP DIVE ──────────────────────────────────────── */
+function renderDeepDive(modelId, models) {
+  const wrap  = $('an-deep-cards');
+  const panel = $('an-model-deep');
+  if (!wrap || !panel) return;
+
+  if (!modelId) {
+    wrap.innerHTML = '<div class="an-loading-state" style="color:var(--ice-ghost)">Click a model row above to drill into its metrics</div>';
+    // Reset deep-dive header hint
+    const hint = panel.querySelector('.an-panel-hint');
+    if (hint) hint.textContent = 'click a model in the table above to focus';
+    return;
+  }
+
+  const m = models.find(mo => mo.model === modelId);
+  if (!m) {
+    wrap.innerHTML = '<div class="an-loading-state">Model not found in current filter</div>';
+    return;
+  }
+
+  // Update panel hint to show focused model name
+  const hint = panel.querySelector('.an-panel-hint');
+  if (hint) hint.textContent = m.label;
+
+  const colour = MODEL_COLOURS[m.family] || MODEL_COLOURS.other;
+
+  // Estimated cost per generation
+  const costPerGen = m.total > 0
+    ? (parseFloat(m.est_cost_usd || 0) / m.total).toFixed(3)
+    : '0.000';
+
+  // Output video minutes
+  const outputMins = m.total_seconds_gen
+    ? (m.total_seconds_gen / 60).toFixed(1)
+    : '0.0';
+
+  // Error rate
+  const errRate = m.total > 0
+    ? Math.round(((( m.failed || 0) + (m.nsfw || 0)) / m.total) * 100)
+    : 0;
+
+  const cards = [
+    { label: 'Total Requests',    value: m.total,            sub: `${m.total} generations` },
+    { label: 'Completed',         value: m.completed || 0,   sub: `${m.success_rate}% success rate` },
+    { label: 'Failed / Blocked',  value: `${(m.failed||0) + (m.nsfw||0)}`, sub: `${errRate}% error rate` },
+    { label: 'Speed P50',         value: m.p50_gen_sec != null ? `${m.p50_gen_sec}s` : '—', sub: 'median gen time' },
+    { label: 'Speed P90',         value: m.p90_gen_sec != null ? `${m.p90_gen_sec}s` : '—', sub: '90th percentile' },
+    { label: 'Min Gen Time',      value: m.min_gen_sec  != null ? `${Math.round(m.min_gen_sec)}s`  : '—', sub: 'fastest job' },
+    { label: 'Max Gen Time',      value: m.max_gen_sec  != null ? `${Math.round(m.max_gen_sec)}s`  : '—', sub: 'slowest job' },
+    { label: 'Est. Total Cost',   value: `$${m.est_cost_usd}`, sub: `$${costPerGen} per gen` },
+    { label: 'Output Video',      value: `${m.total_seconds_gen || 0}s`, sub: `${outputMins} mins generated` },
+    { label: 'Active Jobs',       value: m.active || 0,      sub: 'currently running' },
+  ];
+
+  wrap.innerHTML = cards.map(card => `
+    <div class="an-deep-card" style="border-color:${colour}22">
+      <div class="an-deep-card-label">${escHtml(card.label)}</div>
+      <div class="an-deep-card-value" style="color:${colour}">${escHtml(String(card.value))}</div>
+      <div class="an-deep-card-sub">${escHtml(card.sub)}</div>
+    </div>`).join('');
+}
+
+/* ── HELPER: setText ──────────────────────────────────────────── */
+function setText(id, val) {
+  const el = $(id);
+  if (el) el.textContent = val;
+}
+
+/* ── INIT ANALYTICS ON DOM READY ─────────────────────────────── */
+// We hook into the existing DOMContentLoaded flow by patching bindUI
+const _origBindUI = typeof bindUI === 'function' ? bindUI : null;
+
+// Patch: run analytics init after the main bindUI
+document.addEventListener('DOMContentLoaded', () => {
+  initViewSwitcher();
+  initAnalyticsControls();
+});
+
+// Also hook into enterApp so analytics reloads when user logs in
+const _origEnterApp = enterApp;
+// Override enterApp to also set up analytics when auth gate clears
+// (We use a flag to avoid double-init)
+let _analyticsInited = false;

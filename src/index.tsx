@@ -834,6 +834,211 @@ app.delete('/api/shots/:shotId', requireAuth, async (c) => {
   return c.json({ ok: true })
 })
 
+/* ══════════════════════════════════════════════════════════════════
+   ANALYTICS ROUTE
+══════════════════════════════════════════════════════════════════ */
+
+// GET /api/analytics?range=7d|30d|90d|all
+app.get('/api/analytics', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const range  = c.req.query('range') || '30d'
+
+    // Build date filter
+    const dateFilter: Record<string, string> = {
+      '7d':  `datetime('now', '-7 days')`,
+      '30d': `datetime('now', '-30 days')`,
+      '90d': `datetime('now', '-90 days')`,
+      'all': `datetime('2000-01-01')`,
+    }
+    const since = dateFilter[range] || dateFilter['30d']
+
+    // ── 1. OVERVIEW STATS ─────────────────────────────────────────
+    const overview = await c.env.DB.prepare(`
+      SELECT
+        COUNT(*)                                                  AS total_shots,
+        SUM(CASE WHEN status='completed'   THEN 1 ELSE 0 END)    AS completed,
+        SUM(CASE WHEN status='failed'      THEN 1 ELSE 0 END)    AS failed,
+        SUM(CASE WHEN status='nsfw'        THEN 1 ELSE 0 END)    AS nsfw,
+        SUM(CASE WHEN status IN ('queued','in_progress') THEN 1 ELSE 0 END) AS active,
+        SUM(CASE WHEN status='completed' AND duration IS NOT NULL THEN duration ELSE 0 END) AS total_seconds,
+        AVG(CASE WHEN status='completed'
+            AND completed_at IS NOT NULL AND created_at IS NOT NULL
+            THEN (julianday(completed_at) - julianday(created_at)) * 86400.0
+            ELSE NULL END) AS avg_gen_time_sec,
+        -- P50 estimate via count-based approximation (SQLite has no PERCENTILE)
+        MIN(CASE WHEN status='completed'
+            AND completed_at IS NOT NULL
+            THEN (julianday(completed_at) - julianday(created_at)) * 86400.0
+            ELSE NULL END) AS min_gen_time_sec,
+        MAX(CASE WHEN status='completed'
+            AND completed_at IS NOT NULL
+            THEN (julianday(completed_at) - julianday(created_at)) * 86400.0
+            ELSE NULL END) AS max_gen_time_sec
+      FROM shots
+      WHERE user_id = ? AND created_at >= ${since}
+    `).bind(userId).first<any>()
+
+    // ── 2. PER-MODEL BREAKDOWN ────────────────────────────────────
+    const modelRows = await c.env.DB.prepare(`
+      SELECT
+        model,
+        COUNT(*)                                                  AS total,
+        SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END)      AS completed,
+        SUM(CASE WHEN status='failed'    THEN 1 ELSE 0 END)      AS failed,
+        SUM(CASE WHEN status='nsfw'      THEN 1 ELSE 0 END)      AS nsfw,
+        SUM(CASE WHEN status IN ('queued','in_progress') THEN 1 ELSE 0 END) AS active,
+        AVG(CASE WHEN status='completed'
+            AND completed_at IS NOT NULL AND created_at IS NOT NULL
+            THEN (julianday(completed_at) - julianday(created_at)) * 86400.0
+            ELSE NULL END) AS avg_gen_sec,
+        MIN(CASE WHEN status='completed'
+            AND completed_at IS NOT NULL
+            THEN (julianday(completed_at) - julianday(created_at)) * 86400.0
+            ELSE NULL END) AS min_gen_sec,
+        MAX(CASE WHEN status='completed'
+            AND completed_at IS NOT NULL
+            THEN (julianday(completed_at) - julianday(created_at)) * 86400.0
+            ELSE NULL END) AS max_gen_sec,
+        SUM(CASE WHEN status='completed' AND duration IS NOT NULL THEN duration ELSE 0 END) AS total_seconds_gen
+      FROM shots
+      WHERE user_id = ? AND created_at >= ${since}
+      GROUP BY model
+      ORDER BY total DESC
+    `).bind(userId).all<any>()
+
+    // ── 3. DAILY ACTIVITY (last N days, padded) ───────────────────
+    const dailyRows = await c.env.DB.prepare(`
+      SELECT
+        date(created_at) AS day,
+        COUNT(*)         AS total,
+        SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
+        SUM(CASE WHEN status='failed' OR status='nsfw' THEN 1 ELSE 0 END) AS failed
+      FROM shots
+      WHERE user_id = ? AND created_at >= ${since}
+      GROUP BY date(created_at)
+      ORDER BY day ASC
+    `).bind(userId).all<any>()
+
+    // ── 4. ASPECT RATIO DISTRIBUTION ─────────────────────────────
+    const aspectRows = await c.env.DB.prepare(`
+      SELECT aspect_ratio, COUNT(*) AS count
+      FROM shots
+      WHERE user_id = ? AND created_at >= ${since}
+      GROUP BY aspect_ratio
+      ORDER BY count DESC
+    `).bind(userId).all<any>()
+
+    // ── 5. DURATION DISTRIBUTION ──────────────────────────────────
+    const durationRows = await c.env.DB.prepare(`
+      SELECT duration, COUNT(*) AS count
+      FROM shots
+      WHERE user_id = ? AND created_at >= ${since}
+      GROUP BY duration
+      ORDER BY duration ASC
+    `).bind(userId).all<any>()
+
+    // ── 6. PROJECT VELOCITY ───────────────────────────────────────
+    const projectRows = await c.env.DB.prepare(`
+      SELECT
+        p.id, p.name,
+        COUNT(s.id)                                                     AS total_shots,
+        SUM(CASE WHEN s.status='completed' THEN 1 ELSE 0 END)          AS completed_shots,
+        MAX(s.created_at)                                               AS last_shot_at
+      FROM projects p
+      LEFT JOIN shots s ON s.project_id = p.id AND s.created_at >= ${since}
+      WHERE p.user_id = ?
+      GROUP BY p.id, p.name
+      ORDER BY total_shots DESC
+      LIMIT 10
+    `).bind(userId).all<any>()
+
+    // ── 7. ESTIMATED COST (rough per-model pricing) ───────────────
+    // Approximate credit cost per second of output video
+    const MODEL_COST_PER_SEC: Record<string, number> = {
+      'higgsfield-ai/dop/lite':                        0.06,
+      'higgsfield-ai/dop/standard':                    0.09,
+      'higgsfield-ai/dop/turbo':                       0.12,
+      'kling-video/v2.1/pro/image-to-video':           0.14,
+      'kling-video/v2.1/standard/image-to-video':      0.09,
+      'bytedance/seedance/v1/pro/image-to-video':      0.10,
+      'bytedance/seedance/v1/lite/image-to-video':     0.06,
+      'higgsfield-ai/soul/standard':                   0.05,
+      'flux-pro/kontext/max/text-to-image':            0.04,
+    }
+
+    // Build per-model cost and P90 estimates
+    const models = modelRows.results.map((row: any) => {
+      const costPerSec = MODEL_COST_PER_SEC[row.model] || 0.08
+      const estCost    = ((row.total_seconds_gen || 0) * costPerSec).toFixed(2)
+      // P90 estimate: if avg is available, P90 ≈ avg * 1.3 (rough heuristic without ORDER BY on aggregates)
+      const p90 = row.avg_gen_sec ? Math.round(row.avg_gen_sec * 1.3) : null
+      const p50 = row.avg_gen_sec ? Math.round(row.avg_gen_sec)       : null
+      const successRate = row.total > 0 ? Math.round((row.completed / row.total) * 100) : 0
+      return {
+        ...row,
+        success_rate:   successRate,
+        p50_gen_sec:    p50,
+        p90_gen_sec:    p90,
+        est_cost_usd:   estCost,
+        cost_per_sec:   costPerSec,
+        label:          modelLabel(row.model),
+        family:         modelFamily(row.model),
+      }
+    })
+
+    // Total estimated cost across all models
+    const totalCost = models.reduce((acc: number, m: any) => acc + parseFloat(m.est_cost_usd), 0)
+
+    // Overall success rate
+    const successRate = (overview?.total_shots || 0) > 0
+      ? Math.round(((overview?.completed || 0) / (overview?.total_shots || 1)) * 100)
+      : 0
+
+    return c.json({
+      range,
+      overview: {
+        ...(overview || {}),
+        success_rate:   successRate,
+        total_cost_usd: totalCost.toFixed(2),
+      },
+      models,
+      daily:        dailyRows.results,
+      aspect_ratio: aspectRows.results,
+      duration:     durationRows.results,
+      projects:     projectRows.results,
+    })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// Helper: short label for a model slug
+function modelLabel(id: string): string {
+  const MAP: Record<string, string> = {
+    'higgsfield-ai/dop/lite':                        'DoP Lite',
+    'higgsfield-ai/dop/standard':                    'DoP Standard',
+    'higgsfield-ai/dop/turbo':                       'DoP Turbo',
+    'kling-video/v2.1/pro/image-to-video':           'Kling 2.1 Pro',
+    'kling-video/v2.1/standard/image-to-video':      'Kling 2.1 Std',
+    'bytedance/seedance/v1/pro/image-to-video':      'Seedance Pro',
+    'bytedance/seedance/v1/lite/image-to-video':     'Seedance Lite',
+    'higgsfield-ai/soul/standard':                   'Soul',
+    'flux-pro/kontext/max/text-to-image':            'Flux Kontext',
+  }
+  return MAP[id] || id.split('/').pop() || id
+}
+
+// Helper: model family for grouping/coloring
+function modelFamily(id: string): string {
+  if (id.includes('dop'))      return 'dop'
+  if (id.includes('soul'))     return 'soul'
+  if (id.includes('kling'))    return 'kling'
+  if (id.includes('seedance')) return 'seedance'
+  if (id.includes('flux'))     return 'flux'
+  return 'other'
+}
+
 // POST /api/enhance-prompt — standalone prompt enhancer
 app.post('/api/enhance-prompt', requireAuth, async (c) => {
   try {
@@ -1041,6 +1246,14 @@ function videoGeneratorPage(): string {
     </span>
   </div>
   <div class="vg-nav-right">
+    <button class="vg-nav-tab-btn" id="btn-show-studio" data-view="studio">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      Studio
+    </button>
+    <button class="vg-nav-tab-btn" id="btn-show-analytics" data-view="analytics">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      Analytics
+    </button>
     <button class="vg-keys-btn" id="btn-open-settings" title="Settings">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
       Settings
@@ -1363,6 +1576,187 @@ function videoGeneratorPage(): string {
 </div>
 
 <div class="vg-copied-toast" id="vg-toast">Copied!</div>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     ANALYTICS PANEL
+════════════════════════════════════════════════════════════════ -->
+<section id="vg-analytics" style="display:none">
+
+  <!-- Analytics nav bar -->
+  <div class="an-topbar">
+    <div class="an-topbar-left">
+      <h2 class="an-title">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        Generation Analytics
+      </h2>
+      <p class="an-subtitle">Per-model performance, speed, and cost intelligence</p>
+    </div>
+    <div class="an-topbar-right">
+      <div class="an-range-tabs" id="an-range-tabs">
+        <button class="an-range-btn" data-range="7d">7D</button>
+        <button class="an-range-btn active" data-range="30d">30D</button>
+        <button class="an-range-btn" data-range="90d">90D</button>
+        <button class="an-range-btn" data-range="all">All</button>
+      </div>
+      <button class="an-refresh-btn" id="btn-an-refresh" title="Refresh">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- Model filter tabs -->
+  <div class="an-model-tabs" id="an-model-tabs">
+    <button class="an-model-tab active" data-model="all">All Models</button>
+    <button class="an-model-tab" data-model="dop">DoP</button>
+    <button class="an-model-tab" data-model="soul">Soul</button>
+    <button class="an-model-tab" data-model="kling">Kling</button>
+    <button class="an-model-tab" data-model="seedance">Seedance</button>
+    <button class="an-model-tab" data-model="flux">Flux</button>
+  </div>
+
+  <!-- Summary cards row -->
+  <div class="an-summary-row" id="an-summary-row">
+    <div class="an-card an-card-accent">
+      <div class="an-card-label">Total Requests</div>
+      <div class="an-card-value" id="an-total-requests">—</div>
+      <div class="an-card-sub" id="an-total-sub">across all models</div>
+    </div>
+    <div class="an-card">
+      <div class="an-card-label">Success Rate</div>
+      <div class="an-card-value" id="an-success-rate">—</div>
+      <div class="an-card-bar-wrap"><div class="an-card-bar" id="an-success-bar"></div></div>
+    </div>
+    <div class="an-card">
+      <div class="an-card-label">Speed P50</div>
+      <div class="an-card-value" id="an-speed-p50">—</div>
+      <div class="an-card-sub">median gen time</div>
+    </div>
+    <div class="an-card">
+      <div class="an-card-label">Speed P90</div>
+      <div class="an-card-value" id="an-speed-p90">—</div>
+      <div class="an-card-sub">90th percentile</div>
+    </div>
+    <div class="an-card">
+      <div class="an-card-label">Est. Cost</div>
+      <div class="an-card-value" id="an-total-cost">—</div>
+      <div class="an-card-sub">credits consumed</div>
+    </div>
+    <div class="an-card">
+      <div class="an-card-label">Video Generated</div>
+      <div class="an-card-value" id="an-total-seconds">—</div>
+      <div class="an-card-sub">total output seconds</div>
+    </div>
+  </div>
+
+  <!-- Main analytics grid -->
+  <div class="an-grid">
+
+    <!-- LEFT: Activity chart + Job stats -->
+    <div class="an-col-main">
+
+      <!-- Activity timeline chart -->
+      <div class="an-panel">
+        <div class="an-panel-header">
+          <span class="an-panel-title">Job Activity</span>
+          <span class="an-panel-badge" id="an-activity-period"></span>
+        </div>
+        <div class="an-chart-wrap" id="an-activity-chart">
+          <svg id="an-activity-svg" class="an-activity-svg" viewBox="0 0 700 120" preserveAspectRatio="none"></svg>
+          <div class="an-chart-empty" id="an-activity-empty" style="display:none">
+            No generation activity in this period
+          </div>
+        </div>
+        <div class="an-chart-legend">
+          <span class="an-legend-dot completed"></span><span>Completed</span>
+          <span class="an-legend-dot failed"></span><span>Failed/NSFW</span>
+        </div>
+      </div>
+
+      <!-- Job Duration distribution -->
+      <div class="an-panel">
+        <div class="an-panel-header">
+          <span class="an-panel-title">Job Duration Distribution</span>
+          <span class="an-panel-hint">seconds per output clip</span>
+        </div>
+        <div class="an-dur-bars" id="an-dur-bars">
+          <div class="an-loading-state">Loading…</div>
+        </div>
+      </div>
+
+      <!-- Aspect Ratio breakdown -->
+      <div class="an-panel">
+        <div class="an-panel-header">
+          <span class="an-panel-title">Aspect Ratio Usage</span>
+        </div>
+        <div class="an-aspect-wrap" id="an-aspect-wrap">
+          <div class="an-loading-state">Loading…</div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- RIGHT: Per-model table + Project velocity -->
+    <div class="an-col-side">
+
+      <!-- Per-model breakdown table -->
+      <div class="an-panel">
+        <div class="an-panel-header">
+          <span class="an-panel-title">Model Performance</span>
+          <span class="an-panel-hint">sorted by requests</span>
+        </div>
+        <div class="an-model-table-wrap" id="an-model-table-wrap">
+          <div class="an-loading-state">Loading…</div>
+        </div>
+      </div>
+
+      <!-- Model comparison radar / bar -->
+      <div class="an-panel">
+        <div class="an-panel-header">
+          <span class="an-panel-title">Model Comparison</span>
+          <span class="an-panel-hint">success rate by model</span>
+        </div>
+        <div class="an-compare-bars" id="an-compare-bars">
+          <div class="an-loading-state">Loading…</div>
+        </div>
+      </div>
+
+      <!-- Project velocity -->
+      <div class="an-panel">
+        <div class="an-panel-header">
+          <span class="an-panel-title">Project Velocity</span>
+          <span class="an-panel-hint">shots per project</span>
+        </div>
+        <div class="an-project-list" id="an-project-list">
+          <div class="an-loading-state">Loading…</div>
+        </div>
+      </div>
+
+      <!-- Status breakdown donut -->
+      <div class="an-panel">
+        <div class="an-panel-header">
+          <span class="an-panel-title">Job Status Breakdown</span>
+        </div>
+        <div class="an-status-row" id="an-status-row">
+          <div class="an-loading-state">Loading…</div>
+        </div>
+      </div>
+
+    </div>
+
+  </div><!-- /an-grid -->
+
+  <!-- Higgsfield-equivalent deep dive: per-model analytics -->
+  <div class="an-model-deep" id="an-model-deep">
+    <div class="an-panel-header">
+      <span class="an-panel-title">Per-Model Deep Dive</span>
+      <span class="an-panel-hint">click a model in the table above to focus</span>
+    </div>
+    <div class="an-deep-cards" id="an-deep-cards">
+      <div class="an-loading-state">Select a model to drill into its metrics</div>
+    </div>
+  </div>
+
+</section><!-- /vg-analytics -->
 
 <script src="/static/video-generator.js"></script>
 </body>
