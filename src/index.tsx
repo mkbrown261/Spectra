@@ -1,42 +1,29 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import { readFileSync } from 'fs'
-import { join } from 'path'
 import OpenAI from 'openai'
-import fs from 'fs'
-import yaml from 'js-yaml'
-import os from 'os'
-import path from 'path'
 
-const app = new Hono()
+/* ── Cloudflare env bindings ─────────────────────────────────────── */
+type Bindings = {
+  OPENAI_API_KEY:   string
+  OPENAI_BASE_URL:  string
+  YOUTUBE_API_KEY:  string
+  FB_ACCESS_TOKEN:  string
+}
+
+const app = new Hono<{ Bindings: Bindings }>()
 app.use('/api/*', cors())
 
-/* ── AI Client ───────────────────────────────────────────────────── */
-function getAIClient(): OpenAI {
-  try {
-    const cfgPath = path.join(os.homedir(), '.genspark_llm.yaml')
-    if (fs.existsSync(cfgPath)) {
-      const cfg = yaml.load(fs.readFileSync(cfgPath, 'utf8')) as any
-      return new OpenAI({ apiKey: cfg?.openai?.api_key, baseURL: cfg?.openai?.base_url })
-    }
-  } catch {}
-  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY, baseURL: process.env.OPENAI_BASE_URL })
+// NOTE: Cloudflare Pages serves public/ automatically at root.
+// No explicit static routes needed — /static/*, /favicon.svg etc.
+// are handled by the Pages CDN directly from the public/ directory.
+
+/* ── AI Client (Cloudflare Workers compatible) ───────────────────── */
+function getAIClient(env: Bindings): OpenAI {
+  return new OpenAI({
+    apiKey:  env?.OPENAI_API_KEY  || '',
+    baseURL: env?.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+  })
 }
-
-/* ── Static helpers ──────────────────────────────────────────────── */
-function readStatic(filename: string): string {
-  try { return readFileSync(join(process.cwd(), 'public', 'static', filename), 'utf-8') } catch { return '' }
-}
-
-app.get('/static/style.css', (c) => { c.header('Content-Type','text/css; charset=utf-8'); c.header('Cache-Control','no-cache'); return c.body(readStatic('style.css')) })
-app.get('/static/main.js',   (c) => { c.header('Content-Type','application/javascript; charset=utf-8'); c.header('Cache-Control','no-cache'); return c.body(readStatic('main.js')) })
-app.get('/static/attention-engine.css', (c) => { c.header('Content-Type','text/css; charset=utf-8'); c.header('Cache-Control','no-cache'); return c.body(readStatic('attention-engine.css')) })
-app.get('/static/attention-engine.js',  (c) => { c.header('Content-Type','application/javascript; charset=utf-8'); c.header('Cache-Control','no-cache'); return c.body(readStatic('attention-engine.js')) })
-
-app.get('/favicon.svg', (c) => {
-  c.header('Content-Type','image/svg+xml'); c.header('Cache-Control','public, max-age=86400')
-  return c.body(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#060810"/><text x="50%" y="56%" dominant-baseline="middle" text-anchor="middle" font-family="monospace" font-size="18" font-weight="700" fill="#A8D8F0">S</text></svg>`)
-})
 
 /* ══════════════════════════════════════════════════════════════════
    PLATFORM WEIGHT PRESETS
@@ -248,9 +235,9 @@ ${segments.map(s => `[${s.label}] Retention: ${s.retention}% ${s.is_dropoff ? '�
 
 Provide a complete analysis. Be brutally honest and highly specific.`
 
-    const ai = getAIClient()
+    const ai = getAIClient(c.env)
     const stream = await ai.chat.completions.create({
-      model: 'gpt-5',
+      model: 'gpt-4o',
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user',   content: userPrompt },
@@ -323,9 +310,9 @@ DESIRED TONE: ${tone}
 
 Generate 3 killer hook variations, 2 full script rewrites, pattern interrupt ideas, and CTA options. Make them native to ${platform}'s culture and format.`
 
-    const ai = getAIClient()
+    const ai = getAIClient(c.env)
     const stream = await ai.chat.completions.create({
-      model: 'gpt-5',
+      model: 'gpt-4o',
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user',   content: userPrompt },
@@ -406,8 +393,8 @@ app.post('/api/attention/score', async (c) => {
 ══════════════════════════════════════════════════════════════════ */
 app.get('/api/fetch-url', async (c) => {
   const url    = c.req.query('url') || ''
-  const ytKey  = c.req.query('yt_key') || process.env.YOUTUBE_API_KEY || ''
-  const fbToken = c.req.query('fb_token') || process.env.FB_ACCESS_TOKEN || ''
+  const ytKey  = c.req.query('yt_key') || c.env.YOUTUBE_API_KEY || ''
+  const fbToken = c.req.query('fb_token') || c.env.FB_ACCESS_TOKEN || ''
 
   if (!url) return c.json({ error: 'No URL provided' }, 400)
 

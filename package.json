@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "hono": "^4.12.12",
-    "js-yaml": "^4.1.1",
     "openai": "^6.35.0"
   },
   "devDependencies": {
