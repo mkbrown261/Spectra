@@ -521,7 +521,7 @@ app.get('/tools/attention-engine',  (c) => c.redirect('/tools/attention-engine/'
 app.get('/tools/attention-engine/', (c) => c.html(attentionEnginePage()))
 
 app.get('/tools/video-generator',   (c) => c.redirect('/tools/video-generator/'))
-app.get('/tools/video-generator/',  (c) => c.html(toolShell('Intelligent Video Generator', 'video', '#34D399')))
+app.get('/tools/video-generator/',  (c) => c.html(videoGeneratorPage()))
 app.get('/tools/distribution-engine',  (c) => c.redirect('/tools/distribution-engine/'))
 app.get('/tools/distribution-engine/', (c) => c.html(toolShell('Content Distribution Engine', 'distribution', '#60A5FA')))
 app.get('/tools/motion-engine',  (c) => c.redirect('/tools/motion-engine/'))
@@ -530,6 +530,202 @@ app.get('/tools/persona-engine',  (c) => c.redirect('/tools/persona-engine/'))
 app.get('/tools/persona-engine/', (c) => c.html(toolShell('Spectra Persona Engine', 'persona', '#F87171')))
 
 app.get('/', (c) => c.html(landingPage()))
+
+/* ══════════════════════════════════════════════════════════════════
+   API: POST /api/video/generate  (streaming SSE)
+══════════════════════════════════════════════════════════════════ */
+app.post('/api/video/generate', async (c) => {
+  try {
+    const body = await c.req.json()
+    const {
+      platform     = 'tiktok',
+      style        = 'cinematic',
+      aspect_ratio = '9:16',
+      tone         = 'engaging',
+      duration_sec = 30,
+      concept      = '',
+      script       = '',
+      audience     = '',
+      mood         = '',
+      music_style  = '',
+    } = body
+
+    const systemPrompt = `You are Spectra's Video Generator — a world-class video director and creative producer for ${platform.toUpperCase()} content.
+You create complete, production-ready video briefs that a real team can execute immediately.
+Every brief is specific, visual, and platform-native — not generic advice.
+
+Output ONLY valid JSON with this exact structure:
+{
+  "concept": "One-paragraph video concept with the core idea, narrative arc, and emotional hook",
+  "brief": {
+    "format": "string",
+    "platform": "string",
+    "aspect_ratio": "string",
+    "duration": "string",
+    "audience": "string",
+    "mood": "string",
+    "visual_style": "string",
+    "pacing": "string"
+  },
+  "directors_note": "2-3 sentences from the director's perspective — what makes this video special and the #1 thing to get right",
+  "scripts": [
+    {
+      "title": "string",
+      "structure": "string (e.g. Hook → Problem → Solution → CTA)",
+      "tone": "string",
+      "duration": "string (e.g. 28s)",
+      "script": "Full formatted script with [HOOK], [BODY], [CTA] markers and timing notes"
+    },
+    {
+      "title": "string",
+      "structure": "string",
+      "tone": "string",
+      "duration": "string",
+      "script": "Full formatted script — alternate version with different approach"
+    }
+  ],
+  "shot_list": [
+    {
+      "type": "string (e.g. CLOSE-UP, WIDE SHOT, TRACKING SHOT, CUTAWAY)",
+      "description": "string — what exactly is on screen",
+      "direction": "string — camera movement, lighting, action note",
+      "duration": "string (e.g. 2-3s)"
+    }
+  ],
+  "music_brief": {
+    "genre": "string",
+    "style": "string",
+    "description": "string — tempo, energy, emotional feel",
+    "reference_tracks": ["string", "string"]
+  },
+  "broll_suggestions": ["string", "string", "string", "string", "string"],
+  "voiceover": {
+    "style": "string",
+    "tone": "string",
+    "pacing": "string",
+    "notes": "string"
+  },
+  "technical": {
+    "resolution": "string",
+    "frame_rate": "string",
+    "color_grade": "string",
+    "editing_style": "string",
+    "transitions": "string"
+  },
+  "captions": {
+    "${platform}": {
+      "text": "string — full caption copy optimized for this platform",
+      "hashtags": ["string", "string", "string", "string", "string"]
+    }
+  }
+}`
+
+    const userPrompt = `Create a complete video production brief for this concept:
+
+PLATFORM: ${platform.toUpperCase()}
+STYLE: ${style}
+ASPECT RATIO: ${aspect_ratio}
+TONE: ${tone}
+DURATION: ${duration_sec} seconds
+TARGET AUDIENCE: ${audience || 'General social media audience'}
+MOOD: ${mood || 'Not specified'}
+MUSIC PREFERENCE: ${music_style || 'Match the content style'}
+
+VIDEO CONCEPT:
+${concept}
+
+${script ? `EXISTING SCRIPT/NOTES:\n${script}` : ''}
+
+Generate a production-ready brief. Shot list should have ${Math.ceil(duration_sec / 4)}-${Math.ceil(duration_sec / 2.5)} shots. Be specific and visual. Make the scripts feel native to ${platform}.`
+
+    const ai = getAIClient(c.env)
+    const stream = await ai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userPrompt },
+      ],
+      stream: true,
+      temperature: 0.72,
+      max_tokens: 3200,
+    })
+
+    return new Response(
+      new ReadableStream({
+        async start(controller) {
+          const enc = new TextEncoder()
+          let buffer = ''
+          for await (const chunk of stream) {
+            const txt = chunk.choices[0]?.delta?.content || ''
+            buffer += txt
+            controller.enqueue(enc.encode(`data: ${JSON.stringify({ type: 'token', text: txt })}\n\n`))
+          }
+          controller.enqueue(enc.encode(`data: ${JSON.stringify({ type: 'done', full: buffer })}\n\n`))
+          controller.close()
+        }
+      }),
+      { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } }
+    )
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   API: POST /api/video/hooks  (streaming SSE)
+══════════════════════════════════════════════════════════════════ */
+app.post('/api/video/hooks', async (c) => {
+  try {
+    const body = await c.req.json()
+    const { platform = 'tiktok', concept = '', style = 'cinematic', audience = '', tone = 'engaging' } = body
+
+    const systemPrompt = `You are Spectra's Hook Engine — a specialist in writing the first 3 seconds of ${platform.toUpperCase()} videos that stop the scroll cold.
+You understand exactly what patterns perform right now on ${platform} in 2025.
+
+Output ONLY valid JSON:
+{
+  "hooks": [
+    { "text": "string", "strategy": "string (e.g. Bold Claim, Question, Controversy, Visual Disruption, Empathy)", "why_it_works": "string" },
+    { "text": "string", "strategy": "string", "why_it_works": "string" },
+    { "text": "string", "strategy": "string", "why_it_works": "string" },
+    { "text": "string", "strategy": "string", "why_it_works": "string" },
+    { "text": "string", "strategy": "string", "why_it_works": "string" }
+  ],
+  "platform_notes": "string — what hook patterns are dominating ${platform} right now"
+}`
+
+    const ai = getAIClient(c.env)
+    const stream = await ai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: `Write 5 killer hooks for this ${platform} video:\n\nCONCEPT: ${concept}\nSTYLE: ${style}\nAUDIENCE: ${audience || 'General'}\nTONE: ${tone}\n\nMake them feel NATIVE to ${platform}. Each hook must be different — different strategy, different energy, different structure.` },
+      ],
+      stream: true,
+      temperature: 0.85,
+      max_tokens: 1200,
+    })
+
+    return new Response(
+      new ReadableStream({
+        async start(controller) {
+          const enc = new TextEncoder()
+          let buffer = ''
+          for await (const chunk of stream) {
+            const txt = chunk.choices[0]?.delta?.content || ''
+            buffer += txt
+            controller.enqueue(enc.encode(`data: ${JSON.stringify({ type: 'token', text: txt })}\n\n`))
+          }
+          controller.enqueue(enc.encode(`data: ${JSON.stringify({ type: 'done', full: buffer })}\n\n`))
+          controller.close()
+        }
+      }),
+      { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } }
+    )
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
 
 export default app
 
@@ -1052,6 +1248,332 @@ function attentionEnginePage(): string {
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="/static/attention-engine.js"></script>
+</body>
+</html>`
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   VIDEO GENERATOR PAGE
+══════════════════════════════════════════════════════════════════ */
+function videoGeneratorPage(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Video Generator — Spectra</title>
+  <meta name="description" content="AI-powered video production briefs. Concept to shot list in seconds.">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/video-generator.css"/>
+</head>
+<body>
+
+<!-- NAV -->
+<nav id="vg-nav">
+  <a href="/" class="vg-nav-logo">
+    <span class="vg-logo-mark">S</span>
+    <span>SPECTRA</span>
+  </a>
+  <div class="vg-nav-center">
+    <span class="vg-tool-badge">
+      <span class="vg-tool-pip"></span>
+      Video Generator
+    </span>
+  </div>
+  <div class="vg-nav-right">
+    <a href="/" class="vg-nav-back">
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+        <path d="M13 8H3M7 4l-4 4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      Suite
+    </a>
+  </div>
+</nav>
+
+<!-- MAIN LAYOUT -->
+<main id="vg-main">
+
+  <!-- ═══ LEFT PANEL — INPUT ══════════════════════════════════════ -->
+  <aside id="vg-input-panel">
+
+    <!-- Platform -->
+    <div class="vg-section">
+      <div class="vg-section-label">Platform</div>
+      <div class="vg-platform-grid">
+        <button class="vg-platform-btn active" data-platform="tiktok">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 01-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 01-2.88 2.5 2.89 2.89 0 01-2.89-2.89 2.89 2.89 0 012.89-2.89c.28 0 .54.04.79.1V9.01a6.27 6.27 0 00-.79-.05 6.34 6.34 0 00-6.34 6.34 6.34 6.34 0 006.34 6.34 6.34 6.34 0 006.33-6.34V8.69a8.18 8.18 0 004.78 1.52V6.75a4.85 4.85 0 01-1.01-.06z"/></svg>
+          TikTok
+        </button>
+        <button class="vg-platform-btn" data-platform="instagram">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/></svg>
+          Instagram
+        </button>
+        <button class="vg-platform-btn" data-platform="youtube">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M23 7s-.3-2-1.2-2.8c-1.1-1.2-2.4-1.2-3-1.3C16.6 2.8 12 2.8 12 2.8s-4.6 0-6.8.1c-.6.1-1.9.1-3 1.3C1.3 5 1 7 1 7S.7 9.1.7 11.3v2c0 2.1.3 4.2.3 4.2s.3 2 1.2 2.8c1.1 1.2 2.6 1.1 3.3 1.2C7.6 21.7 12 21.7 12 21.7s4.6 0 6.8-.2c.6-.1 1.9-.1 3-1.3.9-.8 1.2-2.8 1.2-2.8s.3-2.1.3-4.2v-2C23.3 9.1 23 7 23 7zM9.7 15.5V8.4l8.1 3.6-8.1 3.5z"/></svg>
+          YouTube
+        </button>
+        <button class="vg-platform-btn" data-platform="twitter">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+          Twitter/X
+        </button>
+        <button class="vg-platform-btn" data-platform="facebook">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M24 12.073C24 5.405 18.627 0 12 0S0 5.405 0 12.073c0 6.024 4.388 11.02 10.125 11.927v-8.437H7.078v-3.49h3.047V9.41c0-3.025 1.792-4.697 4.533-4.697 1.312 0 2.686.235 2.686.235v2.97h-1.513c-1.491 0-1.956.93-1.956 1.886v2.254h3.328l-.532 3.49h-2.796v8.437C19.612 23.093 24 18.097 24 12.073z"/></svg>
+          Facebook
+        </button>
+        <button class="vg-platform-btn" data-platform="ads">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M7 15l3-4 3 4 3-5"/></svg>
+          Paid Ads
+        </button>
+      </div>
+    </div>
+
+    <!-- Video Style -->
+    <div class="vg-section">
+      <div class="vg-section-label">Video Style</div>
+      <div class="vg-style-chips">
+        <button class="vg-style-chip active" data-style="cinematic">Cinematic</button>
+        <button class="vg-style-chip" data-style="documentary">Documentary</button>
+        <button class="vg-style-chip" data-style="talking-head">Talking Head</button>
+        <button class="vg-style-chip" data-style="ugc">UGC / Raw</button>
+        <button class="vg-style-chip" data-style="animation">Animation</button>
+        <button class="vg-style-chip" data-style="product">Product Demo</button>
+        <button class="vg-style-chip" data-style="testimonial">Testimonial</button>
+        <button class="vg-style-chip" data-style="explainer">Explainer</button>
+      </div>
+    </div>
+
+    <!-- Aspect Ratio -->
+    <div class="vg-section">
+      <div class="vg-section-label">Aspect Ratio</div>
+      <div class="vg-aspect-row">
+        <button class="vg-aspect-btn active" data-aspect="9:16">
+          <div class="vg-aspect-icon vg-aspect-916"></div>
+          <span>9:16</span>
+        </button>
+        <button class="vg-aspect-btn" data-aspect="16:9">
+          <div class="vg-aspect-icon vg-aspect-169"></div>
+          <span>16:9</span>
+        </button>
+        <button class="vg-aspect-btn" data-aspect="1:1">
+          <div class="vg-aspect-icon vg-aspect-11"></div>
+          <span>1:1</span>
+        </button>
+        <button class="vg-aspect-btn" data-aspect="4:5">
+          <div class="vg-aspect-icon vg-aspect-45"></div>
+          <span>4:5</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Concept -->
+    <div class="vg-section">
+      <div class="vg-section-label">Video Concept <span class="vg-required">*</span></div>
+      <div class="vg-textarea-wrap">
+        <textarea
+          id="vg-concept"
+          class="vg-textarea"
+          rows="4"
+          placeholder="Describe your video idea — topic, message, story arc, key moment you want to capture..."
+          maxlength="500"
+        ></textarea>
+        <span class="vg-char-count" id="vg-concept-count">0/500</span>
+      </div>
+    </div>
+
+    <!-- Script / Notes -->
+    <div class="vg-section">
+      <div class="vg-section-label">Existing Script / Notes <span class="vg-optional">(optional)</span></div>
+      <div class="vg-textarea-wrap">
+        <textarea
+          id="vg-script"
+          class="vg-textarea"
+          rows="3"
+          placeholder="Paste any existing script, talking points, or raw notes..."
+          maxlength="2000"
+        ></textarea>
+        <span class="vg-char-count" id="vg-script-count">0/2000</span>
+      </div>
+    </div>
+
+    <!-- Additional context row -->
+    <div class="vg-section">
+      <div class="vg-two-col">
+        <div class="vg-field">
+          <label class="vg-label">Target Audience</label>
+          <input type="text" id="vg-audience" class="vg-input" placeholder="e.g. 18-28 fitness enthusiasts"/>
+        </div>
+        <div class="vg-field">
+          <label class="vg-label">Tone</label>
+          <select id="vg-tone" class="vg-input vg-select">
+            <option value="engaging">Engaging</option>
+            <option value="inspirational">Inspirational</option>
+            <option value="urgent">Urgent</option>
+            <option value="educational">Educational</option>
+            <option value="entertaining">Entertaining</option>
+            <option value="professional">Professional</option>
+            <option value="raw/authentic">Raw / Authentic</option>
+            <option value="humorous">Humorous</option>
+          </select>
+        </div>
+      </div>
+      <div class="vg-two-col" style="margin-top:0.75rem">
+        <div class="vg-field">
+          <label class="vg-label">Duration (seconds)</label>
+          <input type="number" id="vg-duration" class="vg-input" placeholder="30" value="30" min="5" max="600"/>
+        </div>
+        <div class="vg-field">
+          <label class="vg-label">Mood / Vibe</label>
+          <input type="text" id="vg-mood" class="vg-input" placeholder="e.g. Energetic, Calm, Dramatic"/>
+        </div>
+      </div>
+      <div class="vg-field" style="margin-top:0.75rem">
+        <label class="vg-label">Music Style</label>
+        <input type="text" id="vg-music" class="vg-input" placeholder="e.g. Trap beats, Ambient, Lo-fi hip hop, Epic orchestral"/>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="vg-actions">
+      <button class="vg-btn-generate" id="btn-generate">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="7" width="20" height="14" rx="2"/>
+          <path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/>
+          <line x1="12" y1="12" x2="12" y2="17"/>
+          <line x1="9.5" y1="14.5" x2="14.5" y2="14.5"/>
+        </svg>
+        Generate Brief
+      </button>
+      <button class="vg-btn-hooks" id="btn-hooks">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+        </svg>
+        5 Hooks Only
+      </button>
+    </div>
+
+  </aside>
+
+  <!-- ═══ RIGHT PANEL — OUTPUT ══════════════════════════════════════ -->
+  <section id="vg-output-panel">
+
+    <!-- Empty state -->
+    <div class="vg-empty-state" id="vg-empty">
+      <div class="vg-empty-icon">
+        <svg viewBox="0 0 64 64" fill="none">
+          <rect x="6" y="14" width="40" height="28" rx="3" stroke="currentColor" stroke-width="1.5" opacity="0.3"/>
+          <path d="M46 14l12-6v36l-12-6V14z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" opacity="0.3"/>
+          <circle cx="20" cy="26" r="3" stroke="currentColor" stroke-width="1.5" opacity="0.5"/>
+          <path d="M6 35l12-10 8 8 8-6 12 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
+          <line x1="16" y1="50" x2="48" y2="50" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity="0.25"/>
+          <line x1="24" y1="56" x2="40" y2="56" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity="0.18"/>
+        </svg>
+      </div>
+      <h2 class="vg-empty-title">Video Generator Ready</h2>
+      <p class="vg-empty-sub">Choose your platform and style, describe your concept, then generate a complete production-ready video brief.</p>
+      <div class="vg-empty-chips">
+        <span class="vg-chip">Production Brief</span>
+        <span class="vg-chip">Full Shot List</span>
+        <span class="vg-chip">Script Variants</span>
+        <span class="vg-chip">Hook Generator</span>
+        <span class="vg-chip">Music Direction</span>
+        <span class="vg-chip">Caption Copy</span>
+      </div>
+    </div>
+
+    <!-- Loading state -->
+    <div class="vg-loading-state" id="vg-loading" style="display:none">
+      <div class="vg-loading-ring"></div>
+      <div class="vg-loading-label" id="loading-label">Generating your video brief...</div>
+      <div class="vg-loading-stream" id="loading-stream"></div>
+    </div>
+
+    <!-- Results -->
+    <div class="vg-results" id="vg-results" style="display:none">
+
+      <!-- Results header -->
+      <div class="vg-results-header">
+        <div class="vg-results-title">
+          <span class="vg-results-platform-badge" id="results-platform-badge"></span>
+          <h2>Production Brief Ready</h2>
+        </div>
+        <div class="vg-results-actions">
+          <button class="vg-btn-icon" id="btn-export" title="Export as Markdown">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+          </button>
+          <button class="vg-btn-icon" id="btn-rerun" title="Regenerate">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Output tabs -->
+      <div class="vg-output-tabs">
+        <button class="vg-output-tab active" data-output-tab="brief">Brief</button>
+        <button class="vg-output-tab" data-output-tab="script">Script</button>
+        <button class="vg-output-tab" data-output-tab="shots">Shot List</button>
+        <button class="vg-output-tab" data-output-tab="hooks">Hooks</button>
+        <button class="vg-output-tab" data-output-tab="production">Production</button>
+        <button class="vg-output-tab" data-output-tab="captions">Captions</button>
+      </div>
+
+      <!-- TAB: BRIEF -->
+      <div class="vg-output-content active" id="out-brief">
+        <div id="out-concept"></div>
+        <div class="vg-brief-grid" id="out-brief-grid"></div>
+        <div id="out-directors-note"></div>
+      </div>
+
+      <!-- TAB: SCRIPT -->
+      <div class="vg-output-content" id="out-script">
+        <div id="out-script-container"></div>
+      </div>
+
+      <!-- TAB: SHOTS -->
+      <div class="vg-output-content" id="out-shots">
+        <div class="vg-shot-list" id="out-shot-list"></div>
+      </div>
+
+      <!-- TAB: HOOKS -->
+      <div class="vg-output-content" id="out-hooks">
+        <div class="vg-hooks-placeholder">
+          <p>Click <strong>5 Hooks Only</strong> in the input panel, or generate a full brief first — hooks will appear here.</p>
+        </div>
+      </div>
+
+      <!-- TAB: PRODUCTION -->
+      <div class="vg-output-content" id="out-production">
+        <div class="vg-prod-grid">
+          <div class="vg-prod-card" id="out-music"></div>
+          <div class="vg-prod-card" id="out-broll"></div>
+          <div class="vg-prod-card" id="out-voiceover"></div>
+        </div>
+        <div class="vg-tech-card" id="out-technical"></div>
+      </div>
+
+      <!-- TAB: CAPTIONS -->
+      <div class="vg-output-content" id="out-captions">
+        <div id="out-captions-container"></div>
+      </div>
+
+    </div><!-- /vg-results -->
+
+    <!-- Copied toast -->
+    <div class="vg-copied-toast">Copied to clipboard</div>
+
+  </section>
+
+</main>
+
+<script src="/static/video-generator.js"></script>
 </body>
 </html>`
 }
