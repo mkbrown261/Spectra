@@ -696,15 +696,19 @@ body {
 .vg-upload-drop {
   padding: 16px; display: flex; flex-direction: column;
   align-items: center; gap: 6px; text-align: center;
+  cursor: pointer; width: 100%; box-sizing: border-box;
+  text-decoration: none;
 }
 .vg-upload-icon { color: var(--text-ghost); margin-bottom: 4px; }
 .vg-upload-text { font-size: 0.75rem; color: var(--text-dim); }
 .vg-upload-sub { font-size: 0.68rem; color: var(--text-ghost); }
 .vg-btn-upload-browse {
-  padding: 5px 12px; border-radius: 100px;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 7px 16px; border-radius: 100px;
   border: 1px solid var(--border-glow); background: var(--accent-ghost);
-  color: var(--accent-bright); font-size: 0.72rem; font-weight: 500;
+  color: var(--accent-bright); font-size: 0.75rem; font-weight: 600;
   cursor: pointer; transition: all 0.16s;
+  pointer-events: none;
 }
 .vg-btn-upload-browse:hover { background: rgba(124,106,247,0.2); }
 .vg-url-input { margin-top: 2px; }

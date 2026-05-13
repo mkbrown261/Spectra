@@ -2112,15 +2112,18 @@ function videoGeneratorPage(): string {
             </button>
           </div>
           <!-- Drop target -->
-          <div class="vg-upload-drop" id="vg-upload-drop">
+          <label class="vg-upload-drop" id="vg-upload-drop" for="vg-file-input">
             <div class="vg-upload-icon">
               <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
             </div>
-            <div class="vg-upload-text">Drop image here or</div>
-            <button class="vg-btn-upload-browse" id="btn-browse-image">Browse</button>
-            <div class="vg-upload-sub">or</div>
-            <input type="url" id="vg-image-url" class="vg-input vg-url-input" placeholder="Paste image URL..."/>
-          </div>
+            <div class="vg-upload-text">Click to upload from device</div>
+            <span class="vg-btn-upload-browse">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Upload from device
+            </span>
+            <div class="vg-upload-sub">or drag &amp; drop · or paste URL below</div>
+            <input type="url" id="vg-image-url" class="vg-input vg-url-input" placeholder="Paste image URL..." onclick="event.stopPropagation()"/>
+          </label>
           <input type="file" id="vg-file-input" accept="image/jpeg,image/png,image/webp,image/gif" style="display:none"/>
         </div>
       </div>

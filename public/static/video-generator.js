@@ -457,8 +457,7 @@ function initUploadZone() {
 
   if (!zone) return;
 
-  // Browse button → trigger file input
-  browseBtn?.addEventListener('click', () => fileInput?.click());
+  // Browse button removed — label element handles file picker natively
 
   // File input change
   fileInput?.addEventListener('change', () => {
