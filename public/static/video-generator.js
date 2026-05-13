@@ -853,6 +853,7 @@ async function selectProject(id) {
   $('vg-shot-grid').style.display = 'grid';
 
   await loadShots(id);
+  await renderCharacters(id);  // Item 5: load character panel
 }
 
 function showEmptyState() {
@@ -907,8 +908,14 @@ function renderShotGrid(projectId) {
     return;
   }
 
-  const sorted = [...shots].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  grid.innerHTML = sorted.map(shot => renderShotCard(shot)).join('');
+  // Sort by sort_order (item 4), then creation date as fallback
+  const sorted = [...shots].sort((a, b) => {
+    if (a.sort_order != null && b.sort_order != null) return a.sort_order - b.sort_order;
+    return new Date(b.created_at) - new Date(a.created_at);
+  });
+
+  // Render cards with draggable attribute (Item 4)
+  grid.innerHTML = sorted.map(shot => renderShotCard(shot, true)).join('');
 
   // Bind shot actions
   grid.querySelectorAll('[data-shot-id]').forEach(el => {
@@ -923,9 +930,12 @@ function renderShotGrid(projectId) {
       if (action === 'play')     playShot(shotId, projectId);
     });
   });
+
+  // Init drag-and-drop (Item 4)
+  initDragAndDrop(grid);
 }
 
-function renderShotCard(shot) {
+function renderShotCard(shot, draggable = false) {
   const statusDotClass = {
     queued:      'dot-queued',
     in_progress: 'dot-progress',
@@ -986,7 +996,10 @@ function renderShotCard(shot) {
   const tagsHtml = tags.length ? `<div class="vg-shot-tags">${tags.join('')}</div>` : '';
 
   return `
-    <article class="vg-shot-card" data-status="${shot.status}" data-shot-id="${shot.id}">
+    <article class="vg-shot-card" data-status="${shot.status}" data-shot-id="${shot.id}"${draggable ? ' draggable="true"' : ''}>
+      ${draggable ? `<div class="vg-shot-drag-handle" title="Drag to reorder">
+        <svg width="10" height="10" viewBox="0 0 20 20" fill="currentColor" opacity="0.4"><circle cx="7" cy="4" r="1.5"/><circle cx="13" cy="4" r="1.5"/><circle cx="7" cy="10" r="1.5"/><circle cx="13" cy="10" r="1.5"/><circle cx="7" cy="16" r="1.5"/><circle cx="13" cy="16" r="1.5"/></svg>
+      </div>` : ''}
       <div class="vg-shot-thumb">
         ${thumbContent}
         <span class="vg-shot-aspect-badge">${escHtml(shot.aspect_ratio || '16:9')}</span>
@@ -1586,6 +1599,307 @@ function showToast(msg, isError = false) {
    BIND UI
    ═══════════════════════════════════════════════════════════════ */
 
+/* ═══════════════════════════════════════════════════════════════
+   ITEM 2 — STRIPE UPGRADE FLOW
+   ═══════════════════════════════════════════════════════════════ */
+
+function openUpgradeModal() {
+  const overlay = $('upgrade-modal-overlay');
+  if (overlay) {
+    overlay.classList.add('active');
+    $('upgrade-modal-error') && ($('upgrade-modal-error').style.display = 'none');
+  }
+}
+
+function closeUpgradeModal() {
+  const overlay = $('upgrade-modal-overlay');
+  if (overlay) overlay.classList.remove('active');
+}
+
+async function startCheckout(tier) {
+  try {
+    const errEl = $('upgrade-modal-error');
+    if (errEl) errEl.style.display = 'none';
+    const btns = document.querySelectorAll('[data-upgrade-tier]');
+    btns.forEach(b => { b.disabled = true; b.textContent = 'Processing…'; });
+
+    const res  = await api('POST', '/api/billing/checkout', { tier });
+    const data = await res.json();
+
+    btns.forEach(b => { b.disabled = false; b.textContent = `Select ${capitalize(b.dataset.upgradeTier)}`; });
+
+    if (!res.ok || !data.url) {
+      const msg = data.error || 'Failed to create checkout session';
+      if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; }
+      showToast(msg, true);
+      return;
+    }
+    // Redirect to Stripe Checkout
+    window.location.href = data.url;
+  } catch (err) {
+    showToast('Checkout error: ' + err.message, true);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ITEM 4 — SHOT REORDER (drag-and-drop)
+   ═══════════════════════════════════════════════════════════════ */
+
+let _dragShotId  = null;
+let _dragOverId  = null;
+
+function initDragAndDrop(grid) {
+  if (!grid) return;
+
+  grid.addEventListener('dragstart', e => {
+    const card = e.target.closest('.vg-shot-card');
+    if (!card) return;
+    _dragShotId = card.dataset.shotId;
+    card.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+  });
+
+  grid.addEventListener('dragend', e => {
+    const card = e.target.closest('.vg-shot-card');
+    if (card) card.classList.remove('dragging');
+    grid.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+    _dragShotId = null;
+    _dragOverId = null;
+  });
+
+  grid.addEventListener('dragover', e => {
+    e.preventDefault();
+    const card = e.target.closest('.vg-shot-card');
+    if (!card || card.dataset.shotId === _dragShotId) return;
+    grid.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+    card.classList.add('drag-over');
+    _dragOverId = card.dataset.shotId;
+  });
+
+  grid.addEventListener('drop', async e => {
+    e.preventDefault();
+    grid.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+    if (!_dragShotId || !_dragOverId || _dragShotId === _dragOverId) return;
+
+    const projectId = VG.activeProjectId;
+    if (!projectId) return;
+
+    const shots = VG.shots[projectId] || [];
+
+    // Build new order: remove dragged, insert before drop target
+    const newOrder = shots.filter(s => s.id !== _dragShotId);
+    const dropIdx  = newOrder.findIndex(s => s.id === _dragOverId);
+    const dragged  = shots.find(s => s.id === _dragShotId);
+    if (!dragged) return;
+    newOrder.splice(dropIdx, 0, dragged);
+
+    // Optimistic update
+    VG.shots[projectId] = newOrder;
+    renderShotGrid(projectId);
+
+    // Persist to server
+    try {
+      await api('PATCH', `/api/projects/${projectId}/reorder`, {
+        shot_ids: newOrder.map(s => s.id),
+      });
+    } catch {
+      showToast('Reorder save failed', true);
+    }
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ITEM 5 — CHARACTER SOUL
+   ═══════════════════════════════════════════════════════════════ */
+
+let _charUploadedKey = null;
+let _charUploadedUrl = null;
+
+function openCharModal() {
+  $('char-modal-overlay')?.classList.add('active');
+  $('char-name-input') && ($('char-name-input').value = '');
+  $('char-desc-input') && ($('char-desc-input').value = '');
+  $('char-upload-name') && ($('char-upload-name').textContent = '');
+  $('char-upload-preview') && ($('char-upload-preview').style.display = 'none');
+  $('char-modal-error') && ($('char-modal-error').style.display = 'none');
+  $('char-file-input') && ($('char-file-input').value = '');
+  _charUploadedKey = null;
+  _charUploadedUrl = null;
+}
+
+function closeCharModal() {
+  $('char-modal-overlay')?.classList.remove('active');
+}
+
+async function handleCharFileSelect(file) {
+  const nameEl    = $('char-upload-name');
+  const previewEl = $('char-upload-preview');
+  const imgEl     = $('char-upload-img');
+
+  if (nameEl) nameEl.textContent = 'Uploading…';
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const res  = await fetch('/api/upload', { method: 'POST', body: fd, credentials: 'same-origin' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Upload failed');
+    _charUploadedKey = data.key;
+    _charUploadedUrl = data.absoluteUrl || (window.location.origin + data.url);
+    if (nameEl) nameEl.textContent = file.name;
+    if (imgEl)  { imgEl.src = data.url; }
+    if (previewEl) previewEl.style.display = 'block';
+  } catch (err) {
+    if (nameEl) nameEl.textContent = '';
+    showToast('Upload failed: ' + err.message, true);
+  }
+}
+
+async function saveCharacter() {
+  const name   = $('char-name-input')?.value?.trim();
+  const desc   = $('char-desc-input')?.value?.trim();
+  const errEl  = $('char-modal-error');
+  const saveBtn = $('btn-save-char');
+
+  if (!name) {
+    if (errEl) { errEl.textContent = 'Character name required'; errEl.style.display = 'block'; }
+    return;
+  }
+  if (!VG.activeProjectId) {
+    if (errEl) { errEl.textContent = 'Select a project first'; errEl.style.display = 'block'; }
+    return;
+  }
+
+  if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving…'; }
+  if (errEl) errEl.style.display = 'none';
+
+  try {
+    const res  = await api('POST', `/api/projects/${VG.activeProjectId}/characters`, {
+      name,
+      description:   desc || null,
+      ref_image_url: _charUploadedUrl || null,
+    });
+    const data = await res.json();
+
+    if (!res.ok) throw new Error(data.error || 'Failed to save character');
+
+    closeCharModal();
+    showToast(`Character "${name}" added`);
+    // Reload project to get updated characters list
+    await loadShots(VG.activeProjectId);
+    await renderCharacters(VG.activeProjectId);
+  } catch (err) {
+    if (errEl) { errEl.textContent = err.message; errEl.style.display = 'block'; }
+    showToast(err.message, true);
+  } finally {
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = 'Add Character'; }
+  }
+}
+
+async function renderCharacters(projectId) {
+  const panel = $('vg-character-section');
+  const list  = $('vg-character-list');
+  if (!panel || !list || !projectId) return;
+
+  panel.style.display = 'block';
+
+  try {
+    const res  = await api('GET', `/api/projects/${projectId}`);
+    const data = await res.json();
+    const chars = data.characters || [];
+
+    if (chars.length === 0) {
+      list.innerHTML = `<div class="vg-char-empty">No characters yet. Add one to maintain visual consistency across shots.</div>`;
+      return;
+    }
+
+    list.innerHTML = chars.map(ch => `
+      <div class="vg-char-card" data-char-id="${ch.id}">
+        <div class="vg-char-avatar">
+          ${ch.ref_image_url
+            ? `<img src="${escAttr(ch.ref_image_url)}" alt="${escAttr(ch.name)}" loading="lazy"/>`
+            : `<div class="vg-char-initials">${escHtml(ch.name.slice(0,2).toUpperCase())}</div>`
+          }
+        </div>
+        <div class="vg-char-info">
+          <div class="vg-char-name">${escHtml(ch.name)}</div>
+          ${ch.description ? `<div class="vg-char-desc">${escHtml(ch.description)}</div>` : ''}
+          ${ch.soul_id ? `<div class="vg-char-soul-badge">Soul trained ✓</div>` : ''}
+        </div>
+        <div class="vg-char-actions">
+          <button class="vg-btn-chip vg-char-use-btn" title="Use as reference image" data-char-id="${ch.id}" data-ref-url="${escAttr(ch.ref_image_url || '')}">
+            Use
+          </button>
+          ${ch.ref_image_url && !ch.soul_id
+            ? `<button class="vg-btn-chip vg-char-train-btn" data-char-id="${ch.id}" title="Train Soul for consistency">Train Soul</button>`
+            : ''
+          }
+          <button class="vg-btn-chip danger vg-char-del-btn" data-char-id="${ch.id}" title="Delete character">×</button>
+        </div>
+      </div>
+    `).join('');
+
+    // Bind character actions
+    list.querySelectorAll('.vg-char-use-btn').forEach(btn => {
+      btn.addEventListener('click', () => useCharacter(btn.dataset.charId, btn.dataset.refUrl));
+    });
+    list.querySelectorAll('.vg-char-train-btn').forEach(btn => {
+      btn.addEventListener('click', () => trainCharacterSoul(btn.dataset.charId));
+    });
+    list.querySelectorAll('.vg-char-del-btn').forEach(btn => {
+      btn.addEventListener('click', () => deleteCharacter(btn.dataset.charId, projectId));
+    });
+  } catch (err) {
+    list.innerHTML = `<div class="vg-char-empty" style="color:var(--color-error)">Failed to load characters</div>`;
+  }
+}
+
+async function useCharacter(charId, refUrl) {
+  if (!refUrl) {
+    showToast('This character has no reference image', true);
+    return;
+  }
+  // Set the character's ref image as the upload preview + VG state
+  VG.uploadedImageUrl = refUrl.startsWith('/')
+    ? window.location.origin + refUrl
+    : refUrl;
+  VG.uploadedImageKey = null; // not an R2 key, might be absolute
+
+  // Show preview
+  const imgEl = $('vg-upload-img');
+  if (imgEl) imgEl.src = refUrl;
+  showUploadPreview(refUrl);
+
+  showToast('Character reference image set');
+}
+
+async function trainCharacterSoul(charId) {
+  if (!VG.activeProjectId) return;
+  const btn = document.querySelector(`[data-char-id="${charId}"].vg-char-train-btn`);
+  if (btn) { btn.disabled = true; btn.textContent = 'Training…'; }
+  try {
+    const res  = await api('POST', `/api/projects/${VG.activeProjectId}/characters/train`, { character_id: charId });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Training failed');
+    showToast(data.message || 'Soul training started');
+    await renderCharacters(VG.activeProjectId);
+  } catch (err) {
+    showToast(err.message, true);
+    if (btn) { btn.disabled = false; btn.textContent = 'Train Soul'; }
+  }
+}
+
+async function deleteCharacter(charId, projectId) {
+  if (!confirm('Delete this character?')) return;
+  try {
+    const res = await api('DELETE', `/api/projects/${projectId}/characters/${charId}`);
+    if (!res.ok) throw new Error('Delete failed');
+    showToast('Character deleted');
+    await renderCharacters(projectId);
+  } catch (err) {
+    showToast(err.message, true);
+  }
+}
+
 function bindUI() {
   // Auth tabs
   $$('.vg-auth-tab').forEach(tab => {
@@ -1679,9 +1993,30 @@ function bindUI() {
   // Storyboard view toggle
   $('btn-toggle-view')?.addEventListener('click', toggleStoryboardView);
 
-  // Upgrade button (placeholder)
-  $('btn-upgrade')?.addEventListener('click', () => {
-    showToast('Upgrade coming soon — contact us to upgrade early');
+  // Upgrade button — open upgrade modal (Item 2)
+  $('btn-upgrade')?.addEventListener('click', openUpgradeModal);
+
+  // Upgrade modal
+  $('btn-close-upgrade-modal')?.addEventListener('click', closeUpgradeModal);
+  $('upgrade-modal-overlay')?.addEventListener('click', e => {
+    if (e.target === $('upgrade-modal-overlay')) closeUpgradeModal();
+  });
+  document.querySelectorAll('[data-upgrade-tier]').forEach(btn => {
+    btn.addEventListener('click', () => startCheckout(btn.dataset.upgradeTier));
+  });
+
+  // Character modal (Item 5)
+  $('btn-add-character')?.addEventListener('click', openCharModal);
+  $('btn-close-char-modal')?.addEventListener('click', closeCharModal);
+  $('btn-cancel-char-modal')?.addEventListener('click', closeCharModal);
+  $('char-modal-overlay')?.addEventListener('click', e => {
+    if (e.target === $('char-modal-overlay')) closeCharModal();
+  });
+  $('btn-save-char')?.addEventListener('click', saveCharacter);
+  $('btn-char-browse')?.addEventListener('click', () => $('char-file-input')?.click());
+  $('char-file-input')?.addEventListener('change', e => {
+    const file = e.target.files?.[0];
+    if (file) handleCharFileSelect(file);
   });
 
   // Escape key closes overlays
@@ -1691,6 +2026,8 @@ function bindUI() {
       closeBibleModal();
       closeSettings();
       closePlayer();
+      closeCharModal();
+      closeUpgradeModal();
     }
   });
 

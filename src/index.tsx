@@ -7,14 +7,16 @@ import OpenAI from 'openai'
    BINDINGS
 ══════════════════════════════════════════════════════════════════ */
 type Bindings = {
-  DB:               D1Database
-  STORAGE:          R2Bucket
-  OPENAI_API_KEY:   string
-  OPENAI_BASE_URL:  string
-  ENCRYPTION_KEY:   string   // 32-byte hex string for AES-256-GCM
-  JWT_SECRET:       string
-  YOUTUBE_API_KEY:  string
-  FB_ACCESS_TOKEN:  string
+  DB:                    D1Database
+  STORAGE:               R2Bucket
+  OPENAI_API_KEY:        string
+  OPENAI_BASE_URL:       string
+  ENCRYPTION_KEY:        string   // 32-byte hex string for AES-256-GCM
+  JWT_SECRET:            string
+  YOUTUBE_API_KEY:       string
+  FB_ACCESS_TOKEN:       string
+  STRIPE_SECRET_KEY:     string   // sk_live_... or sk_test_...
+  STRIPE_WEBHOOK_SECRET: string   // whsec_...
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -176,6 +178,88 @@ async function requireAuth(c: any, next: any) {
   c.set('userCredits', session.credits)
   c.set('userEmail', session.email)
   await next()
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   R2 VIDEO COPY HELPER  (Item 1)
+══════════════════════════════════════════════════════════════════ */
+async function copyVideoToR2(params: {
+  hfVideoUrl: string
+  storage:    R2Bucket
+  userId:     string
+  shotId:     string
+}): Promise<string | null> {
+  try {
+    const { hfVideoUrl, storage, userId, shotId } = params
+    const res = await fetch(hfVideoUrl, { headers: { 'User-Agent': 'Spectra/1.0' } })
+    if (!res.ok || !res.body) return null
+    const key = `videos/${userId}/${shotId}.mp4`
+    await storage.put(key, res.body, {
+      httpMetadata: { contentType: 'video/mp4' },
+    })
+    return key
+  } catch {
+    return null
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   STRIPE HELPERS  (Item 2)
+══════════════════════════════════════════════════════════════════ */
+// Stripe plan IDs — update these with real IDs from your Stripe dashboard
+const STRIPE_PRICES: Record<string, string> = {
+  creator: 'price_creator_monthly',
+  studio:  'price_studio_monthly',
+  pro:     'price_pro_monthly',
+}
+
+async function stripeRequest(
+  path: string,
+  method: string,
+  body: Record<string, any> | null,
+  secretKey: string
+): Promise<any> {
+  const opts: RequestInit = {
+    method,
+    headers: {
+      'Authorization': `Bearer ${secretKey}`,
+      'Content-Type':  'application/x-www-form-urlencoded',
+    },
+  }
+  if (body) {
+    opts.body = new URLSearchParams(
+      Object.entries(body).flatMap(([k, v]) =>
+        Array.isArray(v) ? v.map((vi, i) => [`${k}[${i}]`, String(vi)]) : [[k, String(v)]]
+      )
+    ).toString()
+  }
+  const res = await fetch(`https://api.stripe.com/v1${path}`, opts)
+  return res.json()
+}
+
+// Constant-time HMAC-SHA256 signature verification for Stripe webhooks
+async function verifyStripeSignature(
+  payload: string,
+  sigHeader: string,
+  secret: string
+): Promise<boolean> {
+  try {
+    const parts = Object.fromEntries(sigHeader.split(',').map(p => p.split('=')))
+    const ts = parts['t']
+    const v1 = parts['v1']
+    if (!ts || !v1) return false
+
+    const signed = `${ts}.${payload}`
+    const enc    = new TextEncoder()
+    const key    = await crypto.subtle.importKey(
+      'raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+    )
+    const sig    = await crypto.subtle.sign('HMAC', key, enc.encode(signed))
+    const hex    = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('')
+    return hex === v1
+  } catch {
+    return false
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -644,8 +728,9 @@ app.get('/api/projects/:id', requireAuth, async (c) => {
 
   const shots = await c.env.DB.prepare(
     `SELECT id, prompt_raw, prompt_enhanced, provider, model, aspect_ratio, duration,
-            status, video_url, thumbnail_url, error_message, created_at, completed_at
-     FROM shots WHERE project_id = ? ORDER BY created_at DESC`
+            status, video_url, thumbnail_url, error_message, created_at, completed_at,
+            sort_order, seed, style_preset, quality
+     FROM shots WHERE project_id = ? ORDER BY sort_order ASC, created_at DESC`
   ).bind(projectId).all()
 
   const characters = await c.env.DB.prepare(
@@ -927,7 +1012,33 @@ app.get('/api/shots/:shotId/status', requireAuth, async (c) => {
 
     if (hfStatus.status === 'completed') {
       newStatus = 'completed'
-      videoUrl  = hfStatus.video?.url || hfStatus.images?.[0]?.url || null
+      const rawUrl = hfStatus.video?.url || hfStatus.images?.[0]?.url || null
+      videoUrl  = rawUrl
+
+      // ── Item 1: Copy HF video to R2 for permanent storage ──────
+      if (rawUrl && c.env.STORAGE) {
+        const r2Key = await copyVideoToR2({
+          hfVideoUrl: rawUrl,
+          storage:    c.env.STORAGE,
+          userId,
+          shotId,
+        })
+        if (r2Key) {
+          // Build absolute R2 serve URL
+          const origin = new URL(c.req.url).origin
+          videoUrl = `${origin}/api/video/${encodeURIComponent(r2Key)}`
+        }
+      }
+
+      // ── Item 3: Capture thumbnail from HF response ──────────────
+      // Higgsfield may return a thumbnail/preview field on completion
+      const hfAny = hfStatus as any
+      const thumbUrl = hfAny.thumbnail || hfAny.preview || hfAny.poster || null
+      if (thumbUrl) {
+        await c.env.DB.prepare(
+          `UPDATE shots SET thumbnail_url=? WHERE id=?`
+        ).bind(thumbUrl, shotId).run()
+      }
     } else if (hfStatus.status === 'failed') {
       newStatus = 'failed'
       errorMsg  = hfStatus.error || 'Generation failed'
@@ -969,6 +1080,289 @@ app.delete('/api/shots/:shotId', requireAuth, async (c) => {
     `DELETE FROM shots WHERE id = ? AND user_id = ?`
   ).bind(shotId, userId).run()
   return c.json({ ok: true })
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   ITEM 1 — R2 VIDEO SERVE
+══════════════════════════════════════════════════════════════════ */
+
+// GET /api/video/:key — serve an R2 video (key is URL-encoded path)
+app.get('/api/video/:key', async (c) => {
+  try {
+    if (!c.env.STORAGE) return c.json({ error: 'Storage not configured' }, 500)
+    const key    = decodeURIComponent(c.req.param('key'))
+    const object = await c.env.STORAGE.get(key)
+    if (!object) return c.json({ error: 'Video not found' }, 404)
+    const headers = new Headers()
+    headers.set('Content-Type', object.httpMetadata?.contentType || 'video/mp4')
+    headers.set('Cache-Control', 'public, max-age=31536000')
+    headers.set('Accept-Ranges', 'bytes')
+    return new Response(object.body, { headers })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   ITEM 2 — STRIPE BILLING
+══════════════════════════════════════════════════════════════════ */
+
+// GET /api/billing/status
+app.get('/api/billing/status', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const user   = await c.env.DB.prepare(
+      `SELECT tier, stripe_customer_id, stripe_subscription_id FROM users WHERE id = ?`
+    ).bind(userId).first<{ tier: string; stripe_customer_id: string | null; stripe_subscription_id: string | null }>()
+    if (!user) return c.json({ error: 'User not found' }, 404)
+    return c.json({
+      tier:                    user.tier,
+      stripe_customer_id:      user.stripe_customer_id,
+      stripe_subscription_id:  user.stripe_subscription_id,
+      limits:                  TIER_LIMITS[user.tier] || TIER_LIMITS.free,
+    })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// POST /api/billing/checkout — create Stripe Checkout session
+app.post('/api/billing/checkout', requireAuth, async (c) => {
+  try {
+    if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Stripe not configured' }, 500)
+    const userId = c.get('userId')
+    const email  = c.get('userEmail')
+    const { tier } = await c.req.json()
+    const priceId = STRIPE_PRICES[tier]
+    if (!priceId) return c.json({ error: 'Invalid tier' }, 400)
+
+    const origin = new URL(c.req.url).origin
+
+    // Get or create Stripe customer
+    const userRow = await c.env.DB.prepare(
+      `SELECT stripe_customer_id FROM users WHERE id = ?`
+    ).bind(userId).first<{ stripe_customer_id: string | null }>()
+
+    let customerId = userRow?.stripe_customer_id
+    if (!customerId) {
+      const customer = await stripeRequest('/customers', 'POST', {
+        email,
+        metadata: JSON.stringify({ spectra_user_id: userId }),
+      }, c.env.STRIPE_SECRET_KEY)
+      customerId = customer.id
+      await c.env.DB.prepare(
+        `UPDATE users SET stripe_customer_id = ? WHERE id = ?`
+      ).bind(customerId, userId).run()
+    }
+
+    // Create Checkout session
+    const session = await stripeRequest('/checkout/sessions', 'POST', {
+      customer:             customerId,
+      mode:                 'subscription',
+      'line_items[0][price]':    priceId,
+      'line_items[0][quantity]': '1',
+      success_url:          `${origin}/tools/video-generator/?upgraded=1`,
+      cancel_url:           `${origin}/tools/video-generator/?upgrade_cancel=1`,
+      'metadata[spectra_user_id]': userId,
+      'metadata[tier]':     tier,
+    }, c.env.STRIPE_SECRET_KEY)
+
+    if (session.error) return c.json({ error: session.error.message }, 400)
+    return c.json({ ok: true, url: session.url, session_id: session.id })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// POST /api/billing/webhook — Stripe webhook handler
+app.post('/api/billing/webhook', async (c) => {
+  try {
+    if (!c.env.STRIPE_WEBHOOK_SECRET) return c.json({ error: 'Webhook secret not configured' }, 500)
+    const payload   = await c.req.text()
+    const sigHeader = c.req.header('stripe-signature') || ''
+    const valid     = await verifyStripeSignature(payload, sigHeader, c.env.STRIPE_WEBHOOK_SECRET)
+    if (!valid) return c.json({ error: 'Invalid signature' }, 400)
+
+    const event = JSON.parse(payload)
+
+    if (event.type === 'checkout.session.completed') {
+      const session  = event.data.object
+      const userId   = session.metadata?.spectra_user_id
+      const tier     = session.metadata?.tier
+      const subId    = session.subscription
+      if (userId && tier && TIER_LIMITS[tier]) {
+        await c.env.DB.prepare(
+          `UPDATE users SET tier = ?, stripe_subscription_id = ?, updated_at = datetime('now') WHERE id = ?`
+        ).bind(tier, subId || null, userId).run()
+      }
+    } else if (event.type === 'customer.subscription.deleted') {
+      const sub      = event.data.object
+      const custId   = sub.customer
+      if (custId) {
+        await c.env.DB.prepare(
+          `UPDATE users SET tier = 'free', stripe_subscription_id = NULL, updated_at = datetime('now')
+           WHERE stripe_customer_id = ?`
+        ).bind(custId).run()
+      }
+    } else if (event.type === 'customer.subscription.updated') {
+      const sub    = event.data.object
+      const custId = sub.customer
+      const status = sub.status
+      // If subscription becomes past_due or unpaid, downgrade
+      if (custId && ['past_due', 'unpaid', 'canceled'].includes(status)) {
+        await c.env.DB.prepare(
+          `UPDATE users SET tier = 'free', updated_at = datetime('now') WHERE stripe_customer_id = ?`
+        ).bind(custId).run()
+      }
+    }
+
+    return c.json({ received: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   ITEM 3 — THUMBNAIL
+══════════════════════════════════════════════════════════════════ */
+
+// PATCH /api/shots/:shotId/thumbnail — manually set thumbnail URL
+app.patch('/api/shots/:shotId/thumbnail', requireAuth, async (c) => {
+  try {
+    const userId  = c.get('userId')
+    const shotId  = c.req.param('shotId')
+    const { thumbnail_url } = await c.req.json()
+    if (!thumbnail_url) return c.json({ error: 'thumbnail_url required' }, 400)
+
+    const shot = await c.env.DB.prepare(
+      `SELECT id FROM shots WHERE id = ? AND user_id = ?`
+    ).bind(shotId, userId).first()
+    if (!shot) return c.json({ error: 'Shot not found' }, 404)
+
+    await c.env.DB.prepare(
+      `UPDATE shots SET thumbnail_url = ? WHERE id = ?`
+    ).bind(thumbnail_url, shotId).run()
+
+    return c.json({ ok: true, thumbnail_url })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   ITEM 4 — SHOT REORDER
+══════════════════════════════════════════════════════════════════ */
+
+// PATCH /api/projects/:projectId/reorder — reorder shots
+app.patch('/api/projects/:projectId/reorder', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const projectId = c.req.param('projectId')
+
+    const project = await c.env.DB.prepare(
+      `SELECT id FROM projects WHERE id = ? AND user_id = ?`
+    ).bind(projectId, userId).first()
+    if (!project) return c.json({ error: 'Project not found' }, 404)
+
+    const { shot_ids } = await c.req.json()
+    if (!Array.isArray(shot_ids) || shot_ids.length === 0) {
+      return c.json({ error: 'shot_ids array required' }, 400)
+    }
+
+    // Apply sort_order in one batch (D1 supports individual prepare/run)
+    const stmts = shot_ids.map((id: string, idx: number) =>
+      c.env.DB.prepare(
+        `UPDATE shots SET sort_order = ? WHERE id = ? AND project_id = ? AND user_id = ?`
+      ).bind(idx, id, projectId, userId)
+    )
+    await c.env.DB.batch(stmts)
+
+    return c.json({ ok: true, count: shot_ids.length })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   ITEM 5 — CHARACTER SOUL TRAINING
+══════════════════════════════════════════════════════════════════ */
+
+// POST /api/projects/:id/characters/train — initiate Higgsfield Soul training
+app.post('/api/projects/:id/characters/train', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const projectId = c.req.param('id')
+
+    const project = await c.env.DB.prepare(
+      `SELECT id FROM projects WHERE id = ? AND user_id = ?`
+    ).bind(projectId, userId).first()
+    if (!project) return c.json({ error: 'Project not found' }, 404)
+
+    const { character_id } = await c.req.json()
+    if (!character_id) return c.json({ error: 'character_id required' }, 400)
+
+    const character = await c.env.DB.prepare(
+      `SELECT id, name, ref_image_url, soul_id FROM characters WHERE id = ? AND project_id = ?`
+    ).bind(character_id, projectId).first<{
+      id: string; name: string; ref_image_url: string | null; soul_id: string | null
+    }>()
+    if (!character) return c.json({ error: 'Character not found' }, 404)
+    if (!character.ref_image_url) return c.json({ error: 'Character needs a reference image before training' }, 400)
+
+    // Decrypt Higgsfield key
+    const keyRow = await c.env.DB.prepare(
+      `SELECT encrypted_key, iv FROM api_keys WHERE user_id = ? AND provider = 'higgsfield'`
+    ).bind(userId).first<{ encrypted_key: string; iv: string }>()
+    if (!keyRow) return c.json({ error: 'No Higgsfield API key saved. Go to Settings.' }, 400)
+    if (!c.env.ENCRYPTION_KEY) return c.json({ error: 'Server encryption not configured' }, 500)
+    const credentials = await decryptKey(keyRow.encrypted_key, keyRow.iv, c.env.ENCRYPTION_KEY)
+
+    // Resolve ref_image_url to absolute if relative
+    let refImageUrl = character.ref_image_url
+    if (refImageUrl.startsWith('/')) {
+      const origin = new URL(c.req.url).origin
+      refImageUrl  = `${origin}${refImageUrl}`
+    }
+
+    // Submit Soul training job to Higgsfield
+    // Soul training endpoint: POST /higgsfield-ai/soul/train
+    const res = await fetch(`${HF_BASE}/higgsfield-ai/soul/train`, {
+      method:  'POST',
+      headers: {
+        'Authorization': `Key ${credentials}`,
+        'Content-Type':  'application/json',
+        'Accept':        'application/json',
+      },
+      body: JSON.stringify({
+        name:       character.name,
+        image_url:  refImageUrl,
+      }),
+    })
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => res.statusText)
+      return c.json({ error: `Higgsfield Soul training error ${res.status}: ${txt}` }, 502)
+    }
+
+    const trainResult: any = await res.json()
+    const soulId = trainResult.soul_id || trainResult.id || null
+
+    if (soulId) {
+      await c.env.DB.prepare(
+        `UPDATE characters SET soul_id = ? WHERE id = ?`
+      ).bind(soulId, character_id).run()
+    }
+
+    return c.json({
+      ok:          true,
+      character_id,
+      soul_id:     soulId,
+      status:      trainResult.status || 'submitted',
+      message:     soulId ? 'Soul training started' : 'Training submitted (no soul_id returned yet)',
+    })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
 })
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1677,6 +2071,23 @@ function videoGeneratorPage(): string {
       </div>
     </section>
 
+    <!-- Divider -->
+    <div class="vg-panel-divider"></div>
+
+    <!-- CHARACTER SOUL PANEL (Item 5) -->
+    <section class="vg-panel-section" id="vg-character-section" style="display:none">
+      <div class="vg-section-header">
+        <span class="vg-section-label">Characters</span>
+        <button class="vg-btn-chip" id="btn-add-character">
+          <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2v12M2 8h12"/></svg>
+          Add
+        </button>
+      </div>
+      <div id="vg-character-list">
+        <div class="vg-char-empty">No characters yet. Add one to maintain visual consistency across shots.</div>
+      </div>
+    </section>
+
   </aside>
 
   <!-- ═══════════════ CENTER STAGE ═══════════════ -->
@@ -1913,6 +2324,108 @@ function videoGeneratorPage(): string {
 </div>
 
 <div class="vg-toast" id="vg-toast"></div>
+
+<!-- CHARACTER ADD MODAL (Item 5) -->
+<div class="vg-modal-overlay" id="char-modal-overlay">
+  <div class="vg-modal" id="char-modal">
+    <div class="vg-modal-header">
+      <h3 id="char-modal-title">Add Character</h3>
+      <button class="vg-drawer-close" id="btn-close-char-modal">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="vg-modal-body">
+      <p class="vg-modal-desc">Characters remember a reference image. Train their Soul for consistent appearance across every shot.</p>
+      <div class="vg-field">
+        <label class="vg-label">Name <span class="vg-required-star">*</span></label>
+        <input type="text" id="char-name-input" class="vg-input" placeholder="e.g. Hero, Villain, Narrator"/>
+      </div>
+      <div class="vg-field">
+        <label class="vg-label">Description</label>
+        <input type="text" id="char-desc-input" class="vg-input" placeholder="Physical appearance, style notes..."/>
+      </div>
+      <div class="vg-field">
+        <label class="vg-label">Reference Image</label>
+        <div class="vg-char-upload-row">
+          <div class="vg-char-upload-preview" id="char-upload-preview" style="display:none">
+            <img id="char-upload-img" src="" alt="Character ref"/>
+          </div>
+          <button class="vg-btn-chip" id="btn-char-browse">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+            Browse image
+          </button>
+          <input type="file" id="char-file-input" accept="image/jpeg,image/png,image/webp" style="display:none"/>
+          <span class="vg-char-upload-name" id="char-upload-name"></span>
+        </div>
+      </div>
+      <div id="char-modal-error" class="vg-auth-error" style="display:none"></div>
+    </div>
+    <div class="vg-modal-footer">
+      <button class="vg-btn-ghost" id="btn-cancel-char-modal">Cancel</button>
+      <button class="vg-btn-primary" id="btn-save-char">Add Character</button>
+    </div>
+  </div>
+</div>
+
+<!-- UPGRADE MODAL (Item 2) -->
+<div class="vg-modal-overlay" id="upgrade-modal-overlay">
+  <div class="vg-modal vg-upgrade-modal" id="upgrade-modal">
+    <div class="vg-modal-header">
+      <h3>Upgrade Your Plan</h3>
+      <button class="vg-drawer-close" id="btn-close-upgrade-modal">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="vg-modal-body">
+      <div class="vg-upgrade-tiers-full">
+        <div class="vg-upgrade-tier-card" data-tier="creator">
+          <div class="vg-utc-header">
+            <span class="vg-utc-name">Creator</span>
+            <span class="vg-utc-price">$29<span class="vg-utc-period">/mo</span></span>
+          </div>
+          <ul class="vg-utc-features">
+            <li>100 shots / month</li>
+            <li>5 projects</li>
+            <li>5 GB storage</li>
+            <li>All 9 models</li>
+            <li>Style presets + seed control</li>
+          </ul>
+          <button class="vg-btn-primary full-width" data-upgrade-tier="creator">Select Creator</button>
+        </div>
+        <div class="vg-upgrade-tier-card featured" data-tier="studio">
+          <div class="vg-utc-badge">Most Popular</div>
+          <div class="vg-utc-header">
+            <span class="vg-utc-name">Studio</span>
+            <span class="vg-utc-price">$79<span class="vg-utc-period">/mo</span></span>
+          </div>
+          <ul class="vg-utc-features">
+            <li>500 shots / month</li>
+            <li>25 projects</li>
+            <li>25 GB storage</li>
+            <li>Character Soul training</li>
+            <li>Priority generation queue</li>
+          </ul>
+          <button class="vg-btn-primary full-width" data-upgrade-tier="studio">Select Studio</button>
+        </div>
+        <div class="vg-upgrade-tier-card" data-tier="pro">
+          <div class="vg-utc-header">
+            <span class="vg-utc-name">Pro</span>
+            <span class="vg-utc-price">$149<span class="vg-utc-period">/mo</span></span>
+          </div>
+          <ul class="vg-utc-features">
+            <li>Unlimited shots</li>
+            <li>Unlimited projects</li>
+            <li>100 GB storage</li>
+            <li>API access</li>
+            <li>White-label exports</li>
+          </ul>
+          <button class="vg-btn-primary full-width" data-upgrade-tier="pro">Select Pro</button>
+        </div>
+      </div>
+      <div id="upgrade-modal-error" class="vg-auth-error" style="display:none"></div>
+    </div>
+  </div>
+</div>
 
 <!-- ══════════════════════════════════════════════════════
      ANALYTICS PANEL
