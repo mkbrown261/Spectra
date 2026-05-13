@@ -475,10 +475,17 @@ function openModelPicker() {
   const trigger  = $('vg-model-trigger');
   const dropdown = $('vg-model-dropdown');
   const chevron  = $('vg-model-trigger-chevron');
-  if (!dropdown) return;
+  if (!dropdown || !trigger) return;
+
+  // Position using fixed coords so sidebar overflow:auto can't clip it
+  const rect = trigger.getBoundingClientRect();
+  dropdown.style.top   = (rect.bottom + 4) + 'px';
+  dropdown.style.left  = rect.left + 'px';
+  dropdown.style.width = rect.width + 'px';
+
   dropdown.classList.add('open');
   dropdown.setAttribute('aria-hidden', 'false');
-  trigger?.setAttribute('aria-expanded', 'true');
+  trigger.setAttribute('aria-expanded', 'true');
   chevron?.classList.add('open');
 }
 
@@ -2169,7 +2176,7 @@ let _charUploadedKey = null;
 let _charUploadedUrl = null;
 
 function openCharModal() {
-  $('char-modal-overlay')?.classList.add('active');
+  $('char-modal-overlay')?.classList.add('open');
   $('char-name-input') && ($('char-name-input').value = '');
   $('char-desc-input') && ($('char-desc-input').value = '');
   $('char-upload-name') && ($('char-upload-name').textContent = '');
@@ -2181,7 +2188,7 @@ function openCharModal() {
 }
 
 function closeCharModal() {
-  $('char-modal-overlay')?.classList.remove('active');
+  $('char-modal-overlay')?.classList.remove('open');
 }
 
 async function handleCharFileSelect(file) {
@@ -2433,7 +2440,7 @@ function applyProjectMemory(projectId) {
   // Preset
   if (mem.preset) {
     VG.selectedPreset = mem.preset;
-    $$('.vg-style-btn').forEach(b => b.classList.toggle('active', b.dataset.preset === mem.preset));
+    $$('.vg-preset-chip').forEach(b => b.classList.toggle('active', b.dataset.presetId === mem.preset));
   }
 
   return true;
