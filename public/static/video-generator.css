@@ -1748,3 +1748,116 @@ body {
 @media (max-width: 640px) {
   .vg-upgrade-tiers-full { grid-template-columns: 1fr; }
 }
+
+/* ── GUIDED USE-CASE FLOW (Project Modal) ────────────────────── */
+.vg-modal-wide { max-width: 520px !important; width: 520px !important; }
+
+.vg-usecase-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+}
+.vg-usecase-card {
+  display: flex; flex-direction: column; align-items: center; gap: 5px;
+  padding: 12px 8px; border-radius: var(--r-md);
+  border: 1px solid var(--border-subtle); background: var(--bg-raised);
+  cursor: pointer; transition: all 0.16s; text-align: center;
+}
+.vg-usecase-card:hover {
+  border-color: var(--border-glow); background: var(--bg-elevated);
+  transform: translateY(-1px);
+}
+.vg-usecase-card.active {
+  border-color: var(--accent); background: var(--accent-ghost);
+  box-shadow: 0 0 0 2px rgba(124,106,247,0.2);
+}
+.vg-usecase-icon  { font-size: 1.4rem; line-height: 1; }
+.vg-usecase-name  { font-size: 0.7rem; font-weight: 700; color: var(--text-bright); }
+.vg-usecase-hint  { font-size: 0.6rem; color: var(--text-ghost); line-height: 1.3; }
+
+/* Step 2 banner */
+.vg-usecase-selected-banner {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 12px; border-radius: var(--r-md);
+  background: var(--accent-ghost); border: 1px solid var(--border-glow);
+}
+.vg-usecase-badge {
+  font-size: 0.78rem; font-weight: 700; color: var(--accent-bright);
+}
+.vg-usecase-hint-text {
+  font-size: 0.65rem; color: var(--text-dim); line-height: 1.4;
+}
+.vg-usecase-hint-text em { color: var(--text-secondary); font-style: italic; }
+
+/* Config summary pills */
+.vg-usecase-config-summary { margin: 10px 0 4px; }
+.vg-ucs-row {
+  display: flex; gap: 8px; flex-wrap: wrap;
+}
+.vg-ucs-item {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 0.65rem; font-weight: 600; color: var(--text-dim);
+  padding: 3px 9px; border-radius: 100px;
+  border: 1px solid var(--border-subtle); background: var(--bg-raised);
+}
+.vg-ucs-item svg { color: var(--accent-bright); }
+
+/* Advanced settings toggle */
+.vg-usecase-advanced {
+  margin-top: 10px; border-radius: var(--r-sm);
+  border: 1px solid var(--border-subtle); overflow: hidden;
+}
+.vg-usecase-advanced summary {
+  padding: 8px 12px; font-size: 0.68rem; font-weight: 600;
+  color: var(--text-dim); cursor: pointer; user-select: none;
+  list-style: none; display: flex; align-items: center; gap: 5px;
+}
+.vg-usecase-advanced summary::-webkit-details-marker { display: none; }
+.vg-usecase-advanced summary::before {
+  content: '▸'; color: var(--accent-bright); font-size: 0.6rem;
+  transition: transform 0.2s;
+}
+.vg-usecase-advanced[open] summary::before { transform: rotate(90deg); }
+.vg-usecase-advanced > .vg-field,
+.vg-usecase-advanced > div { padding: 0 12px 10px; }
+
+/* ── CHARACTER CONTINUITY LOCK ───────────────────────────────── */
+.vg-char-lock-banner {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; margin-bottom: 8px;
+  border-radius: var(--r-sm); background: var(--accent-ghost);
+  border: 1px solid var(--border-glow);
+  font-size: 0.67rem; color: var(--text-dim); cursor: pointer;
+  transition: background 0.15s;
+}
+.vg-char-lock-banner:hover { background: rgba(124,106,247,0.18); }
+.vg-char-lock-avatar {
+  width: 26px; height: 26px; border-radius: 50%;
+  object-fit: cover; border: 1px solid var(--border-glow);
+  flex-shrink: 0;
+}
+.vg-char-lock-avatar-placeholder {
+  width: 26px; height: 26px; border-radius: 50%;
+  background: var(--accent-ghost); border: 1px solid var(--border-glow);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent-bright); font-size: 0.7rem; flex-shrink: 0;
+}
+.vg-char-lock-info { flex: 1; min-width: 0; }
+.vg-char-lock-name {
+  font-weight: 700; color: var(--accent-bright); display: block;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.vg-char-lock-sub { color: var(--text-ghost); font-size: 0.6rem; }
+.vg-char-lock-clear {
+  background: none; border: none; cursor: pointer;
+  color: var(--text-ghost); padding: 2px; display: flex; align-items: center;
+}
+.vg-char-lock-clear:hover { color: var(--red); }
+
+/* ── STYLE MEMORY — project settings restored badge ─────────── */
+.vg-memory-restored {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 0.6rem; color: var(--text-ghost);
+  padding: 3px 8px; border-radius: 100px;
+  background: var(--bg-raised); border: 1px solid var(--border-subtle);
+  animation: fadeIn 0.3s ease;
+}
+.vg-memory-restored svg { color: var(--green); }

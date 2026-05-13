@@ -142,6 +142,14 @@ const VG = {
   uploadedImageKey: null,  // R2 key after upload
   uploadedImageUrl: null,  // /api/image/<key> or pasted URL
 
+  // #3 — Character Continuity Lock
+  lockedCharId:    null,
+  lockedCharName:  null,
+  lockedCharAvatar: null,
+
+  // #5 — Style Memory (per-project localStorage)
+  projectMemory:   {},  // { [projectId]: { model, aspect, duration, preset } }
+
   // Quality sliders
   quality: {
     motion: 5,
@@ -538,6 +546,9 @@ function selectModel(modelId) {
 
   // Update image block required/optional badges
   updateImageRequirement(modelId);
+
+  // #5 — Save project memory when model changes
+  saveProjectMemory(VG.activeProjectId);
 }
 
 function updateImageRequirement(modelId) {
@@ -947,17 +958,24 @@ async function selectProject(id) {
     if (nameEl) nameEl.textContent = project.name;
   }
 
-  // Set default model for this project
-  if (project.default_model) {
+  // #5 — Style Memory: restore saved settings for this project
+  const memoryRestored = applyProjectMemory(id);
+  if (!memoryRestored && project.default_model) {
     selectModel(project.default_model);
   }
+
+  // #3 — Clear char lock when switching projects
+  VG.lockedCharId     = null;
+  VG.lockedCharName   = null;
+  VG.lockedCharAvatar = null;
+  renderCharLockBanner();
 
   // Hide empty, show grid
   $('vg-empty').style.display    = 'none';
   $('vg-shot-grid').style.display = 'grid';
 
   await loadShots(id);
-  await renderCharacters(id);  // Item 5: load character panel
+  await renderCharacters(id);
 }
 
 function showEmptyState() {
@@ -1634,17 +1652,156 @@ function closePlayer() {
    NEW PROJECT MODAL
    ═══════════════════════════════════════════════════════════════ */
 
+/* ═══════════════════════════════════════════════════════════════
+   NEW PROJECT MODAL — GUIDED USE-CASE FLOW
+   ═══════════════════════════════════════════════════════════════ */
+
+const USE_CASE_CONFIGS = {
+  commercial: {
+    label:       '📺 Commercial',
+    model:       'kling-video/v2.1/pro/image-to-video',
+    aspect:      '16:9',
+    duration:    8,
+    style:       'Clean, polished, professional',
+    mood:        'Confident, aspirational',
+    palette:     'Brand-focused, high contrast',
+    promptHint:  'Product hero shot, brand reveal, call to action',
+  },
+  music_video: {
+    label:       '🎵 Music Video',
+    model:       'higgsfield-ai/dop/turbo',
+    aspect:      '16:9',
+    duration:    8,
+    style:       'Stylized, visually expressive',
+    mood:        'Emotional, dynamic, immersive',
+    palette:     'Vivid, saturated, mood-driven',
+    promptHint:  'Artist performance, abstract visuals, rhythm-driven cuts',
+  },
+  fashion: {
+    label:       '👗 Fashion Ad',
+    model:       'higgsfield-ai/dop/standard',
+    aspect:      '9:16',
+    duration:    5,
+    style:       'Editorial, high-fashion, minimalist',
+    mood:        'Sophisticated, aspirational, sleek',
+    palette:     'Neutral tones, luxury accents',
+    promptHint:  'Model walking, garment detail close-up, runway atmosphere',
+  },
+  character: {
+    label:       '🎭 Character Scene',
+    model:       'kling-video/v2.1/pro/image-to-video',
+    aspect:      '16:9',
+    duration:    8,
+    style:       'Cinematic, character-driven',
+    mood:        'Narrative, emotionally resonant',
+    palette:     'Dramatic lighting, motivated color',
+    promptHint:  'Character reaction shot, emotional moment, scene dialogue',
+  },
+  product: {
+    label:       '📦 Product Showcase',
+    model:       'higgsfield-ai/dop/standard',
+    aspect:      '1:1',
+    duration:    5,
+    style:       'Clean, studio, product-focused',
+    mood:        'Premium, trustworthy, clear',
+    palette:     'White/neutral backgrounds, accent color',
+    promptHint:  'Product rotation, feature highlight, texture close-up',
+  },
+  trailer: {
+    label:       '🎬 Cinematic Trailer',
+    model:       'higgsfield-ai/dop/turbo',
+    aspect:      '16:9',
+    duration:    10,
+    style:       'Epic, cinematic, blockbuster',
+    mood:        'Intense, dramatic, awe-inspiring',
+    palette:     'Desaturated, teal-orange, high contrast',
+    promptHint:  'Wide establishing shot, action sequence, dramatic reveal',
+  },
+  social: {
+    label:       '📱 Social Content',
+    model:       'higgsfield-ai/dop/lite',
+    aspect:      '9:16',
+    duration:    5,
+    style:       'Trendy, authentic, snappy',
+    mood:        'Energetic, fun, relatable',
+    palette:     'Bold, vibrant, eye-catching',
+    promptHint:  'Hook moment, relatable action, strong visual cut',
+  },
+  custom: {
+    label:       '✏️ Custom',
+    model:       'higgsfield-ai/dop/standard',
+    aspect:      '16:9',
+    duration:    5,
+    style:       '',
+    mood:        '',
+    palette:     '',
+    promptHint:  '',
+  },
+};
+
+let _selectedUseCase = null;
+
 function openProjectModal() {
+  _selectedUseCase = null;
+  // Reset to step 1
+  $('project-step-1').style.display = 'block';
+  $('project-step-2').style.display = 'none';
+  $('btn-save-project').style.display  = 'none';
+  $('btn-back-project').style.display  = 'none';
+  // Deselect all use-case cards
+  $$('.vg-usecase-card').forEach(c => c.classList.remove('active'));
   $('project-modal-overlay').classList.add('open');
-  $('project-name-input').focus();
-  $('project-modal-error').style.display = 'none';
 }
 
 function closeProjectModal() {
   $('project-modal-overlay').classList.remove('open');
+  _selectedUseCase = null;
   ['project-name-input','project-style-input','project-mood-input','project-palette-input'].forEach(id => {
     const el = $(id); if (el) el.value = '';
   });
+}
+
+function selectUseCase(key) {
+  _selectedUseCase = key;
+  const cfg = USE_CASE_CONFIGS[key];
+  if (!cfg) return;
+
+  // Move to step 2
+  $('project-step-1').style.display = 'none';
+  $('project-step-2').style.display = 'block';
+  $('btn-save-project').style.display = 'inline-flex';
+  $('btn-back-project').style.display = 'inline-flex';
+
+  // Banner
+  const banner = $('vg-usecase-banner');
+  if (banner) {
+    banner.innerHTML = `<span class="vg-usecase-badge">${cfg.label}</span>
+      ${cfg.promptHint ? `<span class="vg-usecase-hint-text">Prompt ideas: <em>${cfg.promptHint}</em></span>` : ''}`;
+  }
+
+  // Pre-fill advanced fields
+  const styleEl   = $('project-style-input');
+  const moodEl    = $('project-mood-input');
+  const paletteEl = $('project-palette-input');
+  const modelEl   = $('project-model-select');
+  if (styleEl)   styleEl.value   = cfg.style;
+  if (moodEl)    moodEl.value    = cfg.mood;
+  if (paletteEl) paletteEl.value = cfg.palette;
+  if (modelEl)   modelEl.value   = cfg.model;
+
+  // Config summary
+  const summary = $('vg-usecase-summary');
+  if (summary) {
+    const modelLabel = MODEL_COSTS[cfg.model]?.label || cfg.model.split('/').pop();
+    summary.innerHTML = `
+      <div class="vg-ucs-row">
+        <span class="vg-ucs-item"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>${modelLabel}</span>
+        <span class="vg-ucs-item"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>${cfg.aspect}</span>
+        <span class="vg-ucs-item"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>${cfg.duration}s</span>
+      </div>`;
+  }
+
+  $('project-name-input').focus();
 }
 
 async function saveProject() {
@@ -1662,10 +1819,11 @@ async function saveProject() {
   btn.disabled    = true;
   btn.textContent = 'Creating…';
 
-  const style   = $('project-style-input')?.value.trim()   || '';
-  const mood    = $('project-mood-input')?.value.trim()    || '';
-  const palette = $('project-palette-input')?.value.trim() || '';
-  const model   = $('project-model-select')?.value          || 'higgsfield-ai/dop/standard';
+  const cfg     = _selectedUseCase ? USE_CASE_CONFIGS[_selectedUseCase] : null;
+  const style   = $('project-style-input')?.value.trim()   || cfg?.style   || '';
+  const mood    = $('project-mood-input')?.value.trim()    || cfg?.mood    || '';
+  const palette = $('project-palette-input')?.value.trim() || cfg?.palette || '';
+  const model   = $('project-model-select')?.value          || cfg?.model  || 'higgsfield-ai/dop/standard';
   const styleBible = buildStyleBible({ style, mood, palette });
 
   try {
@@ -1689,8 +1847,27 @@ async function saveProject() {
     VG.projects.unshift(newProject);
     renderProjectList();
     closeProjectModal();
-    selectProject(data.id);
-    showToast(`Project "${name}" created ✓`);
+    await selectProject(data.id);
+
+    // Apply use-case defaults to the compose panel
+    if (cfg) {
+      // Aspect ratio
+      $$('.vg-aspect-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.aspect === cfg.aspect);
+      });
+      VG.selectedAspect = cfg.aspect;
+
+      // Duration
+      $$('.vg-dur-btn').forEach(b => {
+        b.classList.toggle('active', parseInt(b.dataset.dur) === cfg.duration);
+      });
+      VG.selectedDur = cfg.duration;
+
+      // Model
+      selectModel(model);
+    }
+
+    showToast(`"${name}" created — ready to generate`);
   } catch {
     errEl.textContent   = 'Network error — please try again';
     errEl.style.display = 'block';
@@ -2063,7 +2240,12 @@ async function renderCharacters(projectId) {
 
     // Bind character actions
     list.querySelectorAll('.vg-char-use-btn').forEach(btn => {
-      btn.addEventListener('click', () => useCharacter(btn.dataset.charId, btn.dataset.refUrl));
+      btn.addEventListener('click', () => {
+        const card   = btn.closest('.vg-char-card');
+        const name   = card?.querySelector('.vg-char-name')?.textContent || '';
+        const avatar = card?.querySelector('img')?.src || null;
+        useCharacter(btn.dataset.charId, btn.dataset.refUrl, name, avatar);
+      });
     });
     list.querySelectorAll('.vg-char-train-btn').forEach(btn => {
       btn.addEventListener('click', () => trainCharacterSoul(btn.dataset.charId));
@@ -2076,26 +2258,117 @@ async function renderCharacters(projectId) {
   }
 }
 
-async function useCharacter(charId, refUrl) {
+async function useCharacter(charId, refUrl, charName, charAvatar) {
   if (!refUrl) {
     showToast('This character has no reference image', true);
     return;
   }
-  // Set the character's ref image as the upload preview + VG state
+
+  // #3 — Character Continuity Lock
+  VG.lockedCharId     = charId;
+  VG.lockedCharName   = charName || 'Character';
+  VG.lockedCharAvatar = charAvatar || null;
   VG.uploadedImageUrl = refUrl.startsWith('/')
     ? window.location.origin + refUrl
     : refUrl;
-  VG.uploadedImageKey = null; // not an R2 key, might be absolute
+  VG.uploadedImageKey = null;
 
   // Show preview
   const imgEl = $('vg-upload-img');
-  if (imgEl) imgEl.src = refUrl;
-  showUploadPreview(refUrl);
+  if (imgEl) imgEl.src = VG.uploadedImageUrl;
+  showUploadPreview(VG.uploadedImageUrl);
 
-  showToast('Character reference image set');
+  // Show lock banner in compose panel
+  renderCharLockBanner();
+
+  showToast(`🔒 ${VG.lockedCharName} locked — all shots will use this character`);
 }
 
-async function trainCharacterSoul(charId) {
+/* ── #3 CHARACTER CONTINUITY LOCK ───────────────────────────── */
+
+function renderCharLockBanner() {
+  const banner  = $('vg-char-lock-banner');
+  const nameEl  = $('vg-char-lock-name');
+  const avatarWrap = $('vg-char-lock-avatar-wrap');
+  if (!banner) return;
+
+  if (VG.lockedCharId) {
+    banner.style.display = 'flex';
+    if (nameEl) nameEl.textContent = VG.lockedCharName || 'Character';
+    if (avatarWrap && VG.lockedCharAvatar) {
+      avatarWrap.innerHTML = `<img class="vg-char-lock-avatar" src="${escAttr(VG.lockedCharAvatar)}" alt="${escAttr(VG.lockedCharName || '')}"/>`;
+    }
+  } else {
+    banner.style.display = 'none';
+  }
+}
+
+function clearCharLock() {
+  VG.lockedCharId     = null;
+  VG.lockedCharName   = null;
+  VG.lockedCharAvatar = null;
+  renderCharLockBanner();
+  // Also clear the image if it was set by the lock
+  clearImage();
+  showToast('Character lock removed');
+}
+
+/* ── #5 STYLE MEMORY PER PROJECT ────────────────────────────── */
+
+const MEMORY_KEY = 'spectra_project_memory';
+
+function saveProjectMemory(projectId) {
+  if (!projectId) return;
+  try {
+    const all = JSON.parse(localStorage.getItem(MEMORY_KEY) || '{}');
+    all[projectId] = {
+      model:    VG.selectedModel,
+      aspect:   VG.selectedAspect,
+      duration: VG.selectedDur,
+      preset:   VG.selectedPreset,
+      savedAt:  Date.now(),
+    };
+    localStorage.setItem(MEMORY_KEY, JSON.stringify(all));
+  } catch {}
+}
+
+function loadProjectMemory(projectId) {
+  if (!projectId) return null;
+  try {
+    const all = JSON.parse(localStorage.getItem(MEMORY_KEY) || '{}');
+    return all[projectId] || null;
+  } catch { return null; }
+}
+
+function applyProjectMemory(projectId) {
+  const mem = loadProjectMemory(projectId);
+  if (!mem) return false;
+
+  // Model
+  if (mem.model) selectModel(mem.model);
+
+  // Aspect
+  if (mem.aspect) {
+    $$('.vg-aspect-btn').forEach(b => b.classList.toggle('active', b.dataset.aspect === mem.aspect));
+    VG.selectedAspect = mem.aspect;
+  }
+
+  // Duration
+  if (mem.duration) {
+    $$('.vg-dur-btn').forEach(b => b.classList.toggle('active', parseInt(b.dataset.dur) === mem.duration));
+    VG.selectedDur = mem.duration;
+  }
+
+  // Preset
+  if (mem.preset) {
+    VG.selectedPreset = mem.preset;
+    $$('.vg-style-btn').forEach(b => b.classList.toggle('active', b.dataset.preset === mem.preset));
+  }
+
+  return true;
+}
+
+
   if (!VG.activeProjectId) return;
   const btn = document.querySelector(`[data-char-id="${charId}"].vg-char-train-btn`);
   if (btn) { btn.disabled = true; btn.textContent = 'Training…'; }
@@ -2158,6 +2431,20 @@ function bindUI() {
   $('btn-close-project-modal')?.addEventListener('click', closeProjectModal);
   $('btn-cancel-project-modal')?.addEventListener('click', closeProjectModal);
   $('btn-save-project')?.addEventListener('click', saveProject);
+  $('btn-back-project')?.addEventListener('click', () => {
+    $('project-step-1').style.display = 'block';
+    $('project-step-2').style.display = 'none';
+    $('btn-save-project').style.display = 'none';
+    $('btn-back-project').style.display = 'none';
+  });
+  // Use-case card clicks
+  $$('.vg-usecase-card').forEach(card => {
+    card.addEventListener('click', () => {
+      $$('.vg-usecase-card').forEach(c => c.classList.remove('active'));
+      card.classList.add('active');
+      selectUseCase(card.dataset.usecase);
+    });
+  });
   $('project-modal-overlay')?.addEventListener('click', e => {
     if (e.target === $('project-modal-overlay')) closeProjectModal();
   });
@@ -2171,12 +2458,28 @@ function bindUI() {
     if (e.target === $('bible-modal-overlay')) closeBibleModal();
   });
 
+  // #3 — Character lock clear button
+  $('btn-char-lock-clear')?.addEventListener('click', clearCharLock);
+
+  // #5 — Save memory on aspect/duration/model change
+  $$('.vg-aspect-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      setTimeout(() => saveProjectMemory(VG.activeProjectId), 100);
+    });
+  });
+  $$('.vg-dur-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      setTimeout(() => saveProjectMemory(VG.activeProjectId), 100);
+    });
+  });
+
   // Aspect ratio
   $$('.vg-aspect-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       $$('.vg-aspect-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       VG.selectedAspect = btn.dataset.aspect;
+      saveProjectMemory(VG.activeProjectId);
     });
   });
 
@@ -2186,6 +2489,7 @@ function bindUI() {
       $$('.vg-dur-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       VG.selectedDur = parseInt(btn.dataset.dur, 10);
+      saveProjectMemory(VG.activeProjectId);
     });
   });
 

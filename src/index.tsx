@@ -2122,6 +2122,19 @@ function videoGeneratorPage(): string {
           <span class="vg-required-badge" id="vg-image-required-badge">required</span>
           <span class="vg-optional-badge" id="vg-image-optional-badge" style="display:none">optional</span>
         </div>
+        <!-- #3 Character Continuity Lock Banner -->
+        <div class="vg-char-lock-banner" id="vg-char-lock-banner" style="display:none">
+          <div class="vg-char-lock-avatar-placeholder" id="vg-char-lock-avatar-wrap">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          </div>
+          <div class="vg-char-lock-info">
+            <span class="vg-char-lock-name" id="vg-char-lock-name">Character</span>
+            <span class="vg-char-lock-sub">🔒 Locked — reference image applied to every shot</span>
+          </div>
+          <button class="vg-char-lock-clear" id="btn-char-lock-clear" title="Unlock character">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
         <div class="vg-upload-zone" id="vg-upload-zone">
           <!-- Preview -->
           <div class="vg-upload-preview" id="vg-upload-preview" style="display:none">
@@ -2277,7 +2290,7 @@ function videoGeneratorPage(): string {
 
 <!-- NEW PROJECT MODAL -->
 <div class="vg-modal-overlay" id="project-modal-overlay">
-  <div class="vg-modal" id="project-modal">
+  <div class="vg-modal vg-modal-wide" id="project-modal">
     <div class="vg-modal-header">
       <h3 id="project-modal-title">New Project</h3>
       <button class="vg-drawer-close" id="btn-close-project-modal">
@@ -2285,37 +2298,95 @@ function videoGeneratorPage(): string {
       </button>
     </div>
     <div class="vg-modal-body">
-      <div class="vg-field">
-        <label class="vg-label">Project Name <span class="vg-required-star">*</span></label>
-        <input type="text" id="project-name-input" class="vg-input" placeholder="e.g. Dark Fantasy Trailer, Brand Campaign Q2"/>
+
+      <!-- STEP 1: Use-case picker -->
+      <div id="project-step-1">
+        <p class="vg-modal-desc" style="margin-bottom:14px">What are you creating? We'll set everything up for you.</p>
+        <div class="vg-usecase-grid" id="vg-usecase-grid">
+          <button class="vg-usecase-card" data-usecase="commercial">
+            <span class="vg-usecase-icon">📺</span>
+            <span class="vg-usecase-name">Commercial</span>
+            <span class="vg-usecase-hint">Product ads, brand spots</span>
+          </button>
+          <button class="vg-usecase-card" data-usecase="music_video">
+            <span class="vg-usecase-icon">🎵</span>
+            <span class="vg-usecase-name">Music Video</span>
+            <span class="vg-usecase-hint">Visual storytelling for audio</span>
+          </button>
+          <button class="vg-usecase-card" data-usecase="fashion">
+            <span class="vg-usecase-icon">👗</span>
+            <span class="vg-usecase-name">Fashion Ad</span>
+            <span class="vg-usecase-hint">Editorial, lookbook, runway</span>
+          </button>
+          <button class="vg-usecase-card" data-usecase="character">
+            <span class="vg-usecase-icon">🎭</span>
+            <span class="vg-usecase-name">Character Scene</span>
+            <span class="vg-usecase-hint">Narrative, performance</span>
+          </button>
+          <button class="vg-usecase-card" data-usecase="product">
+            <span class="vg-usecase-icon">📦</span>
+            <span class="vg-usecase-name">Product Showcase</span>
+            <span class="vg-usecase-hint">E-commerce, unboxing, demo</span>
+          </button>
+          <button class="vg-usecase-card" data-usecase="trailer">
+            <span class="vg-usecase-icon">🎬</span>
+            <span class="vg-usecase-name">Cinematic Trailer</span>
+            <span class="vg-usecase-hint">Epic sequences, film-style</span>
+          </button>
+          <button class="vg-usecase-card" data-usecase="social">
+            <span class="vg-usecase-icon">📱</span>
+            <span class="vg-usecase-name">Social Content</span>
+            <span class="vg-usecase-hint">Short-form, reels, TikTok</span>
+          </button>
+          <button class="vg-usecase-card" data-usecase="custom">
+            <span class="vg-usecase-icon">✏️</span>
+            <span class="vg-usecase-name">Custom</span>
+            <span class="vg-usecase-hint">Set everything manually</span>
+          </button>
+        </div>
       </div>
-      <div class="vg-field">
-        <label class="vg-label">Visual Style</label>
-        <input type="text" id="project-style-input" class="vg-input" placeholder="e.g. Dark cinematic, neon noir, warm golden hour"/>
+
+      <!-- STEP 2: Name + confirm (pre-filled from use-case) -->
+      <div id="project-step-2" style="display:none">
+        <div class="vg-usecase-selected-banner" id="vg-usecase-banner"></div>
+        <div class="vg-field" style="margin-top:14px">
+          <label class="vg-label">Project Name <span class="vg-required-star">*</span></label>
+          <input type="text" id="project-name-input" class="vg-input" placeholder="e.g. Summer Campaign 2025"/>
+        </div>
+        <div class="vg-usecase-config-summary" id="vg-usecase-summary"></div>
+        <details class="vg-usecase-advanced">
+          <summary>Advanced settings</summary>
+          <div class="vg-field" style="margin-top:10px">
+            <label class="vg-label">Visual Style</label>
+            <input type="text" id="project-style-input" class="vg-input" placeholder="e.g. Dark cinematic, neon noir"/>
+          </div>
+          <div class="vg-field">
+            <label class="vg-label">Mood &amp; Tone</label>
+            <input type="text" id="project-mood-input" class="vg-input" placeholder="e.g. Dramatic, energetic, ethereal"/>
+          </div>
+          <div class="vg-field">
+            <label class="vg-label">Color Palette</label>
+            <input type="text" id="project-palette-input" class="vg-input" placeholder="e.g. Deep blues, teal highlights"/>
+          </div>
+          <div class="vg-field">
+            <label class="vg-label">Default Model</label>
+            <select id="project-model-select" class="vg-input vg-select">
+              <option value="higgsfield-ai/dop/standard">DoP Standard (Recommended)</option>
+              <option value="higgsfield-ai/dop/lite">DoP Lite (Fast)</option>
+              <option value="higgsfield-ai/dop/turbo">DoP Turbo (Quality)</option>
+              <option value="kling-video/v2.1/pro/image-to-video">Kling 2.1 Pro</option>
+              <option value="bytedance/seedance/v1/pro/image-to-video">Seedance v1 Pro</option>
+            </select>
+          </div>
+        </details>
+        <div id="project-modal-error" class="vg-auth-error" style="display:none"></div>
       </div>
-      <div class="vg-field">
-        <label class="vg-label">Mood & Tone</label>
-        <input type="text" id="project-mood-input" class="vg-input" placeholder="e.g. Dramatic, melancholic, energetic, ethereal"/>
-      </div>
-      <div class="vg-field">
-        <label class="vg-label">Color Palette</label>
-        <input type="text" id="project-palette-input" class="vg-input" placeholder="e.g. Deep blues, teal highlights, desaturated"/>
-      </div>
-      <div class="vg-field">
-        <label class="vg-label">Default Model</label>
-        <select id="project-model-select" class="vg-input vg-select">
-          <option value="higgsfield-ai/dop/standard">DoP Standard (Recommended)</option>
-          <option value="higgsfield-ai/dop/lite">DoP Lite (Fast)</option>
-          <option value="higgsfield-ai/dop/turbo">DoP Turbo</option>
-          <option value="kling-video/v2.1/pro/image-to-video">Kling 2.1 Pro</option>
-          <option value="bytedance/seedance/v1/pro/image-to-video">Seedance v1 Pro</option>
-        </select>
-      </div>
-      <div id="project-modal-error" class="vg-auth-error" style="display:none"></div>
+
     </div>
-    <div class="vg-modal-footer">
+    <div class="vg-modal-footer" id="project-modal-footer">
       <button class="vg-btn-ghost" id="btn-cancel-project-modal">Cancel</button>
-      <button class="vg-btn-primary" id="btn-save-project">Create Project</button>
+      <button class="vg-btn-ghost" id="btn-back-project" style="display:none">← Back</button>
+      <button class="vg-btn-primary" id="btn-save-project" style="display:none">Create Project</button>
     </div>
   </div>
 </div>
