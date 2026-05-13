@@ -153,7 +153,35 @@ const VG = {
   storyboardView: 'grid', // 'grid' | 'strip'
 
   generating: false,
+
+  // Transparent generation tracking
+  shotStartTimes:  {},   // { [shotId]: Date.now() }
+  shotElapsedTick: {},   // { [shotId]: intervalId }
+  sessionCreditsUsed: 0, // credits burned this session
+  lastGenerations: [],   // last 5 { model, duration, cost, label }
 };
+
+/* ── MODEL COST TABLE (credits per second of output) ─────────── */
+const MODEL_COSTS = {
+  'higgsfield-ai/dop/lite':                       { cps: 1.2, label: 'DoP Lite',     eta: 25  },
+  'higgsfield-ai/dop/standard':                   { cps: 2.0, label: 'DoP Standard', eta: 45  },
+  'higgsfield-ai/dop/turbo':                      { cps: 3.5, label: 'DoP Turbo',    eta: 60  },
+  'kling-video/v2.1/pro/image-to-video':          { cps: 4.0, label: 'Kling 2.1 Pro',eta: 90  },
+  'kling-video/v2.1/standard/image-to-video':     { cps: 2.2, label: 'Kling 2.1 Std',eta: 55  },
+  'bytedance/seedance/v1/pro/image-to-video':     { cps: 3.8, label: 'Seedance Pro',  eta: 80  },
+  'bytedance/seedance/v1/lite/image-to-video':    { cps: 1.8, label: 'Seedance Lite', eta: 35  },
+  'higgsfield-ai/soul/standard':                  { cps: 1.0, label: 'Soul',          eta: 20  },
+  'flux-pro/kontext/max/text-to-image':           { cps: 2.5, label: 'Flux Kontext',  eta: 30  },
+};
+
+function getShotCost(modelId, duration) {
+  const m = MODEL_COSTS[modelId];
+  if (!m) return null;
+  return Math.round(m.cps * (duration || 5));
+}
+function getModelEta(modelId) {
+  return MODEL_COSTS[modelId]?.eta ?? 60;
+}
 
 /* ── DOM REFS ────────────────────────────────────────────────── */
 const $ = (id) => document.getElementById(id);
@@ -1050,6 +1078,28 @@ function renderShotCard(shot, draggable = false) {
       nsfw:        `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
     };
     const icon = icons[shot.status] || icons.failed;
+
+    // For queued/in_progress: show rich progress overlay
+    if (shot.status === 'queued' || shot.status === 'in_progress') {
+      const cost = getShotCost(shot.model, shot.duration);
+      const eta  = getModelEta(shot.model);
+      return `
+        <div class="vg-shot-status-overlay vg-shot-generating">
+          <div class="vg-shot-gen-top">
+            <div class="vg-shot-gen-spinner">${icon}</div>
+            <div class="vg-shot-gen-info">
+              <span class="vg-shot-gen-status">${shot.status === 'queued' ? 'Queued' : 'Rendering'}</span>
+              <span class="vg-shot-elapsed" data-shot-id="${shot.id}">0s</span>
+            </div>
+            ${cost ? `<span class="vg-shot-cost-badge">${cost} cr</span>` : ''}
+          </div>
+          <div class="vg-shot-progress-bar">
+            <div class="vg-shot-progress-bar-fill" style="width:0%"></div>
+          </div>
+          <span class="vg-shot-eta">~${eta}s left</span>
+        </div>`;
+    }
+
     return `
       <div class="vg-shot-status-overlay">
         <div class="vg-shot-status-icon">${icon}</div>
@@ -1111,6 +1161,15 @@ function renderShotCard(shot, draggable = false) {
 function startPolling(shotId, projectId) {
   if (VG.pollTimers[shotId]) return;
 
+  // Start elapsed timer for this shot
+  if (!VG.shotStartTimes[shotId]) {
+    VG.shotStartTimes[shotId] = Date.now();
+  }
+  // Tick every second to update elapsed display
+  VG.shotElapsedTick[shotId] = setInterval(() => {
+    updateShotElapsed(shotId);
+  }, 1000);
+
   VG.pollTimers[shotId] = setInterval(async () => {
     try {
       const res  = await api('GET', `/api/shots/${shotId}/status`);
@@ -1134,12 +1193,47 @@ function startPolling(shotId, projectId) {
       if (data.status === 'completed' || data.status === 'failed' || data.status === 'nsfw') {
         clearInterval(VG.pollTimers[shotId]);
         delete VG.pollTimers[shotId];
+        // Stop elapsed timer
+        clearInterval(VG.shotElapsedTick[shotId]);
+        delete VG.shotElapsedTick[shotId];
+        delete VG.shotStartTimes[shotId];
         await loadShots(projectId);
       }
     } catch (err) {
       console.error('Poll error for shot', shotId, err);
     }
   }, 4000);
+}
+
+function updateShotElapsed(shotId) {
+  const card = document.querySelector(`.vg-shot-card[data-shot-id="${shotId}"]`);
+  if (!card) return;
+  const timerEl = card.querySelector('.vg-shot-elapsed');
+  const etaEl   = card.querySelector('.vg-shot-eta');
+  const barEl   = card.querySelector('.vg-shot-progress-bar-fill');
+  if (!timerEl) return;
+
+  const start   = VG.shotStartTimes[shotId];
+  if (!start) return;
+  const elapsed = Math.floor((Date.now() - start) / 1000);
+  const mins    = Math.floor(elapsed / 60);
+  const secs    = elapsed % 60;
+  timerEl.textContent = mins > 0
+    ? `${mins}m ${String(secs).padStart(2,'0')}s`
+    : `${secs}s`;
+
+  // ETA
+  const shot = Object.values(VG.shots).flat().find(s => s.id === shotId);
+  const eta  = getModelEta(shot?.model || '');
+  const remaining = Math.max(0, eta - elapsed);
+  if (etaEl) {
+    etaEl.textContent = remaining > 0 ? `~${remaining}s left` : 'finishing…';
+  }
+  // Progress bar
+  if (barEl) {
+    const pct = Math.min(95, Math.round((elapsed / eta) * 100));
+    barEl.style.width = pct + '%';
+  }
 }
 
 function updateShotCardInDOM(shotId, data) {
@@ -1305,12 +1399,20 @@ async function generate() {
 
     if (newShot.id) startPolling(newShot.id, VG.activeProjectId);
 
-    showToast('Shot submitted — generating now');
+    // Track cost + session history
+    const cost = getShotCost(model, VG.selectedDur);
+    if (cost) {
+      VG.sessionCreditsUsed += cost;
+      VG.lastGenerations.unshift({ model, duration: VG.selectedDur, cost, label: MODEL_COSTS[model]?.label || model });
+      if (VG.lastGenerations.length > 5) VG.lastGenerations.pop();
+      updateCreditWidget();
+    }
 
-    // Clear prompt and unlock seed for next generation
+    showToast('Shot queued — keep composing while it renders');
+
+    // Clear prompt and unlock seed for next shot — don't block the user
     $('vg-prompt').value = '';
     updateCharCount();
-
     if (!VG.seedLocked) {
       const seedInput = $('vg-seed-input');
       if (seedInput) seedInput.value = '';
@@ -1320,6 +1422,7 @@ async function generate() {
   } catch {
     showToast('Network error — try again', true);
   } finally {
+    // Re-enable immediately — user can queue another shot right away
     VG.generating = false;
     btn.disabled  = false;
     btn.classList.remove('loading');
@@ -1364,6 +1467,50 @@ async function enhancePrompt() {
   } finally {
     btn.disabled  = false;
     btn.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> Enhance`;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   CREDIT INTELLIGENCE WIDGET
+   ═══════════════════════════════════════════════════════════════ */
+
+function updateCreditWidget() {
+  const widget  = $('vg-credit-widget');
+  const totalEl = $('vg-cw-total');
+  const histEl  = $('vg-cw-history');
+  const tipEl   = $('vg-cw-tip');
+  if (!widget) return;
+
+  if (VG.lastGenerations.length === 0) { widget.style.display = 'none'; return; }
+  widget.style.display = 'block';
+
+  if (totalEl) totalEl.textContent = `${VG.sessionCreditsUsed} cr used`;
+
+  if (histEl) {
+    histEl.innerHTML = VG.lastGenerations.map(g => `
+      <div class="vg-cw-row">
+        <span class="vg-cw-model">${g.label}</span>
+        <span class="vg-cw-dur">${g.duration}s</span>
+        <span class="vg-cw-cost">${g.cost} cr</span>
+      </div>`).join('');
+  }
+
+  // Smart tip — suggest cheaper model if user picked an expensive one
+  if (tipEl) {
+    const last = VG.lastGenerations[0];
+    const cheaperModels = Object.entries(MODEL_COSTS)
+      .filter(([id, m]) => m.cps < (MODEL_COSTS[last?.model]?.cps || 0))
+      .sort((a,b) => a[1].cps - b[1].cps);
+    if (cheaperModels.length && last) {
+      const [cheapId, cheapInfo] = cheaperModels[0];
+      const saving = last.cost - getShotCost(cheapId, last.duration);
+      tipEl.style.display = 'flex';
+      tipEl.innerHTML = `
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+        <span><strong>${cheapInfo.label}</strong> saves ~${saving} cr per shot for similar results</span>`;
+    } else {
+      tipEl.style.display = 'none';
+    }
   }
 }
 

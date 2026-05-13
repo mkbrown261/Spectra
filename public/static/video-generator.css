@@ -1065,6 +1065,91 @@ body {
 .vg-shot-tag.seed  { color: var(--cyan);    border-color: var(--cyan-dim); }
 .vg-shot-tag.style { color: var(--accent-dim); border-color: var(--accent-ghost); }
 
+/* ── TRANSPARENT GENERATION UX ───────────────────────────────── */
+
+/* Generating shot overlay — rich progress */
+.vg-shot-generating {
+  flex-direction: column; gap: 8px;
+  padding: 10px; align-items: stretch !important;
+  justify-content: center !important;
+  background: linear-gradient(135deg, rgba(10,8,20,0.92), rgba(20,16,40,0.92));
+}
+.vg-shot-gen-top {
+  display: flex; align-items: center; gap: 8px;
+}
+.vg-shot-gen-spinner { color: var(--accent-bright); flex-shrink: 0; }
+.vg-shot-gen-info {
+  display: flex; flex-direction: column; gap: 1px; flex: 1;
+}
+.vg-shot-gen-status {
+  font-size: 0.65rem; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--accent-bright);
+}
+.vg-shot-elapsed {
+  font-size: 0.7rem; font-family: 'Space Mono', monospace;
+  color: var(--text-primary); font-weight: 600;
+}
+.vg-shot-cost-badge {
+  font-size: 0.6rem; font-weight: 700; padding: 2px 7px;
+  border-radius: 100px; background: rgba(124,106,247,0.15);
+  border: 1px solid var(--border-glow); color: var(--accent-bright);
+  flex-shrink: 0;
+}
+.vg-shot-progress-bar {
+  height: 3px; background: rgba(255,255,255,0.08);
+  border-radius: 2px; overflow: hidden;
+}
+.vg-shot-progress-bar-fill {
+  height: 100%; background: linear-gradient(90deg, var(--accent), #a78bfa);
+  border-radius: 2px; transition: width 1s linear;
+}
+.vg-shot-eta {
+  font-size: 0.62rem; color: var(--text-ghost); text-align: right;
+}
+
+/* ── CREDIT INTELLIGENCE WIDGET ──────────────────────────────── */
+.vg-credit-widget {
+  margin-top: 8px; border-radius: var(--r-md);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-raised); overflow: hidden;
+  animation: fadeIn 0.2s ease;
+}
+.vg-cw-header {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 10px; border-bottom: 1px solid var(--border-subtle);
+  font-size: 0.65rem; color: var(--text-dim);
+}
+.vg-cw-header svg { color: var(--accent-bright); flex-shrink: 0; }
+.vg-cw-header span:first-of-type { flex: 1; font-weight: 600; }
+.vg-cw-total {
+  font-size: 0.65rem; font-weight: 700;
+  color: var(--accent-bright); flex-shrink: 0;
+}
+.vg-cw-history { padding: 4px 6px; }
+.vg-cw-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 4px; border-radius: var(--r-xs);
+}
+.vg-cw-row:hover { background: var(--bg-elevated); }
+.vg-cw-model { font-size: 0.67rem; color: var(--text-secondary); flex: 1; }
+.vg-cw-dur   { font-size: 0.63rem; color: var(--text-ghost); }
+.vg-cw-cost  { font-size: 0.65rem; font-weight: 600; color: var(--accent-dim);
+               font-family: 'Space Mono', monospace; }
+.vg-cw-tip {
+  display: flex; align-items: flex-start; gap: 6px;
+  padding: 6px 10px; background: rgba(124,106,247,0.07);
+  border-top: 1px solid var(--border-subtle);
+  font-size: 0.63rem; color: var(--text-dim); line-height: 1.4;
+}
+.vg-cw-tip svg { color: var(--accent-bright); flex-shrink: 0; margin-top: 1px; }
+.vg-cw-tip strong { color: var(--accent-bright); }
+
+/* ── SHOT CARD STATUS DOT (rename classes to match status values) */
+.vg-shot-status-dot.dot-done     { background: var(--green);  box-shadow: 0 0 6px var(--green); }
+.vg-shot-status-dot.dot-queued,
+.vg-shot-status-dot.dot-progress { background: var(--yellow); animation: pip-pulse 1.2s ease-in-out infinite; }
+.vg-shot-status-dot.dot-failed   { background: var(--red); }
+
 /* Failed / NSFW state */
 .vg-shot-card.failed .vg-shot-thumb,
 .vg-shot-card.nsfw   .vg-shot-thumb { background: var(--red-dim); }

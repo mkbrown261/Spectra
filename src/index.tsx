@@ -2212,6 +2212,16 @@ function videoGeneratorPage(): string {
           <div class="vg-usage-bar"><div class="vg-usage-fill" id="vg-usage-fill"></div></div>
           <div class="vg-usage-label" id="vg-usage-label"></div>
         </div>
+        <!-- Credit Intelligence Widget -->
+        <div class="vg-credit-widget" id="vg-credit-widget" style="display:none">
+          <div class="vg-cw-header">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            <span>Session Usage</span>
+            <span class="vg-cw-total" id="vg-cw-total">0 cr used</span>
+          </div>
+          <div class="vg-cw-history" id="vg-cw-history"></div>
+          <div class="vg-cw-tip" id="vg-cw-tip"></div>
+        </div>
       </div>
 
     </div><!-- /vg-compose -->
