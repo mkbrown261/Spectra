@@ -2178,3 +2178,66 @@ body {
   border-color: rgba(52,211,153,0.35) !important;
   color: #34D399 !important;
 }
+
+/* ════════════════════════════════════════════════════════════════
+   CHARACTER SYSTEM FIXES — soul states, inline edit, spinner
+   ════════════════════════════════════════════════════════════════ */
+
+/* Soul badge variants */
+.vg-char-soul-badge.ready {
+  background: rgba(52,211,153,0.12);
+  border: 1px solid rgba(52,211,153,0.35);
+  color: #34D399;
+}
+.vg-char-soul-badge.pending {
+  background: rgba(251,191,36,0.1);
+  border: 1px solid rgba(251,191,36,0.3);
+  color: #FBBF24;
+  display: inline-flex; align-items: center; gap: 5px;
+}
+
+/* Tiny inline spinner for soul pending badge */
+.vg-spinner-xs {
+  display: inline-block;
+  width: 9px; height: 9px;
+  border: 1.5px solid rgba(251,191,36,0.3);
+  border-top-color: #FBBF24;
+  border-radius: 50%;
+  animation: vg-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+/* Character card editing state */
+.vg-char-card.editing {
+  border-color: var(--accent-mid) !important;
+  background: var(--bg-raised);
+}
+.vg-char-edit-name,
+.vg-char-edit-desc {
+  width: 100%;
+  font-size: 0.72rem !important;
+  padding: 4px 7px !important;
+  height: auto !important;
+  display: block;
+}
+.vg-char-edit-actions {
+  display: flex; gap: 5px; margin-top: 6px;
+}
+
+/* Poll / Check button — subdued amber tint */
+.vg-char-poll-btn {
+  color: #FBBF24 !important;
+  border-color: rgba(251,191,36,0.35) !important;
+}
+.vg-char-poll-btn:hover {
+  background: rgba(251,191,36,0.08) !important;
+}
+
+/* Edit button — ghost appearance */
+.vg-char-edit-btn {
+  color: var(--text-dim) !important;
+}
+.vg-char-edit-btn:hover {
+  color: var(--accent-bright) !important;
+  border-color: var(--border-glow) !important;
+}

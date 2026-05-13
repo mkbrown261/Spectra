@@ -820,6 +820,39 @@ app.post('/api/projects/:id/characters', requireAuth, async (c) => {
   }
 })
 
+// PATCH /api/projects/:projectId/characters/:characterId — edit name / description / ref_image_url
+app.patch('/api/projects/:projectId/characters/:characterId', requireAuth, async (c) => {
+  try {
+    const userId      = c.get('userId')
+    const projectId   = c.req.param('projectId')
+    const characterId = c.req.param('characterId')
+
+    const project = await c.env.DB.prepare(
+      `SELECT id FROM projects WHERE id = ? AND user_id = ?`
+    ).bind(projectId, userId).first()
+    if (!project) return c.json({ error: 'Project not found' }, 404)
+
+    const body = await c.req.json()
+    const fields: string[] = []
+    const values: any[]    = []
+
+    if (body.name        !== undefined) { fields.push('name = ?');          values.push(body.name.trim()) }
+    if (body.description !== undefined) { fields.push('description = ?');   values.push(body.description || null) }
+    if (body.ref_image_url !== undefined) { fields.push('ref_image_url = ?'); values.push(body.ref_image_url || null) }
+
+    if (!fields.length) return c.json({ error: 'Nothing to update' }, 400)
+
+    values.push(characterId, projectId)
+    await c.env.DB.prepare(
+      `UPDATE characters SET ${fields.join(', ')} WHERE id = ? AND project_id = ?`
+    ).bind(...values).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
 // DELETE /api/projects/:projectId/characters/:characterId
 app.delete('/api/projects/:projectId/characters/:characterId', requireAuth, async (c) => {
   const userId      = c.get('userId')
@@ -1347,19 +1380,99 @@ app.post('/api/projects/:id/characters/train', requireAuth, async (c) => {
     const trainResult: any = await res.json()
     const soulId = trainResult.soul_id || trainResult.id || null
 
-    if (soulId) {
-      await c.env.DB.prepare(
-        `UPDATE characters SET soul_id = ? WHERE id = ?`
-      ).bind(soulId, character_id).run()
-    }
+    // If Higgsfield returned a soul_id immediately (sync response) → store it.
+    // If training is async (soul_id comes later via poll) → store placeholder 'pending'
+    // so the UI knows training is in-flight without overwriting a real soul_id later.
+    const valueToStore = soulId || 'pending'
+    await c.env.DB.prepare(
+      `UPDATE characters SET soul_id = ? WHERE id = ?`
+    ).bind(valueToStore, character_id).run()
 
     return c.json({
       ok:          true,
       character_id,
       soul_id:     soulId,
       status:      trainResult.status || 'submitted',
-      message:     soulId ? 'Soul training started' : 'Training submitted (no soul_id returned yet)',
+      message:     soulId ? 'Soul training started — Soul ready!' : 'Soul training submitted — polling for completion…',
     })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   CHARACTER SOUL STATUS POLL
+══════════════════════════════════════════════════════════════════ */
+
+// GET /api/projects/:id/characters/:charId/soul-status
+// Checks Higgsfield for training completion, writes soul_id to D1 when done
+app.get('/api/projects/:id/characters/:charId/soul-status', requireAuth, async (c) => {
+  try {
+    const userId      = c.get('userId')
+    const projectId   = c.req.param('id')
+    const characterId = c.req.param('charId')
+
+    const project = await c.env.DB.prepare(
+      `SELECT id FROM projects WHERE id = ? AND user_id = ?`
+    ).bind(projectId, userId).first()
+    if (!project) return c.json({ error: 'Project not found' }, 404)
+
+    const character = await c.env.DB.prepare(
+      `SELECT id, name, soul_id FROM characters WHERE id = ? AND project_id = ?`
+    ).bind(characterId, projectId).first<{ id: string; name: string; soul_id: string | null }>()
+    if (!character) return c.json({ error: 'Character not found' }, 404)
+
+    // Already trained — no need to poll
+    if (character.soul_id) {
+      return c.json({ status: 'ready', soul_id: character.soul_id })
+    }
+
+    // Need Higgsfield key to poll
+    const keyRow = await c.env.DB.prepare(
+      `SELECT encrypted_key, iv FROM api_keys WHERE user_id = ? AND provider = 'higgsfield'`
+    ).bind(userId).first<{ encrypted_key: string; iv: string }>()
+    if (!keyRow) return c.json({ status: 'no_key' })
+    if (!c.env.ENCRYPTION_KEY) return c.json({ error: 'Server encryption not configured' }, 500)
+
+    const credentials = await decryptKey(keyRow.encrypted_key, keyRow.iv, c.env.ENCRYPTION_KEY)
+
+    // Poll Higgsfield for this character's soul by name
+    // GET /higgsfield-ai/soul/list — returns array of { soul_id, name, status }
+    const listRes = await fetch(`${HF_BASE}/higgsfield-ai/soul/list`, {
+      method:  'GET',
+      headers: {
+        'Authorization': `Key ${credentials}`,
+        'Accept':        'application/json',
+      },
+    })
+
+    if (!listRes.ok) {
+      return c.json({ status: 'pending' })   // Can't reach API — treat as still pending
+    }
+
+    const souls: any[] = await listRes.json().catch(() => [])
+    const match = Array.isArray(souls)
+      ? souls.find((s: any) =>
+          s.name === character.name ||
+          s.soul_id === character.soul_id ||
+          s.id === character.soul_id
+        )
+      : null
+
+    if (!match) return c.json({ status: 'pending' })
+
+    const soulStatus = match.status || 'unknown'
+    const soulId     = match.soul_id || match.id || null
+
+    // If training finished, persist soul_id
+    if ((soulStatus === 'ready' || soulStatus === 'trained' || soulStatus === 'completed') && soulId) {
+      await c.env.DB.prepare(
+        `UPDATE characters SET soul_id = ? WHERE id = ?`
+      ).bind(soulId, characterId).run()
+      return c.json({ status: 'ready', soul_id: soulId })
+    }
+
+    return c.json({ status: soulStatus, soul_id: soulId })
   } catch (err: any) {
     return c.json({ error: err.message }, 500)
   }

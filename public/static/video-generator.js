@@ -2265,7 +2265,10 @@ async function renderCharacters(projectId) {
       return;
     }
 
-    list.innerHTML = chars.map(ch => `
+    list.innerHTML = chars.map(ch => {
+      const soulPending = ch.soul_id === 'pending';
+      const soulReady   = ch.soul_id && ch.soul_id !== 'pending';
+      return `
       <div class="vg-char-card" data-char-id="${ch.id}">
         <div class="vg-char-avatar">
           ${ch.ref_image_url
@@ -2276,20 +2279,24 @@ async function renderCharacters(projectId) {
         <div class="vg-char-info">
           <div class="vg-char-name">${escHtml(ch.name)}</div>
           ${ch.description ? `<div class="vg-char-desc">${escHtml(ch.description)}</div>` : ''}
-          ${ch.soul_id ? `<div class="vg-char-soul-badge">Soul trained ✓</div>` : ''}
+          ${soulReady   ? `<div class="vg-char-soul-badge ready">✓ Soul ready</div>` : ''}
+          ${soulPending ? `<div class="vg-char-soul-badge pending"><span class="vg-spinner-xs"></span> Training soul…</div>` : ''}
         </div>
         <div class="vg-char-actions">
-          <button class="vg-btn-chip vg-char-use-btn" title="Use as reference image" data-char-id="${ch.id}" data-ref-url="${escAttr(ch.ref_image_url || '')}">
-            Use
-          </button>
+          <button class="vg-btn-chip vg-char-use-btn"  data-char-id="${ch.id}" data-ref-url="${escAttr(ch.ref_image_url || '')}" title="Lock as reference image">Use</button>
+          <button class="vg-btn-chip vg-char-edit-btn" data-char-id="${ch.id}" data-name="${escAttr(ch.name)}" data-desc="${escAttr(ch.description || '')}" title="Edit name / description">Edit</button>
           ${ch.ref_image_url && !ch.soul_id
-            ? `<button class="vg-btn-chip vg-char-train-btn" data-char-id="${ch.id}" title="Train Soul for consistency">Train Soul</button>`
+            ? `<button class="vg-btn-chip vg-char-train-btn" data-char-id="${ch.id}" title="Train Soul for visual consistency">Train Soul</button>`
+            : ''
+          }
+          ${soulPending
+            ? `<button class="vg-btn-chip vg-char-poll-btn" data-char-id="${ch.id}" title="Check training status">Check</button>`
             : ''
           }
           <button class="vg-btn-chip danger vg-char-del-btn" data-char-id="${ch.id}" title="Delete character">×</button>
         </div>
-      </div>
-    `).join('');
+      </div>`;
+    }).join('');
 
     // Bind character actions
     list.querySelectorAll('.vg-char-use-btn').forEach(btn => {
@@ -2300,11 +2307,22 @@ async function renderCharacters(projectId) {
         useCharacter(btn.dataset.charId, btn.dataset.refUrl, name, avatar);
       });
     });
+    list.querySelectorAll('.vg-char-edit-btn').forEach(btn => {
+      btn.addEventListener('click', () => openCharEditInline(btn.dataset.charId, btn.dataset.name, btn.dataset.desc, projectId));
+    });
     list.querySelectorAll('.vg-char-train-btn').forEach(btn => {
       btn.addEventListener('click', () => trainCharacterSoul(btn.dataset.charId));
     });
+    list.querySelectorAll('.vg-char-poll-btn').forEach(btn => {
+      btn.addEventListener('click', () => pollSoulStatus(btn.dataset.charId, projectId));
+    });
     list.querySelectorAll('.vg-char-del-btn').forEach(btn => {
       btn.addEventListener('click', () => deleteCharacter(btn.dataset.charId, projectId));
+    });
+
+    // Auto-start background polling for any in-flight soul trainings
+    chars.filter(ch => ch.soul_id === 'pending').forEach(ch => {
+      startSoulPoll(ch.id, projectId);
     });
   } catch (err) {
     list.innerHTML = `<div class="vg-char-empty" style="color:var(--color-error)">Failed to load characters</div>`;
@@ -2694,21 +2712,130 @@ function exportCampaign(idx) {
   showToast(`Manifest exported for "${camp.name}"`);
 }
 
-/* ── trainCharacterSoul (hoisted here from orphaned block) ──── */
+/* ── CHARACTER SOUL TRAINING + STATUS POLLING ───────────────── */
+
+const _soulPolls = {};   // charId → intervalId
+
 async function trainCharacterSoul(charId) {
   if (!VG.activeProjectId) return;
   const btn = document.querySelector(`[data-char-id="${charId}"].vg-char-train-btn`);
-  if (btn) { btn.disabled = true; btn.textContent = 'Training…'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Submitting…'; }
   try {
     const res  = await api('POST', `/api/projects/${VG.activeProjectId}/characters/train`, { character_id: charId });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Training failed');
-    showToast(data.message || 'Soul training started');
+    showToast(data.message || 'Soul training submitted — will check status automatically');
+    // Re-render: pending badge appears, auto-poll kicks off from renderCharacters()
     await renderCharacters(VG.activeProjectId);
   } catch (err) {
     showToast(err.message, true);
     if (btn) { btn.disabled = false; btn.textContent = 'Train Soul'; }
   }
+}
+
+// Manual "Check" button — single status check with button feedback
+async function pollSoulStatus(charId, projectId) {
+  const btn = document.querySelector(`[data-char-id="${charId}"].vg-char-poll-btn`);
+  if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+  const done = await checkSoulStatus(charId, projectId);
+  if (!done && btn) { btn.disabled = false; btn.textContent = 'Check'; }
+}
+
+// Core status check — returns true when training is complete (poll stops)
+async function checkSoulStatus(charId, projectId) {
+  try {
+    const res  = await api('GET', `/api/projects/${projectId}/characters/${charId}/soul-status`);
+    const data = await res.json();
+    if (!res.ok) return false;
+
+    if (data.status === 'ready') {
+      stopSoulPoll(charId);
+      showToast('✨ Soul training complete — character is ready!');
+      await renderCharacters(projectId);
+      return true;
+    }
+    // Non-transient status → stop polling to avoid infinite loop
+    if (data.status !== 'pending' && data.status !== 'submitted' && data.status !== 'in_progress') {
+      stopSoulPoll(charId);
+      await renderCharacters(projectId);
+      return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
+function startSoulPoll(charId, projectId) {
+  if (_soulPolls[charId]) return;   // already running
+  _soulPolls[charId] = setInterval(async () => {
+    await checkSoulStatus(charId, projectId);
+  }, 8000);   // poll every 8 s
+}
+
+function stopSoulPoll(charId) {
+  if (_soulPolls[charId]) {
+    clearInterval(_soulPolls[charId]);
+    delete _soulPolls[charId];
+  }
+}
+
+/* ── CHARACTER INLINE EDIT ───────────────────────────────────── */
+
+function openCharEditInline(charId, currentName, currentDesc, projectId) {
+  const card = document.querySelector(`.vg-char-card[data-char-id="${charId}"]`);
+  if (!card || card.classList.contains('editing')) return;
+  card.classList.add('editing');
+
+  const infoEl   = card.querySelector('.vg-char-info');
+  if (!infoEl) return;
+  const origHTML = infoEl.innerHTML;
+
+  infoEl.innerHTML = `
+    <input class="vg-input vg-char-edit-name" value="${escAttr(currentName)}" placeholder="Name" maxlength="60"/>
+    <input class="vg-input vg-char-edit-desc" value="${escAttr(currentDesc)}" placeholder="Description (optional)" maxlength="200" style="margin-top:4px"/>
+    <div class="vg-char-edit-actions">
+      <button class="vg-btn-primary vg-char-edit-save" style="font-size:11px;padding:3px 10px">Save</button>
+      <button class="vg-btn-ghost vg-char-edit-cancel" style="font-size:11px;padding:3px 8px">Cancel</button>
+    </div>
+  `;
+  infoEl.querySelector('.vg-char-edit-name')?.focus();
+
+  const doCancel = () => {
+    infoEl.innerHTML = origHTML;
+    card.classList.remove('editing');
+  };
+
+  const doSave = async () => {
+    const newName = infoEl.querySelector('.vg-char-edit-name')?.value?.trim();
+    const newDesc = infoEl.querySelector('.vg-char-edit-desc')?.value?.trim();
+    if (!newName) { showToast('Name cannot be empty', true); return; }
+
+    const saveBtn   = infoEl.querySelector('.vg-char-edit-save');
+    saveBtn.disabled    = true;
+    saveBtn.textContent = 'Saving…';
+
+    try {
+      const res = await api('PATCH', `/api/projects/${projectId}/characters/${charId}`, {
+        name:        newName,
+        description: newDesc || null,
+      });
+      if (!res.ok) { const d = await res.json(); throw new Error(d.error || 'Save failed'); }
+      showToast('Character updated');
+      await renderCharacters(projectId);
+    } catch (err) {
+      showToast(err.message, true);
+      saveBtn.disabled    = false;
+      saveBtn.textContent = 'Save';
+    }
+  };
+
+  infoEl.querySelector('.vg-char-edit-cancel').addEventListener('click', doCancel);
+  infoEl.querySelector('.vg-char-edit-save').addEventListener('click', doSave);
+  infoEl.querySelectorAll('.vg-char-edit-name, .vg-char-edit-desc').forEach(inp => {
+    inp.addEventListener('keydown', e => {
+      if (e.key === 'Enter')  doSave();
+      if (e.key === 'Escape') doCancel();
+    });
+  });
 }
 
 async function deleteCharacter(charId, projectId) {
