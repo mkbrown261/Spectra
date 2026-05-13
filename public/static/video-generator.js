@@ -544,8 +544,10 @@ async function handleFileUpload(file) {
     }
 
     VG.uploadedImageKey = data.key;
-    VG.uploadedImageUrl = data.url;
-    showUploadPreview(data.url);
+    // Use absoluteUrl for Higgsfield (needs a public URL it can fetch)
+    // Fall back to constructing one from relative url if absoluteUrl not returned
+    VG.uploadedImageUrl = data.absoluteUrl || (window.location.origin + data.url);
+    showUploadPreview(data.url);  // display uses relative path (fine for <img>)
     showToast('Image uploaded ✓');
   } catch {
     showToast('Upload failed — check connection', true);

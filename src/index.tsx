@@ -829,11 +829,24 @@ app.post('/api/generate', requireAuth, async (c) => {
       seed ?? null, style_preset ?? null, quality ?? null,
     ).run()
 
+    // Resolve image_url to absolute — Higgsfield needs a public URL it can fetch
+    // If user uploaded via /api/upload, the URL is relative (/api/image/...) — make it absolute
+    let absoluteImageUrl: string | undefined = undefined
+    if (image_url) {
+      if (image_url.startsWith('/')) {
+        // Derive origin from the incoming request
+        const origin = new URL(c.req.url).origin
+        absoluteImageUrl = `${origin}${image_url}`
+      } else {
+        absoluteImageUrl = image_url
+      }
+    }
+
     // Build Higgsfield body — include seed if provided
     const hfBody: Record<string, any> = {
       model,
       prompt:      promptEnhanced,
-      image_url,
+      image_url:   absoluteImageUrl,
       duration,
       aspect_ratio,
       credentials,
@@ -1219,11 +1232,12 @@ app.post('/api/upload', requireAuth, async (c) => {
       httpMetadata: { contentType: file.type },
     })
 
-    // Build a public URL using R2 custom domain or workers route
-    // Format: /api/image/:key — served by the endpoint below
-    const url = `/api/image/${encodeURIComponent(key)}`
+    // Return both relative path (for display) and absolute URL (for Higgsfield)
+    const relativeUrl = `/api/image/${encodeURIComponent(key)}`
+    const origin      = new URL(c.req.url).origin
+    const absoluteUrl = `${origin}${relativeUrl}`
 
-    return c.json({ ok: true, url, key, size: file.size, type: file.type })
+    return c.json({ ok: true, url: relativeUrl, absoluteUrl, key, size: file.size, type: file.type })
   } catch (err: any) {
     return c.json({ error: err.message }, 500)
   }
