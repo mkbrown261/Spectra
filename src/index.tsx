@@ -266,19 +266,27 @@ async function verifyStripeSignature(
    HIGGSFIELD ADAPTER
 ══════════════════════════════════════════════════════════════════ */
 async function hfSubmitJob(params: {
-  model:        string
-  prompt:       string
-  image_url?:   string
-  duration?:    number
-  aspect_ratio?: string
-  credentials:  string   // KEY_ID:KEY_SECRET — decrypted server-side
+  model:            string
+  prompt:           string
+  image_url?:       string
+  duration?:        number
+  aspect_ratio?:    string
+  credentials:      string   // KEY_ID:KEY_SECRET — decrypted server-side
+  motion_strength?: number   // 1–10, from quality slider
+  style_strength?:  number   // 1–10, from quality slider
+  detail_strength?: number   // 1–10, from quality slider
 }): Promise<{ request_id: string; status: string; status_url: string }> {
-  const { model, prompt, image_url, duration, aspect_ratio, credentials } = params
+  const { model, prompt, image_url, duration, aspect_ratio, credentials,
+          motion_strength, style_strength, detail_strength } = params
 
   const body: Record<string, any> = { prompt }
-  if (image_url)   body.image_url    = image_url
-  if (duration)    body.duration     = duration
-  if (aspect_ratio) body.aspect_ratio = aspect_ratio
+  if (image_url)    body.image_url       = image_url
+  if (duration)     body.duration        = duration
+  if (aspect_ratio) body.aspect_ratio    = aspect_ratio
+  // Quality parameters — only forward if explicitly set (non-null)
+  if (motion_strength != null) body.motion_strength = motion_strength
+  if (style_strength  != null) body.style_strength  = style_strength
+  if (detail_strength != null) body.detail_strength = detail_strength
 
   const res = await fetch(`${HF_BASE}/${model}`, {
     method:  'POST',
@@ -718,7 +726,7 @@ app.post('/api/projects', requireAuth, async (c) => {
 app.get('/api/projects', requireAuth, async (c) => {
   const userId = c.get('userId')
   const rows = await c.env.DB.prepare(
-    `SELECT id, name, style_bible, default_provider, default_model, thumbnail_url, shot_count, created_at, updated_at
+    `SELECT id, name, style_bible, default_provider, default_model, thumbnail_url, shot_count, campaign_id, created_at, updated_at
      FROM projects WHERE user_id = ? ORDER BY updated_at DESC`
   ).bind(userId).all()
   return c.json(rows.results)
@@ -879,6 +887,87 @@ app.delete('/api/projects/:projectId/characters/:characterId', requireAuth, asyn
 })
 
 /* ══════════════════════════════════════════════════════════════════
+   CAMPAIGN ROUTES  (H-6: moved from localStorage → D1)
+══════════════════════════════════════════════════════════════════ */
+
+// GET /api/campaigns — list all campaigns for the current user
+app.get('/api/campaigns', requireAuth, async (c) => {
+  const userId = c.get('userId')
+  const rows = await c.env.DB.prepare(
+    `SELECT id, name, created_at FROM campaigns WHERE user_id = ? ORDER BY created_at ASC`
+  ).bind(userId).all<{ id: string; name: string; created_at: string }>()
+  return c.json(rows.results ?? [])
+})
+
+// POST /api/campaigns — create a new campaign
+app.post('/api/campaigns', requireAuth, async (c) => {
+  const userId = c.get('userId')
+  const body   = await c.req.json()
+  const name   = body?.name?.trim()
+  if (!name) return c.json({ error: 'name required' }, 400)
+  if (name.length > 60) return c.json({ error: 'name too long (max 60 chars)' }, 400)
+
+  const id = uuid()
+  await c.env.DB.prepare(
+    `INSERT INTO campaigns (id, user_id, name) VALUES (?, ?, ?)`
+  ).bind(id, userId, name).run()
+
+  return c.json({ id, name, created_at: new Date().toISOString() }, 201)
+})
+
+// DELETE /api/campaigns/:id — delete a campaign (unassigns all projects)
+app.delete('/api/campaigns/:id', requireAuth, async (c) => {
+  const userId     = c.get('userId')
+  const campaignId = c.req.param('id')
+
+  const campaign = await c.env.DB.prepare(
+    `SELECT id FROM campaigns WHERE id = ? AND user_id = ?`
+  ).bind(campaignId, userId).first()
+  if (!campaign) return c.json({ error: 'Campaign not found' }, 404)
+
+  // Unassign all projects that belong to this campaign
+  await c.env.DB.prepare(
+    `UPDATE projects SET campaign_id = NULL WHERE campaign_id = ? AND user_id = ?`
+  ).bind(campaignId, userId).run()
+
+  await c.env.DB.prepare(
+    `DELETE FROM campaigns WHERE id = ? AND user_id = ?`
+  ).bind(campaignId, userId).run()
+
+  return c.json({ ok: true })
+})
+
+// PUT /api/projects/:id/campaign — assign or unassign a project from a campaign
+app.put('/api/projects/:id/campaign', requireAuth, async (c) => {
+  const userId    = c.get('userId')
+  const projectId = c.req.param('id')
+  const body      = await c.req.json()
+
+  // campaign_id: string → assign; null → unassign
+  const campaignId: string | null = body?.campaign_id ?? null
+
+  // Verify project ownership
+  const project = await c.env.DB.prepare(
+    `SELECT id FROM projects WHERE id = ? AND user_id = ?`
+  ).bind(projectId, userId).first()
+  if (!project) return c.json({ error: 'Project not found' }, 404)
+
+  // If assigning, verify the campaign belongs to this user
+  if (campaignId !== null) {
+    const camp = await c.env.DB.prepare(
+      `SELECT id FROM campaigns WHERE id = ? AND user_id = ?`
+    ).bind(campaignId, userId).first()
+    if (!camp) return c.json({ error: 'Campaign not found' }, 404)
+  }
+
+  await c.env.DB.prepare(
+    `UPDATE projects SET campaign_id = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?`
+  ).bind(campaignId, projectId, userId).run()
+
+  return c.json({ ok: true, campaign_id: campaignId })
+})
+
+/* ══════════════════════════════════════════════════════════════════
    GENERATION ROUTES
 ══════════════════════════════════════════════════════════════════ */
 
@@ -968,7 +1057,23 @@ app.post('/api/generate', requireAuth, async (c) => {
       }
     }
 
-    // Build Higgsfield body — include seed if provided
+    // Parse quality string "motion:N,style:N,detail:N" → individual strength params
+    let motion_strength: number | undefined
+    let style_strength:  number | undefined
+    let detail_strength: number | undefined
+    if (quality) {
+      const qParts: Record<string, number> = {}
+      String(quality).split(',').forEach(part => {
+        const [k, v] = part.trim().split(':')
+        const n = parseFloat(v)
+        if (k && !isNaN(n)) qParts[k.trim()] = n
+      })
+      if (qParts.motion != null) motion_strength = qParts.motion
+      if (qParts.style  != null) style_strength  = qParts.style
+      if (qParts.detail != null) detail_strength = qParts.detail
+    }
+
+    // Build Higgsfield body — include seed + quality params if provided
     const hfBody: Record<string, any> = {
       model,
       prompt:      promptEnhanced,
@@ -976,6 +1081,9 @@ app.post('/api/generate', requireAuth, async (c) => {
       duration,
       aspect_ratio,
       credentials,
+      motion_strength,
+      style_strength,
+      detail_strength,
     }
     if (seed !== undefined && seed !== null) hfBody.seed = seed
 

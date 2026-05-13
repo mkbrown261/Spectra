@@ -157,6 +157,9 @@ const VG = {
     detail: 7,
   },
 
+  // #8 — Campaign cache (H-6: loaded from D1, replaces localStorage)
+  campaigns: [],
+
   // View
   storyboardView: 'grid', // 'grid' | 'strip'
 
@@ -283,6 +286,7 @@ async function enterApp() {
   updateKeyDot();
   await Promise.all([
     loadProjects(),
+    fetchCampaigns(),
     checkKeyStatus(),
     loadSettingsInfo(),
   ]);
@@ -297,6 +301,7 @@ async function logout() {
   VG.projects        = [];
   VG.activeProjectId = null;
   VG.shots           = {};
+  VG.campaigns       = [];
 
   closeSettings();
   showAuthGate();
@@ -942,10 +947,8 @@ function renderProjectList() {
     return;
   }
 
-  const campaigns = loadCampaigns();
-
   container.innerHTML = VG.projects.map(p => {
-    const camp = p.campaignId ? campaigns.find(c => c.id === p.campaignId) : null;
+    const camp = p.campaign_id ? (VG.campaigns || []).find(c => c.id === p.campaign_id) : null;
     return `
     <div class="vg-project-row">
       <button class="vg-project-item ${p.id === VG.activeProjectId ? 'active' : ''}"
@@ -2593,27 +2596,21 @@ function deleteCustomStyle(idx) {
   showToast(`"${name}" deleted`);
 }
 
-/* ── #8 CAMPAIGN WORKFLOW ────────────────────────────────────── */
+/* ── #8 CAMPAIGN WORKFLOW (H-6: D1-backed, localStorage removed) ── */
 
-const CAMPAIGN_KEY = 'spectra_campaigns';
-
-function loadCampaigns() {
+async function fetchCampaigns() {
   try {
-    return JSON.parse(localStorage.getItem(CAMPAIGN_KEY) || '[]');
-  } catch { return []; }
-}
-
-function saveCampaigns(campaigns) {
-  try {
-    localStorage.setItem(CAMPAIGN_KEY, JSON.stringify(campaigns));
-  } catch {}
+    const res = await api('GET', '/api/campaigns');
+    if (!res.ok) return;
+    VG.campaigns = await res.json();
+  } catch { /* non-fatal */ }
 }
 
 function renderCampaigns() {
   const list = $('vg-campaign-list');
   if (!list) return;
 
-  const campaigns = loadCampaigns();
+  const campaigns = VG.campaigns || [];
   if (campaigns.length === 0) {
     list.innerHTML = '<div class="vg-campaign-empty">No campaigns yet</div>';
     return;
@@ -2621,7 +2618,7 @@ function renderCampaigns() {
 
   list.innerHTML = campaigns.map((c, idx) => {
     // Count projects assigned to this campaign
-    const assignedProjects = VG.projects.filter(p => p.campaignId === c.id);
+    const assignedProjects = VG.projects.filter(p => p.campaign_id === c.id);
     const shotCount = assignedProjects.reduce((sum, p) => sum + (p.shot_count || 0), 0);
     return `
     <div class="vg-campaign-item" data-campaign-idx="${idx}" data-campaign-id="${escAttr(c.id)}">
@@ -2664,69 +2661,67 @@ function renderCampaigns() {
   });
 }
 
-function createCampaign(name) {
+async function createCampaign(name) {
   if (!name || !name.trim()) return;
-  const campaigns = loadCampaigns();
-  const newCamp = {
-    id:        `camp_${Date.now()}`,
-    name:      name.trim(),
-    createdAt: Date.now(),
-  };
-  campaigns.push(newCamp);
-  saveCampaigns(campaigns);
-  renderCampaigns();
-  showToast(`Campaign "${newCamp.name}" created`);
-  return newCamp;
+  try {
+    const res  = await api('POST', '/api/campaigns', { name: name.trim() });
+    const data = await res.json();
+    if (!res.ok) { showToast(data.error || 'Failed to create campaign', 'error'); return; }
+    VG.campaigns.push(data);
+    renderCampaigns();
+    showToast(`Campaign "${data.name}" created`);
+    return data;
+  } catch { showToast('Failed to create campaign', 'error'); }
 }
 
-function deleteCampaign(idx) {
-  const campaigns = loadCampaigns();
-  const name      = campaigns[idx]?.name || 'campaign';
-  if (!confirm(`Delete campaign "${name}"? Projects will not be deleted.`)) return;
-
-  const campId = campaigns[idx].id;
-  campaigns.splice(idx, 1);
-  saveCampaigns(campaigns);
-
-  // Unassign projects from this campaign
-  VG.projects.forEach(p => {
-    if (p.campaignId === campId) delete p.campaignId;
-  });
-
-  renderCampaigns();
-  showToast(`Campaign "${name}" deleted`);
+async function deleteCampaign(idx) {
+  const camp = (VG.campaigns || [])[idx];
+  if (!camp) return;
+  if (!confirm(`Delete campaign "${camp.name}"? Projects will not be deleted.`)) return;
+  try {
+    const res = await api('DELETE', `/api/campaigns/${camp.id}`);
+    if (!res.ok) { showToast('Failed to delete campaign', 'error'); return; }
+    // Unassign projects in local cache
+    VG.projects.forEach(p => { if (p.campaign_id === camp.id) p.campaign_id = null; });
+    VG.campaigns.splice(idx, 1);
+    renderCampaigns();
+    renderProjectList();
+    showToast(`Campaign "${camp.name}" deleted`);
+  } catch { showToast('Failed to delete campaign', 'error'); }
 }
 
-function assignProjectToCampaign(campaignId) {
+async function assignProjectToCampaign(campaignId) {
   if (!VG.activeProjectId) {
-    showToast('Select a project first, then click a campaign to assign it', true);
+    showToast('Select a project first, then click a campaign to assign it', 'info');
     return;
   }
-  const project  = VG.projects.find(p => p.id === VG.activeProjectId);
-  const campaigns = loadCampaigns();
-  const camp     = campaigns.find(c => c.id === campaignId);
+  const project = VG.projects.find(p => p.id === VG.activeProjectId);
+  const camp    = (VG.campaigns || []).find(c => c.id === campaignId);
   if (!project || !camp) return;
 
-  // Toggle — clicking same campaign unassigns
-  if (project.campaignId === campaignId) {
-    delete project.campaignId;
+  // Toggle — clicking the already-assigned campaign unassigns
+  const newCampaignId = project.campaign_id === campaignId ? null : campaignId;
+  try {
+    const res  = await api('PUT', `/api/projects/${project.id}/campaign`, { campaign_id: newCampaignId });
+    const data = await res.json();
+    if (!res.ok) { showToast(data.error || 'Failed to update campaign', 'error'); return; }
+    project.campaign_id = newCampaignId;
     renderCampaigns();
     renderProjectList();
-    showToast(`Removed "${project.name}" from campaign`);
-  } else {
-    project.campaignId = campaignId;
-    renderCampaigns();
-    renderProjectList();
-    showToast(`"${project.name}" → "${camp.name}" ✓`);
-  }
+    if (newCampaignId === null) {
+      showToast(`Removed "${project.name}" from campaign`);
+    } else {
+      showToast(`"${project.name}" → "${camp.name}" ✓`);
+    }
+  } catch { showToast('Failed to update campaign assignment', 'error'); }
 }
 
 function exportCampaign(idx) {
-  const campaigns = loadCampaigns();
+  const campaigns = VG.campaigns || [];
   const camp      = campaigns[idx];
   if (!camp) return;
 
-  const assignedProjects = VG.projects.filter(p => p.campaignId === camp.id);
+  const assignedProjects = VG.projects.filter(p => p.campaign_id === camp.id);
   if (assignedProjects.length === 0) {
     showToast('No projects assigned to this campaign', true);
     return;
