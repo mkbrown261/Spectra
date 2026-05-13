@@ -1861,3 +1861,139 @@ body {
   animation: fadeIn 0.3s ease;
 }
 .vg-memory-restored svg { color: var(--green); }
+
+/* ══════════════════════════════════════════════════════════════
+   #6 CUSTOM STYLE SYSTEMS
+   ══════════════════════════════════════════════════════════════ */
+
+/* Label row with actions group on right */
+.vg-compose-label-actions {
+  display: flex; align-items: center; gap: 5px;
+}
+
+/* My Styles sub-section */
+#vg-my-styles-section {
+  margin-top: 8px;
+}
+.vg-my-styles-label {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 0.58rem; font-weight: 600; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-ghost);
+  margin-bottom: 6px;
+}
+.vg-my-styles-label svg { color: #FBBF24; }
+
+/* Custom style chip — extends .vg-preset-chip */
+.vg-custom-style-chip {
+  position: relative;
+  padding-right: 22px !important;
+}
+.vg-custom-style-del {
+  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  background: none; border: none; cursor: pointer; padding: 0 2px;
+  font-size: 0.8rem; line-height: 1;
+  color: var(--text-ghost); border-radius: 2px;
+  opacity: 0; transition: opacity 0.15s;
+}
+.vg-custom-style-chip:hover .vg-custom-style-del { opacity: 1; }
+.vg-custom-style-del:hover { color: var(--red); }
+
+/* ══════════════════════════════════════════════════════════════
+   #7 BIBLE ACTIVE INDICATOR
+   ══════════════════════════════════════════════════════════════ */
+
+.vg-bible-active-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 0.58rem; color: #34D399;
+  padding: 2px 6px; border-radius: 100px;
+  background: rgba(52,211,153,0.1); border: 1px solid rgba(52,211,153,0.25);
+  animation: fadeIn 0.25s ease;
+  white-space: nowrap;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   #8 CAMPAIGN WORKFLOW
+   ══════════════════════════════════════════════════════════════ */
+
+#vg-campaign-section {
+  margin-bottom: 4px;
+}
+.vg-campaign-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 0; margin-bottom: 2px;
+}
+.vg-campaign-label {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 0.6rem; font-weight: 600; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-ghost);
+}
+.vg-campaign-label svg { color: var(--accent-bright); }
+
+.vg-campaign-empty {
+  font-size: 0.65rem; color: var(--text-ghost);
+  padding: 4px 2px 6px;
+  font-style: italic;
+}
+
+.vg-campaign-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 5px 8px; border-radius: var(--r-sm);
+  background: var(--bg-raised); border: 1px solid var(--border-subtle);
+  margin-bottom: 4px; cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.vg-campaign-item:hover {
+  background: var(--accent-ghost); border-color: var(--border-glow);
+}
+.vg-campaign-item-left {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+}
+.vg-campaign-item-left svg { color: var(--accent-bright); flex-shrink: 0; }
+.vg-campaign-name {
+  font-size: 0.7rem; font-weight: 600; color: var(--text-main);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 100px;
+}
+.vg-campaign-item-right {
+  display: flex; align-items: center; gap: 4px; flex-shrink: 0;
+}
+.vg-campaign-meta {
+  font-size: 0.58rem; color: var(--text-ghost);
+}
+.vg-campaign-export-btn, .vg-campaign-del-btn {
+  background: none; border: none; cursor: pointer; padding: 2px 3px;
+  color: var(--text-ghost); border-radius: 3px;
+  display: flex; align-items: center;
+  opacity: 0.5; transition: opacity 0.15s, color 0.15s;
+}
+.vg-campaign-item:hover .vg-campaign-export-btn,
+.vg-campaign-item:hover .vg-campaign-del-btn { opacity: 1; }
+.vg-campaign-export-btn:hover { color: var(--accent-bright); }
+.vg-campaign-del-btn:hover { color: var(--red); font-size: 0.85rem; }
+
+.vg-campaign-new-row {
+  display: flex; align-items: center; gap: 5px;
+  margin-bottom: 6px;
+}
+.vg-campaign-input {
+  flex: 1; min-width: 0;
+  padding: 5px 8px !important; font-size: 0.7rem !important;
+  height: 28px;
+}
+
+/* Divider between campaigns and projects */
+.vg-campaign-divider {
+  height: 1px; background: var(--border-subtle); margin: 6px 0 8px;
+}
+
+/* Project list — campaign tag badge */
+.vg-project-item-right {
+  display: flex; align-items: center; gap: 4px; margin-left: auto;
+}
+.vg-project-campaign-tag {
+  display: flex; align-items: center;
+  color: var(--accent-bright); opacity: 0.7;
+}
+.vg-project-item-shots {
+  font-size: 0.6rem; color: var(--text-ghost); white-space: nowrap;
+}

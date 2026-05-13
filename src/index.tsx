@@ -1971,6 +1971,26 @@ function videoGeneratorPage(): string {
           New
         </button>
       </div>
+      <!-- #8 Campaign container -->
+      <div id="vg-campaign-section">
+        <div class="vg-campaign-header">
+          <span class="vg-campaign-label">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+            Campaigns
+          </span>
+          <button class="vg-btn-chip" id="btn-new-campaign" title="Create new campaign">
+            <svg width="9" height="9" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2v12M2 8h12"/></svg>
+          </button>
+        </div>
+        <div id="vg-campaign-list"><!-- Injected by JS --></div>
+        <!-- New campaign inline input (hidden by default) -->
+        <div class="vg-campaign-new-row" id="vg-campaign-new-row" style="display:none">
+          <input type="text" class="vg-input vg-campaign-input" id="vg-campaign-name-input" placeholder="Campaign name…" maxlength="60"/>
+          <button class="vg-btn-chip" id="btn-campaign-save">Create</button>
+          <button class="vg-btn-chip" id="btn-campaign-cancel">✕</button>
+        </div>
+      </div>
+      <div class="vg-campaign-divider"></div>
       <div id="vg-project-selector">
         <div class="vg-project-loading">Loading projects...</div>
       </div>
@@ -2186,6 +2206,10 @@ function videoGeneratorPage(): string {
           <span class="vg-enhance-mode-label" id="enhance-mode-label">cinematic mode</span>
           <div class="vg-enhance-divider"></div>
           <span class="vg-enhance-note">GPT-4o rewrite</span>
+          <span class="vg-bible-active-badge" id="vg-bible-dot" style="display:none" title="Style bible injected into every enhance">
+            <svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="4" fill="#34D399"/></svg>
+            <span id="vg-bible-tip">bible active</span>
+          </span>
         </div>
       </div>
 
@@ -2193,10 +2217,26 @@ function videoGeneratorPage(): string {
       <div class="vg-compose-block">
         <div class="vg-compose-label-row">
           <span class="vg-compose-label">Style Preset</span>
-          <button class="vg-btn-chip" id="btn-clear-preset">Clear</button>
+          <div class="vg-compose-label-actions">
+            <button class="vg-btn-chip" id="btn-save-custom-style" title="Save current preset as a named style">
+              <svg width="9" height="9" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2v12M2 8h12"/></svg>
+              Save Style
+            </button>
+            <button class="vg-btn-chip" id="btn-clear-preset">Clear</button>
+          </div>
         </div>
         <div class="vg-style-scroll" id="vg-style-scroll">
           <!-- Injected by JS -->
+        </div>
+        <!-- #6 My Styles -->
+        <div id="vg-my-styles-section" style="display:none">
+          <div class="vg-my-styles-label">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+            My Styles
+          </div>
+          <div class="vg-style-scroll" id="vg-my-styles-scroll">
+            <!-- Injected by JS -->
+          </div>
         </div>
       </div>
 

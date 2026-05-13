@@ -717,8 +717,14 @@ function renderStylePresets() {
   `).join('');
 
   container.querySelectorAll('.vg-preset-chip').forEach(chip => {
-    chip.addEventListener('click', () => togglePreset(chip.dataset.presetId));
+    chip.addEventListener('click', () => {
+      togglePreset(chip.dataset.presetId);
+      saveProjectMemory(VG.activeProjectId);
+    });
   });
+
+  // #6 — also render saved custom styles
+  renderMyStyles();
 }
 
 function togglePreset(presetId) {
@@ -929,18 +935,28 @@ function renderProjectList() {
     return;
   }
 
-  container.innerHTML = VG.projects.map(p => `
+  const campaigns = loadCampaigns();
+
+  container.innerHTML = VG.projects.map(p => {
+    const camp = p.campaignId ? campaigns.find(c => c.id === p.campaignId) : null;
+    return `
     <button class="vg-project-item ${p.id === VG.activeProjectId ? 'active' : ''}"
             data-project-id="${p.id}">
       <span class="vg-project-item-pip"></span>
       <span class="vg-project-item-name">${escHtml(p.name)}</span>
-      <span class="vg-project-item-shots">${p.shot_count ?? 0} shots</span>
-    </button>
-  `).join('');
+      <span class="vg-project-item-right">
+        ${camp ? `<span class="vg-project-campaign-tag" title="Campaign: ${escAttr(camp.name)}"><svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg></span>` : ''}
+        <span class="vg-project-item-shots">${p.shot_count ?? 0}s</span>
+      </span>
+    </button>`;
+  }).join('');
 
   container.querySelectorAll('.vg-project-item').forEach(btn => {
     btn.addEventListener('click', () => selectProject(btn.dataset.projectId));
   });
+
+  // #8 — refresh campaign list alongside project list
+  renderCampaigns();
 }
 
 async function selectProject(id) {
@@ -963,6 +979,9 @@ async function selectProject(id) {
   if (!memoryRestored && project.default_model) {
     selectModel(project.default_model);
   }
+
+  // #7 — Bible active indicator
+  updateBibleIndicator(id);
 
   // #3 — Clear char lock when switching projects
   VG.lockedCharId     = null;
@@ -1470,6 +1489,17 @@ async function enhancePrompt() {
     };
     if (VG.selectedPreset) payload.style_preset = VG.selectedPreset;
 
+    // #7 — inject style bible from active project
+    const activeProject = VG.projects.find(p => p.id === VG.activeProjectId);
+    if (activeProject?.style_bible) {
+      const bible = typeof activeProject.style_bible === 'string'
+        ? tryParseJSON(activeProject.style_bible)
+        : activeProject.style_bible;
+      if (bible && Object.values(bible).some(v => v)) {
+        payload.style_bible = bible;
+      }
+    }
+
     const res  = await api('POST', '/api/enhance-prompt', payload);
     const data = await res.json();
 
@@ -1901,6 +1931,22 @@ function closeBibleModal() {
   $('bible-modal-overlay').classList.remove('open');
 }
 
+/* ── #7 BIBLE ACTIVE INDICATOR ────────────────────────────────── */
+function updateBibleIndicator(projectId) {  const dot = $('vg-bible-dot');
+  const tip = $('vg-bible-tip');
+  if (!dot) return;
+
+  const project = VG.projects.find(p => p.id === projectId);
+  const bible   = project?.style_bible;
+  const parsed  = bible
+    ? (typeof bible === 'string' ? tryParseJSON(bible) : bible)
+    : null;
+  const hasContent = parsed && Object.values(parsed).some(v => v && v.trim());
+
+  dot.style.display = hasContent ? 'inline-block' : 'none';
+  if (tip) tip.style.display = hasContent ? 'inline' : 'none';
+}
+
 async function saveBible() {
   if (!VG.activeProjectId) return;
 
@@ -1923,6 +1969,7 @@ async function saveBible() {
       const proj = VG.projects.find(p => p.id === VG.activeProjectId);
       if (proj) proj.style_bible = bible;
       closeBibleModal();
+      updateBibleIndicator(VG.activeProjectId);
       showToast('Style bible updated ✓');
     } else {
       showToast(data.error || 'Failed to save', true);
@@ -2368,7 +2415,281 @@ function applyProjectMemory(projectId) {
   return true;
 }
 
+/* ── #6 CUSTOM STYLE SYSTEMS ─────────────────────────────────── */
 
+const CUSTOM_STYLES_KEY = 'spectra_custom_styles';
+
+function loadCustomStyles() {
+  try {
+    return JSON.parse(localStorage.getItem(CUSTOM_STYLES_KEY) || '[]');
+  } catch { return []; }
+}
+
+function saveCustomStyles(styles) {
+  try {
+    localStorage.setItem(CUSTOM_STYLES_KEY, JSON.stringify(styles));
+  } catch {}
+}
+
+function renderMyStyles() {
+  const section = $('vg-my-styles-section');
+  const scroll  = $('vg-my-styles-scroll');
+  if (!section || !scroll) return;
+
+  const styles = loadCustomStyles();
+  if (styles.length === 0) {
+    section.style.display = 'none';
+    return;
+  }
+
+  section.style.display = 'block';
+  scroll.innerHTML = styles.map((s, idx) => `
+    <span class="vg-preset-chip vg-custom-style-chip ${s.presetId === VG.selectedPreset ? 'active' : ''}"
+          data-style-idx="${idx}" data-preset-id="${escAttr(s.presetId || '')}" title="${escAttr(s.name)}">
+      <span class="vg-preset-emoji">${s.emoji || '⭐'}</span>
+      <span class="vg-preset-label">${escHtml(s.name)}</span>
+      <button class="vg-custom-style-del" data-style-idx="${idx}" title="Delete style">×</button>
+    </span>
+  `).join('');
+
+  // Apply click — select preset
+  scroll.querySelectorAll('.vg-custom-style-chip').forEach(chip => {
+    chip.addEventListener('click', e => {
+      if (e.target.classList.contains('vg-custom-style-del')) return;
+      togglePreset(chip.dataset.presetId);
+      saveProjectMemory(VG.activeProjectId);
+    });
+  });
+
+  // Delete buttons
+  scroll.querySelectorAll('.vg-custom-style-del').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      deleteCustomStyle(parseInt(btn.dataset.styleIdx, 10));
+    });
+  });
+}
+
+function saveCustomStyle() {
+  if (!VG.selectedPreset) {
+    showToast('Select a built-in preset first, then save it as a named style', true);
+    return;
+  }
+
+  const preset = STYLE_PRESETS.find(p => p.id === VG.selectedPreset);
+  if (!preset) { showToast('Unknown preset', true); return; }
+
+  const styles  = loadCustomStyles();
+  const already = styles.find(s => s.presetId === VG.selectedPreset);
+  if (already) { showToast(`"${already.name}" already saved`, true); return; }
+
+  // Prompt for a custom name (prefill with preset label)
+  const name = window.prompt('Name this style:', preset.label);
+  if (!name || !name.trim()) return;
+
+  styles.push({
+    name:     name.trim(),
+    presetId: preset.id,
+    emoji:    preset.emoji,
+    savedAt:  Date.now(),
+  });
+  saveCustomStyles(styles);
+  renderMyStyles();
+  showToast(`Style "${name.trim()}" saved ✓`);
+}
+
+function deleteCustomStyle(idx) {
+  const styles = loadCustomStyles();
+  const name   = styles[idx]?.name || 'style';
+  if (!confirm(`Delete "${name}"?`)) return;
+  styles.splice(idx, 1);
+  saveCustomStyles(styles);
+  renderMyStyles();
+  showToast(`"${name}" deleted`);
+}
+
+/* ── #8 CAMPAIGN WORKFLOW ────────────────────────────────────── */
+
+const CAMPAIGN_KEY = 'spectra_campaigns';
+
+function loadCampaigns() {
+  try {
+    return JSON.parse(localStorage.getItem(CAMPAIGN_KEY) || '[]');
+  } catch { return []; }
+}
+
+function saveCampaigns(campaigns) {
+  try {
+    localStorage.setItem(CAMPAIGN_KEY, JSON.stringify(campaigns));
+  } catch {}
+}
+
+function renderCampaigns() {
+  const list = $('vg-campaign-list');
+  if (!list) return;
+
+  const campaigns = loadCampaigns();
+  if (campaigns.length === 0) {
+    list.innerHTML = '<div class="vg-campaign-empty">No campaigns yet</div>';
+    return;
+  }
+
+  list.innerHTML = campaigns.map((c, idx) => {
+    // Count projects assigned to this campaign
+    const assignedProjects = VG.projects.filter(p => p.campaignId === c.id);
+    const shotCount = assignedProjects.reduce((sum, p) => sum + (p.shot_count || 0), 0);
+    return `
+    <div class="vg-campaign-item" data-campaign-idx="${idx}" data-campaign-id="${escAttr(c.id)}">
+      <div class="vg-campaign-item-left">
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+        <span class="vg-campaign-name">${escHtml(c.name)}</span>
+      </div>
+      <div class="vg-campaign-item-right">
+        <span class="vg-campaign-meta">${assignedProjects.length}p · ${shotCount}s</span>
+        <button class="vg-campaign-export-btn" data-campaign-idx="${idx}" title="Export manifest">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        </button>
+        <button class="vg-campaign-del-btn" data-campaign-idx="${idx}" title="Delete campaign">×</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Click campaign to assign active project
+  list.querySelectorAll('.vg-campaign-item').forEach(item => {
+    item.addEventListener('click', e => {
+      if (e.target.closest('.vg-campaign-export-btn') || e.target.closest('.vg-campaign-del-btn')) return;
+      assignProjectToCampaign(item.dataset.campaignId);
+    });
+  });
+
+  // Export buttons
+  list.querySelectorAll('.vg-campaign-export-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      exportCampaign(parseInt(btn.dataset.campaignIdx, 10));
+    });
+  });
+
+  // Delete buttons
+  list.querySelectorAll('.vg-campaign-del-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      deleteCampaign(parseInt(btn.dataset.campaignIdx, 10));
+    });
+  });
+}
+
+function createCampaign(name) {
+  if (!name || !name.trim()) return;
+  const campaigns = loadCampaigns();
+  const newCamp = {
+    id:        `camp_${Date.now()}`,
+    name:      name.trim(),
+    createdAt: Date.now(),
+  };
+  campaigns.push(newCamp);
+  saveCampaigns(campaigns);
+  renderCampaigns();
+  showToast(`Campaign "${newCamp.name}" created`);
+  return newCamp;
+}
+
+function deleteCampaign(idx) {
+  const campaigns = loadCampaigns();
+  const name      = campaigns[idx]?.name || 'campaign';
+  if (!confirm(`Delete campaign "${name}"? Projects will not be deleted.`)) return;
+
+  const campId = campaigns[idx].id;
+  campaigns.splice(idx, 1);
+  saveCampaigns(campaigns);
+
+  // Unassign projects from this campaign
+  VG.projects.forEach(p => {
+    if (p.campaignId === campId) delete p.campaignId;
+  });
+
+  renderCampaigns();
+  showToast(`Campaign "${name}" deleted`);
+}
+
+function assignProjectToCampaign(campaignId) {
+  if (!VG.activeProjectId) {
+    showToast('Select a project first, then click a campaign to assign it', true);
+    return;
+  }
+  const project  = VG.projects.find(p => p.id === VG.activeProjectId);
+  const campaigns = loadCampaigns();
+  const camp     = campaigns.find(c => c.id === campaignId);
+  if (!project || !camp) return;
+
+  // Toggle — clicking same campaign unassigns
+  if (project.campaignId === campaignId) {
+    delete project.campaignId;
+    renderCampaigns();
+    renderProjectList();
+    showToast(`Removed "${project.name}" from campaign`);
+  } else {
+    project.campaignId = campaignId;
+    renderCampaigns();
+    renderProjectList();
+    showToast(`"${project.name}" → "${camp.name}" ✓`);
+  }
+}
+
+function exportCampaign(idx) {
+  const campaigns = loadCampaigns();
+  const camp      = campaigns[idx];
+  if (!camp) return;
+
+  const assignedProjects = VG.projects.filter(p => p.campaignId === camp.id);
+  if (assignedProjects.length === 0) {
+    showToast('No projects assigned to this campaign', true);
+    return;
+  }
+
+  const lines = [
+    `SPECTRA CAMPAIGN MANIFEST`,
+    `Campaign: ${camp.name}`,
+    `Exported: ${new Date().toISOString()}`,
+    `Projects: ${assignedProjects.length}`,
+    `═`.repeat(60),
+    '',
+  ];
+
+  assignedProjects.forEach(project => {
+    lines.push(`PROJECT: ${project.name}`);
+    lines.push(`  Model: ${project.default_model || '—'}`);
+    lines.push(`  Style Bible: ${project.style_bible ? JSON.stringify(project.style_bible) : '—'}`);
+
+    const shots = VG.shots[project.id] || [];
+    if (shots.length === 0) {
+      lines.push(`  Shots: (none loaded — select this project to load)`);
+    } else {
+      shots.forEach((shot, i) => {
+        lines.push(`  Shot ${i + 1}:`);
+        lines.push(`    Status:  ${shot.status}`);
+        lines.push(`    Model:   ${shot.model || '—'}`);
+        lines.push(`    Prompt:  ${(shot.prompt || '').replace(/\n/g, ' ')}`);
+        if (shot.video_url || shot.hf_video_url) {
+          lines.push(`    URL:     ${shot.video_url || shot.hf_video_url}`);
+        }
+      });
+    }
+    lines.push('');
+  });
+
+  const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = `spectra_campaign_${camp.name.replace(/\s+/g, '_')}.txt`;
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast(`Manifest exported for "${camp.name}"`);
+}
+
+/* ── trainCharacterSoul (hoisted here from orphaned block) ──── */
+async function trainCharacterSoul(charId) {
   if (!VG.activeProjectId) return;
   const btn = document.querySelector(`[data-char-id="${charId}"].vg-char-train-btn`);
   if (btn) { btn.disabled = true; btn.textContent = 'Training…'; }
@@ -2460,6 +2781,38 @@ function bindUI() {
 
   // #3 — Character lock clear button
   $('btn-char-lock-clear')?.addEventListener('click', clearCharLock);
+
+  // #6 — Save custom style
+  $('btn-save-custom-style')?.addEventListener('click', saveCustomStyle);
+
+  // #8 — Campaign workflow
+  $('btn-new-campaign')?.addEventListener('click', () => {
+    const row = $('vg-campaign-new-row');
+    if (row) {
+      row.style.display = 'flex';
+      $('vg-campaign-name-input')?.focus();
+    }
+  });
+  $('btn-campaign-cancel')?.addEventListener('click', () => {
+    const row = $('vg-campaign-new-row');
+    if (row) row.style.display = 'none';
+    const inp = $('vg-campaign-name-input');
+    if (inp) inp.value = '';
+  });
+  $('btn-campaign-save')?.addEventListener('click', () => {
+    const inp = $('vg-campaign-name-input');
+    if (!inp) return;
+    const name = inp.value.trim();
+    if (!name) { inp.focus(); return; }
+    createCampaign(name);
+    inp.value = '';
+    const row = $('vg-campaign-new-row');
+    if (row) row.style.display = 'none';
+  });
+  $('vg-campaign-name-input')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter') $('btn-campaign-save')?.click();
+    if (e.key === 'Escape') $('btn-campaign-cancel')?.click();
+  });
 
   // #5 — Save memory on aspect/duration/model change
   $$('.vg-aspect-btn').forEach(btn => {
