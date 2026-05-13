@@ -331,9 +331,16 @@ async function hfCheckStatus(request_id: string, credentials: string): Promise<{
    OPENAI CLIENT
 ══════════════════════════════════════════════════════════════════ */
 function getAIClient(env: Bindings): OpenAI {
+  const baseURL = env?.OPENAI_BASE_URL || 'https://api.openai.com/v1'
+  const isOpenRouter = baseURL.includes('openrouter.ai')
   return new OpenAI({
     apiKey:  env?.OPENAI_API_KEY  || '',
-    baseURL: env?.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+    baseURL,
+    // OpenRouter requires these headers to identify the app and avoid 403s
+    defaultHeaders: isOpenRouter ? {
+      'HTTP-Referer': 'https://spectra-b8s.pages.dev',
+      'X-Title':      'Spectra',
+    } : {},
   })
 }
 
