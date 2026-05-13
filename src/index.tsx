@@ -1597,6 +1597,87 @@ app.post('/api/enhance-prompt', requireAuth, async (c) => {
   }
 })
 
+/* ══════════════════════════════════════════════════════════════════
+   #10 AI CREATIVE DIRECTOR — POST /api/director
+   Converts a scene concept into a structured shot list via GPT-4o
+══════════════════════════════════════════════════════════════════ */
+app.post('/api/director', requireAuth, async (c) => {
+  try {
+    const {
+      concept,
+      style_bible,
+      aspect_ratio = '16:9',
+      shot_count   = 4,
+    } = await c.req.json()
+
+    if (!concept?.trim()) return c.json({ error: 'Concept required' }, 400)
+
+    const ai = getAIClient(c.env)
+
+    const bibleContext = style_bible
+      ? `\nProject style bible: ${typeof style_bible === 'string' ? style_bible : JSON.stringify(style_bible)}`
+      : ''
+
+    const systemPrompt = `You are a world-class AI video director. A user gives you a scene concept and you break it down into ${shot_count} production-ready individual shots for an AI video generator.
+
+For each shot return a JSON object with EXACTLY these fields:
+- "shot": shot number (1..${shot_count})
+- "label": short shot name (≤6 words, e.g. "Hero Arrives" or "Close-Up Product")
+- "prompt": rich, cinematic, production-ready prompt (80-140 words) including subject, action, camera movement, lighting, atmosphere, depth of field
+- "model": the best model ID from this list for the shot:
+    "higgsfield-ai/dop/standard" (all-round i2v)
+    "higgsfield-ai/dop/turbo" (max quality i2v)
+    "higgsfield-ai/dop/lite" (fast i2v draft)
+    "kling-video/v2.1/pro/image-to-video" (cinematic premium i2v)
+    "bytedance/seedance/v1/pro/image-to-video" (high fidelity i2v)
+    "flux-pro/kontext/max/text-to-image" (text-to-image, no ref needed)
+- "aspect_ratio": "16:9", "9:16", or "1:1" — match the mood
+- "duration": 5, 8, or 10 — in seconds
+- "requires_image": true if model needs a reference image, false otherwise
+- "director_note": 1-sentence creative note explaining the shot choice${bibleContext}
+
+Return ONLY a JSON array of ${shot_count} shot objects. No prose, no markdown, no explanation.`
+
+    const resp = await ai.chat.completions.create({
+      model:       'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: concept.trim() },
+      ],
+      temperature:     0.8,
+      max_tokens:      2000,
+      response_format: { type: 'json_object' },
+    })
+
+    let raw = resp.choices[0]?.message?.content?.trim() || '[]'
+
+    // GPT sometimes wraps in {"shots":[...]} — unwrap
+    let shots: any[]
+    try {
+      const parsed = JSON.parse(raw)
+      shots = Array.isArray(parsed) ? parsed : (parsed.shots || parsed.shot_list || Object.values(parsed)[0] || [])
+    } catch {
+      return c.json({ error: 'Director failed to parse shot list' }, 500)
+    }
+
+    // Clamp and sanitise
+    shots = shots.slice(0, shot_count).map((s: any, i: number) => ({
+      shot:           s.shot           ?? i + 1,
+      label:          String(s.label   ?? `Shot ${i + 1}`).slice(0, 60),
+      prompt:         String(s.prompt  ?? '').slice(0, 400),
+      model:          String(s.model   ?? 'higgsfield-ai/dop/standard'),
+      aspect_ratio:   ['16:9','9:16','1:1'].includes(s.aspect_ratio) ? s.aspect_ratio : '16:9',
+      duration:       [5,8,10].includes(Number(s.duration)) ? Number(s.duration) : 5,
+      requires_image: Boolean(s.requires_image ?? true),
+      director_note:  String(s.director_note ?? '').slice(0, 200),
+    }))
+
+    return c.json({ shots, concept: concept.trim() })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
 // POST /api/upload — upload reference image to R2, return public URL
 app.post('/api/upload', requireAuth, async (c) => {
   try {
@@ -2134,6 +2215,14 @@ function videoGeneratorPage(): string {
 
     <!-- COMPOSE PANEL (generation form) -->
     <div id="vg-compose">
+      <!-- Compose header row with Director toggle -->
+      <div class="vg-compose-top-bar">
+        <span class="vg-compose-top-label">Compose Shot</span>
+        <button class="vg-btn-chip vg-director-toggle-btn" id="btn-open-director" title="AI Creative Director — generate a full shot list from a concept">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/></svg>
+          Director
+        </button>
+      </div>
 
       <!-- Image upload zone -->
       <div class="vg-compose-block" id="vg-image-block">
@@ -2278,6 +2367,47 @@ function videoGeneratorPage(): string {
       </div>
 
     </div><!-- /vg-compose -->
+
+    <!-- #10 AI CREATIVE DIRECTOR PANEL -->
+    <div id="vg-director-panel" style="display:none">
+      <div class="vg-director-header">
+        <div class="vg-director-title">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/></svg>
+          AI Creative Director
+        </div>
+        <button class="vg-btn-chip" id="btn-close-director">✕</button>
+      </div>
+      <div class="vg-director-body">
+        <div class="vg-director-concept-wrap">
+          <textarea id="vg-director-concept" class="vg-textarea vg-director-textarea" rows="3"
+            placeholder="Describe your scene or concept in plain language…&#10;&#10;e.g. A luxury perfume ad — golden deserts, a woman in flowing white silk, dramatic light"
+            maxlength="500"></textarea>
+          <div class="vg-director-controls">
+            <select class="vg-input vg-director-count-select" id="vg-director-shot-count">
+              <option value="3">3 shots</option>
+              <option value="4" selected>4 shots</option>
+              <option value="5">5 shots</option>
+            </select>
+            <button class="vg-btn-generate vg-director-run-btn" id="btn-director-run">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/></svg>
+              Generate Shot List
+            </button>
+          </div>
+        </div>
+        <div id="vg-director-results" style="display:none">
+          <div class="vg-director-results-header">
+            <span id="vg-director-concept-label"></span>
+            <button class="vg-btn-chip" id="btn-director-queue-all">Queue All</button>
+          </div>
+          <div id="vg-director-shots"><!-- Injected by JS --></div>
+        </div>
+        <div id="vg-director-loading" style="display:none" class="vg-director-loading">
+          <span class="vg-spin-lg"></span>
+          <span>Director is planning your shots…</span>
+        </div>
+        <div id="vg-director-error" class="vg-director-error" style="display:none"></div>
+      </div>
+    </div><!-- /vg-director-panel -->
 
     <!-- STORYBOARD PANEL -->
     <div id="vg-storyboard">

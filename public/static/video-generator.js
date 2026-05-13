@@ -1069,6 +1069,7 @@ function renderShotGrid(projectId) {
       if (action === 'copy')     copyPrompt(shotId, projectId);
       if (action === 'download') downloadShot(shotId, projectId);
       if (action === 'play')     playShot(shotId, projectId);
+      if (action === 'continue') continueFromShot(el);
     });
   });
 
@@ -1175,6 +1176,11 @@ function renderShotCard(shot, draggable = false) {
         <div class="vg-shot-meta">
           <span class="vg-shot-time">${timeAgo(shot.created_at)}</span>
           <div class="vg-shot-actions">
+            ${videoUrl ? `
+            <button class="vg-shot-action-btn vg-shot-continue-btn" data-shot-id="${shot.id}" data-action="continue" data-video-url="${escAttr(videoUrl)}" data-prompt="${escAttr(shot.prompt || '')}" title="Continue from last frame — use final frame as next reference">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="5 9 2 12 5 15"/><path d="M22 4v7a4 4 0 01-4 4H2"/></svg>
+              Continue
+            </button>` : ''}
             <button class="vg-shot-action-btn" data-shot-id="${shot.id}" data-action="copy" title="Copy prompt">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
             </button>
@@ -2717,6 +2723,384 @@ async function deleteCharacter(charId, projectId) {
   }
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   #9 MULTI-SHOT CONTINUITY
+   "Continue from last frame" — captures final video frame via
+   canvas, uploads to R2, pre-fills compose as next reference
+   ═══════════════════════════════════════════════════════════════ */
+
+async function continueFromShot(btn) {
+  const videoUrl = btn.dataset.videoUrl;
+  const prompt   = btn.dataset.prompt || '';
+
+  if (!videoUrl) { showToast('No video URL on this shot', true); return; }
+
+  btn.disabled  = true;
+  btn.innerHTML = `<span class="vg-spinner"></span>`;
+
+  try {
+    // Extract last frame using a hidden video + canvas
+    const frameBlob = await extractLastFrame(videoUrl);
+    if (!frameBlob) throw new Error('Frame capture failed');
+
+    // Upload to R2 via /api/upload
+    const formData = new FormData();
+    formData.append('file', frameBlob, 'last_frame.jpg');
+
+    const res  = await fetch('/api/upload', { method: 'POST', credentials: 'include', body: formData });
+    const data = await res.json();
+
+    if (!res.ok) throw new Error(data.error || 'Upload failed');
+
+    // Pre-fill compose panel
+    VG.uploadedImageKey = data.key;
+    VG.uploadedImageUrl = data.absoluteUrl || (window.location.origin + data.url);
+    showUploadPreview(data.url);
+
+    // Clear char lock (frame replaces it)
+    VG.lockedCharId     = null;
+    VG.lockedCharName   = null;
+    VG.lockedCharAvatar = null;
+    renderCharLockBanner();
+
+    // Scroll compose into view
+    const compose = $('vg-compose');
+    if (compose) compose.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+    showToast('Last frame loaded as reference — write your next shot prompt ✓');
+  } catch (err) {
+    showToast(err.message || 'Continue failed', true);
+  } finally {
+    btn.disabled  = false;
+    btn.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="5 9 2 12 5 15"/><path d="M22 4v7a4 4 0 01-4 4H2"/></svg> Continue`;
+  }
+}
+
+function extractLastFrame(videoUrl) {
+  return new Promise((resolve) => {
+    const video  = document.createElement('video');
+    const canvas = document.createElement('canvas');
+    const ctx    = canvas.getContext('2d');
+
+    video.crossOrigin = 'anonymous';
+    video.muted       = true;
+    video.preload     = 'metadata';
+    video.src         = videoUrl;
+
+    video.addEventListener('loadedmetadata', () => {
+      // Seek to near the end (last 0.1s)
+      video.currentTime = Math.max(0, video.duration - 0.1);
+    });
+
+    video.addEventListener('seeked', () => {
+      canvas.width  = video.videoWidth  || 1280;
+      canvas.height = video.videoHeight || 720;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(blob => resolve(blob), 'image/jpeg', 0.92);
+    });
+
+    video.addEventListener('error', () => resolve(null));
+
+    // Timeout safety
+    setTimeout(() => resolve(null), 10000);
+
+    video.load();
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   #10 AI CREATIVE DIRECTOR
+   Scene concept → structured shot list via GPT-4o
+   One-click queue any suggested shot
+   ═══════════════════════════════════════════════════════════════ */
+
+// Director state
+const DIRECTOR = {
+  shots:   [],
+  concept: '',
+  loading: false,
+};
+
+function openDirectorPanel() {
+  const compose  = $('vg-compose');
+  const director = $('vg-director-panel');
+  if (!compose || !director) return;
+
+  compose.style.display  = 'none';
+  director.style.display = 'flex';
+  $('vg-director-concept')?.focus();
+}
+
+function closeDirectorPanel() {
+  const compose  = $('vg-compose');
+  const director = $('vg-director-panel');
+  if (!compose || !director) return;
+
+  director.style.display = 'none';
+  compose.style.display  = 'flex';
+}
+
+async function runDirector() {
+  if (DIRECTOR.loading) return;
+  if (!VG.activeProjectId) {
+    showToast('Select a project first', true);
+    return;
+  }
+
+  const concept = $('vg-director-concept')?.value.trim();
+  if (!concept) { showToast('Describe a scene concept first', true); return; }
+
+  const shotCount = parseInt($('vg-director-shot-count')?.value || '4', 10);
+
+  // Get style bible from active project
+  const activeProject = VG.projects.find(p => p.id === VG.activeProjectId);
+  const bible = activeProject?.style_bible
+    ? (typeof activeProject.style_bible === 'string'
+        ? tryParseJSON(activeProject.style_bible)
+        : activeProject.style_bible)
+    : null;
+
+  DIRECTOR.loading = true;
+  const btn = $('btn-director-run');
+  if (btn) { btn.disabled = true; btn.innerHTML = `<span class="vg-spinner"></span> Directing…`; }
+
+  $('vg-director-results').style.display  = 'none';
+  $('vg-director-loading').style.display  = 'flex';
+  $('vg-director-error').style.display    = 'none';
+
+  try {
+    const payload = { concept, shot_count: shotCount };
+    if (bible && Object.values(bible).some(v => v)) payload.style_bible = bible;
+
+    const res  = await api('POST', '/api/director', payload);
+    const data = await res.json();
+
+    if (!res.ok || !data.shots?.length) {
+      throw new Error(data.error || 'Director returned no shots');
+    }
+
+    DIRECTOR.shots   = data.shots;
+    DIRECTOR.concept = concept;
+    renderDirectorShots();
+
+  } catch (err) {
+    const errEl = $('vg-director-error');
+    if (errEl) { errEl.textContent = err.message; errEl.style.display = 'block'; }
+  } finally {
+    DIRECTOR.loading = false;
+    $('vg-director-loading').style.display = 'none';
+    if (btn) {
+      btn.disabled  = false;
+      btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8" fill="currentColor" stroke="none"/></svg> Generate Shot List`;
+    }
+  }
+}
+
+function renderDirectorShots() {
+  const container = $('vg-director-shots');
+  const results   = $('vg-director-results');
+  const label     = $('vg-director-concept-label');
+
+  if (!container || !results) return;
+
+  if (label) label.textContent = `"${DIRECTOR.concept.slice(0, 60)}${DIRECTOR.concept.length > 60 ? '…' : ''}"`;
+
+  const MODEL_SHORT = {
+    'higgsfield-ai/dop/standard':                  'DoP Std',
+    'higgsfield-ai/dop/turbo':                     'DoP Turbo',
+    'higgsfield-ai/dop/lite':                      'DoP Lite',
+    'kling-video/v2.1/pro/image-to-video':         'Kling Pro',
+    'kling-video/v2.1/standard/image-to-video':    'Kling Std',
+    'bytedance/seedance/v1/pro/image-to-video':    'Seedance',
+    'bytedance/seedance/v1/lite/image-to-video':   'Seedance Lite',
+    'higgsfield-ai/soul/standard':                 'Soul',
+    'flux-pro/kontext/max/text-to-image':          'Flux Kontext',
+  };
+
+  container.innerHTML = DIRECTOR.shots.map((s, idx) => `
+    <div class="vg-director-shot-card" data-idx="${idx}">
+      <div class="vg-dsc-top">
+        <span class="vg-dsc-num">Shot ${s.shot}</span>
+        <span class="vg-dsc-label">${escHtml(s.label)}</span>
+        <div class="vg-dsc-badges">
+          <span class="vg-dsc-badge">${escHtml(MODEL_SHORT[s.model] || s.model.split('/').pop())}</span>
+          <span class="vg-dsc-badge">${escHtml(s.aspect_ratio)}</span>
+          <span class="vg-dsc-badge">${s.duration}s</span>
+          ${s.requires_image ? `<span class="vg-dsc-badge vg-dsc-badge-img">needs ref</span>` : `<span class="vg-dsc-badge vg-dsc-badge-t2v">text→video</span>`}
+        </div>
+      </div>
+      <p class="vg-dsc-prompt">${escHtml(s.prompt)}</p>
+      ${s.director_note ? `<p class="vg-dsc-note">🎬 ${escHtml(s.director_note)}</p>` : ''}
+      <div class="vg-dsc-actions">
+        <button class="vg-btn-chip vg-dsc-load-btn" data-idx="${idx}">
+          Load into Compose
+        </button>
+        <button class="vg-btn-primary vg-dsc-queue-btn" data-idx="${idx}">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          Queue Shot
+        </button>
+      </div>
+    </div>
+  `).join('');
+
+  // Bind buttons
+  container.querySelectorAll('.vg-dsc-load-btn').forEach(btn => {
+    btn.addEventListener('click', () => loadDirectorShotToCompose(parseInt(btn.dataset.idx, 10)));
+  });
+  container.querySelectorAll('.vg-dsc-queue-btn').forEach(btn => {
+    btn.addEventListener('click', () => queueDirectorShot(parseInt(btn.dataset.idx, 10), btn));
+  });
+
+  results.style.display = 'block';
+}
+
+function loadDirectorShotToCompose(idx) {
+  const shot = DIRECTOR.shots[idx];
+  if (!shot) return;
+
+  // Pre-fill prompt
+  const textarea = $('vg-prompt');
+  if (textarea) { textarea.value = shot.prompt; updateCharCount(); }
+
+  // Set model
+  selectModel(shot.model);
+
+  // Set aspect ratio
+  $$('.vg-aspect-btn').forEach(b => b.classList.toggle('active', b.dataset.aspect === shot.aspect_ratio));
+  VG.selectedAspect = shot.aspect_ratio;
+
+  // Set duration
+  $$('.vg-dur-btn').forEach(b => b.classList.toggle('active', parseInt(b.dataset.dur) === shot.duration));
+  VG.selectedDur = shot.duration;
+
+  // Switch to compose panel
+  closeDirectorPanel();
+  showToast(`Shot ${shot.shot}: "${shot.label}" loaded — add a reference image and generate`);
+}
+
+async function queueDirectorShot(idx, btn) {
+  const shot = DIRECTOR.shots[idx];
+  if (!shot) return;
+  if (!VG.activeProjectId) { showToast('Select a project first', true); return; }
+
+  // For i2v models, we need a reference image — load to compose instead
+  if (shot.requires_image && !VG.uploadedImageUrl) {
+    loadDirectorShotToCompose(idx);
+    showToast('Reference image required — upload one then click Generate Shot', true);
+    return;
+  }
+
+  btn.disabled  = true;
+  btn.innerHTML = `<span class="vg-spinner"></span> Queuing…`;
+
+  try {
+    const payload = {
+      project_id:   VG.activeProjectId,
+      prompt:       shot.prompt,
+      model:        shot.model,
+      aspect_ratio: shot.aspect_ratio,
+      duration:     shot.duration,
+      enhance_mode: 'cinematic',
+    };
+
+    if (VG.uploadedImageUrl && shot.requires_image) payload.image_url = VG.uploadedImageUrl;
+
+    const res  = await api('POST', '/api/generate', payload);
+    const data = await res.json();
+
+    if (!res.ok) throw new Error(data.error || 'Generation failed');
+
+    // Add to local shots
+    const newShot = {
+      id:           data.shot_id,
+      project_id:   VG.activeProjectId,
+      prompt:       shot.prompt,
+      model:        shot.model,
+      aspect_ratio: shot.aspect_ratio,
+      duration:     shot.duration,
+      status:       data.status || 'queued',
+      created_at:   new Date().toISOString(),
+    };
+    if (!VG.shots[VG.activeProjectId]) VG.shots[VG.activeProjectId] = [];
+    VG.shots[VG.activeProjectId].unshift(newShot);
+
+    // Show storyboard
+    $('vg-empty').style.display    = 'none';
+    $('vg-shot-grid').style.display = 'grid';
+    renderShotGrid(VG.activeProjectId);
+    if (newShot.id) startPolling(newShot.id, VG.activeProjectId);
+
+    btn.innerHTML = `✓ Queued`;
+    btn.classList.add('vg-dsc-btn-done');
+    showToast(`Shot ${shot.shot} queued ✓`);
+  } catch (err) {
+    showToast(err.message, true);
+    btn.disabled  = false;
+    btn.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg> Queue Shot`;
+  }
+}
+
+async function queueAllDirectorShots() {
+  if (!DIRECTOR.shots.length) return;
+  if (!VG.activeProjectId) { showToast('Select a project first', true); return; }
+
+  const btn = $('btn-director-queue-all');
+  if (btn) { btn.disabled = true; btn.textContent = 'Queuing…'; }
+
+  let queued = 0;
+  for (let i = 0; i < DIRECTOR.shots.length; i++) {
+    const shot = DIRECTOR.shots[i];
+    // Skip i2v shots without a reference image
+    if (shot.requires_image && !VG.uploadedImageUrl) continue;
+
+    try {
+      const payload = {
+        project_id:   VG.activeProjectId,
+        prompt:       shot.prompt,
+        model:        shot.model,
+        aspect_ratio: shot.aspect_ratio,
+        duration:     shot.duration,
+        enhance_mode: 'cinematic',
+      };
+      if (VG.uploadedImageUrl && shot.requires_image) payload.image_url = VG.uploadedImageUrl;
+
+      const res  = await api('POST', '/api/generate', payload);
+      const data = await res.json();
+      if (!res.ok) continue;
+
+      const newShot = {
+        id:           data.shot_id,
+        project_id:   VG.activeProjectId,
+        prompt:       shot.prompt,
+        model:        shot.model,
+        aspect_ratio: shot.aspect_ratio,
+        duration:     shot.duration,
+        status:       data.status || 'queued',
+        created_at:   new Date().toISOString(),
+      };
+      if (!VG.shots[VG.activeProjectId]) VG.shots[VG.activeProjectId] = [];
+      VG.shots[VG.activeProjectId].unshift(newShot);
+      if (newShot.id) startPolling(newShot.id, VG.activeProjectId);
+
+      // Mark button done
+      const shotBtn = document.querySelector(`.vg-dsc-queue-btn[data-idx="${i}"]`);
+      if (shotBtn) { shotBtn.innerHTML = '✓ Queued'; shotBtn.classList.add('vg-dsc-btn-done'); shotBtn.disabled = true; }
+
+      queued++;
+    } catch {}
+
+    // Small delay to avoid hammering the API
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  $('vg-empty').style.display    = 'none';
+  $('vg-shot-grid').style.display = 'grid';
+  renderShotGrid(VG.activeProjectId);
+
+  if (btn) { btn.disabled = false; btn.textContent = `${queued} queued ✓`; }
+  showToast(`${queued} shot${queued !== 1 ? 's' : ''} queued from Director ✓`);
+}
+
 function bindUI() {
   // Auth tabs
   $$('.vg-auth-tab').forEach(tab => {
@@ -2908,7 +3292,17 @@ function bindUI() {
       closePlayer();
       closeCharModal();
       closeUpgradeModal();
+      closeDirectorPanel();
     }
+  });
+
+  // #10 — AI Creative Director
+  $('btn-open-director')?.addEventListener('click', openDirectorPanel);
+  $('btn-close-director')?.addEventListener('click', closeDirectorPanel);
+  $('btn-director-run')?.addEventListener('click', runDirector);
+  $('btn-director-queue-all')?.addEventListener('click', queueAllDirectorShots);
+  $('vg-director-concept')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) runDirector();
   });
 
   // Init upload zone
