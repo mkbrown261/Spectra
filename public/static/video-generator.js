@@ -1,10 +1,125 @@
 /* ════════════════════════════════════════════════════════════════
-   SPECTRA — VIDEO GENERATOR FRONTEND
-   Complete rewrite for auth-gated, project-based AI filmmaking
-   Auth → Projects → Generate → Poll → Shot Grid
+   SPECTRA — VIDEO GENERATOR FRONTEND  v2.0  (Studio Upgrade)
+   Auth → Projects → Generate → Poll → Storyboard
+   New: Model cards · Image upload · Style presets · Seed control
+        Quality sliders · Enhance modes · Storyboard view toggle
    ════════════════════════════════════════════════════════════════ */
 
 'use strict';
+
+/* ── STYLE PRESETS (mirrors backend STYLE_PRESETS) ───────────── */
+const STYLE_PRESETS = [
+  { id: 'neon_noir',         label: 'Neon Noir',          emoji: '🌃' },
+  { id: 'golden_hour',       label: 'Golden Hour',         emoji: '🌅' },
+  { id: 'studio_clean',      label: 'Studio Clean',        emoji: '💡' },
+  { id: 'analog_grain',      label: 'Analog Film',         emoji: '📽' },
+  { id: 'arctic_cold',       label: 'Arctic Cold',         emoji: '❄️' },
+  { id: 'hyperreal',         label: 'Hyperreal',           emoji: '🔬' },
+  { id: 'dreamlike',         label: 'Dreamlike',           emoji: '🌙' },
+  { id: 'brutalist',         label: 'Brutalist',           emoji: '🏗' },
+  { id: 'sunset_epic',       label: 'Sunset Epic',         emoji: '🔥' },
+  { id: 'underwater',        label: 'Underwater',          emoji: '🌊' },
+  { id: 'infrared',          label: 'Infrared',            emoji: '🔴' },
+  { id: 'fashion_editorial', label: 'Fashion Editorial',   emoji: '✨' },
+  { id: 'horror_dread',      label: 'Horror Dread',        emoji: '🕷' },
+  { id: 'retro_wave',        label: 'Retrowave',           emoji: '🌐' },
+  { id: 'nature_epic',       label: 'Nature Epic',         emoji: '🏔' },
+  { id: 'minimalist',        label: 'Minimalist',          emoji: '⬜' },
+  { id: 'smoke_haze',        label: 'Smoke & Haze',        emoji: '💨' },
+  { id: 'raw_documentary',   label: 'Documentary',         emoji: '🎥' },
+  { id: 'sci_fi_clinical',   label: 'Sci-Fi Clinical',     emoji: '🤖' },
+  { id: 'western_dust',      label: 'Western Dust',        emoji: '🤠' },
+];
+
+/* ── MODEL DATA (mirrors backend HF_MODELS) ──────────────────── */
+const HF_MODELS_DATA = [
+  {
+    id:             'higgsfield-ai/dop/lite',
+    label:          'DoP Lite',
+    desc:           'Fast image-to-video. Great for iterations.',
+    speed:          'Fast',
+    speedClass:     'fast',
+    type:           'i2v',
+    requires_image: true,
+  },
+  {
+    id:             'higgsfield-ai/dop/standard',
+    label:          'DoP Standard',
+    desc:           'Balanced quality & speed. Best all-rounder.',
+    speed:          'Balanced',
+    speedClass:     'balanced',
+    type:           'i2v',
+    requires_image: true,
+  },
+  {
+    id:             'higgsfield-ai/dop/turbo',
+    label:          'DoP Turbo',
+    desc:           'Maximum quality DoP generation.',
+    speed:          'Quality',
+    speedClass:     'quality',
+    type:           'i2v',
+    requires_image: true,
+  },
+  {
+    id:             'kling-video/v2.1/pro/image-to-video',
+    label:          'Kling 2.1 Pro',
+    desc:           'Kling Pro — premium cinematic motion.',
+    speed:          'Quality',
+    speedClass:     'quality',
+    type:           'i2v',
+    requires_image: true,
+  },
+  {
+    id:             'kling-video/v2.1/standard/image-to-video',
+    label:          'Kling 2.1 Std',
+    desc:           'Kling Standard — fast, reliable motion.',
+    speed:          'Balanced',
+    speedClass:     'balanced',
+    type:           'i2v',
+    requires_image: true,
+  },
+  {
+    id:             'bytedance/seedance/v1/pro/image-to-video',
+    label:          'Seedance Pro',
+    desc:           'ByteDance Seedance Pro. High fidelity.',
+    speed:          'Quality',
+    speedClass:     'quality',
+    type:           'i2v',
+    requires_image: true,
+  },
+  {
+    id:             'bytedance/seedance/v1/lite/image-to-video',
+    label:          'Seedance Lite',
+    desc:           'Seedance Lite — quick draft generations.',
+    speed:          'Fast',
+    speedClass:     'fast',
+    type:           'i2v',
+    requires_image: true,
+  },
+  {
+    id:             'higgsfield-ai/soul/standard',
+    label:          'Soul',
+    desc:           'Text-to-image generation. No image needed.',
+    speed:          'Balanced',
+    speedClass:     'balanced',
+    type:           't2v',
+    requires_image: false,
+  },
+  {
+    id:             'flux-pro/kontext/max/text-to-image',
+    label:          'Flux Kontext',
+    desc:           'Flux Pro — highest-detail image generation.',
+    speed:          'Quality',
+    speedClass:     'quality',
+    type:           't2v',
+    requires_image: false,
+  },
+];
+
+/* ── MODELS REQUIRING IMAGE ──────────────────────────────────── */
+const I2V_MODELS = new Set(
+  HF_MODELS_DATA.filter(m => m.requires_image).map(m => m.id)
+);
 
 /* ── STATE ───────────────────────────────────────────────────── */
 const VG = {
@@ -14,9 +129,30 @@ const VG = {
   shots:           {},     // { [projectId]: Shot[] }
   pollTimers:      {},     // { [shotId]: intervalId }
   authMode:        'login',
+
+  // Selection state
+  selectedModel:   'higgsfield-ai/dop/standard',
   selectedAspect:  '16:9',
   selectedDur:     5,
-  generating:      false,
+
+  // New v2 state
+  enhanceMode:     'cinematic',
+  selectedPreset:  null,   // style preset id
+  seedLocked:      false,
+  uploadedImageKey: null,  // R2 key after upload
+  uploadedImageUrl: null,  // /api/image/<key> or pasted URL
+
+  // Quality sliders
+  quality: {
+    motion: 5,
+    style:  5,
+    detail: 7,
+  },
+
+  // View
+  storyboardView: 'grid', // 'grid' | 'strip'
+
+  generating: false,
 };
 
 /* ── DOM REFS ────────────────────────────────────────────────── */
@@ -26,16 +162,22 @@ const $$ = (sel) => document.querySelectorAll(sel);
 /* ── INIT ────────────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', () => {
   bindUI();
+  renderModelCards();
+  renderStylePresets();
+  initViewSwitcher();
+  initAnalyticsControls();
   checkSession();
 });
 
-/* ── SESSION CHECK ───────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   SESSION / AUTH
+   ═══════════════════════════════════════════════════════════════ */
+
 async function checkSession() {
   try {
     const res  = await api('GET', '/api/auth/me');
     const data = await res.json();
     if (res.ok && data.id) {
-      // /api/auth/me returns { id, email, tier, credits, limits } directly
       VG.user = { id: data.id, email: data.email, tier: data.tier, credits: data.credits };
       enterApp();
     } else {
@@ -46,18 +188,6 @@ async function checkSession() {
   }
 }
 
-/* ── API HELPER ──────────────────────────────────────────────── */
-function api(method, path, body) {
-  const opts = {
-    method,
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-  };
-  if (body !== undefined) opts.body = JSON.stringify(body);
-  return fetch(path, opts);
-}
-
-/* ── AUTH GATE ───────────────────────────────────────────────── */
 function showAuthGate() {
   $('vg-auth-gate').style.display = 'flex';
   $('vg-app').style.display       = 'none';
@@ -94,16 +224,16 @@ async function handleAuth(e) {
     const data     = await res.json();
 
     if (!res.ok) {
-      errEl.textContent     = data.error || 'Something went wrong';
-      errEl.style.display   = 'block';
-      btn.disabled          = false;
-      btn.textContent       = VG.authMode === 'login' ? 'Sign In' : 'Create Account';
+      errEl.textContent   = data.error || 'Something went wrong';
+      errEl.style.display = 'block';
+      btn.disabled        = false;
+      btn.textContent     = VG.authMode === 'login' ? 'Sign In' : 'Create Account';
       return;
     }
 
     VG.user = data.user;
     enterApp();
-  } catch (err) {
+  } catch {
     errEl.textContent   = 'Network error — please try again';
     errEl.style.display = 'block';
     btn.disabled        = false;
@@ -111,7 +241,6 @@ async function handleAuth(e) {
   }
 }
 
-/* ── ENTER APP ───────────────────────────────────────────────── */
 async function enterApp() {
   hideAuthGate();
   updateKeyDot();
@@ -122,9 +251,7 @@ async function enterApp() {
   ]);
 }
 
-/* ── LOGOUT ──────────────────────────────────────────────────── */
 async function logout() {
-  // Stop all polls
   Object.values(VG.pollTimers).forEach(id => clearInterval(id));
   VG.pollTimers = {};
 
@@ -138,25 +265,39 @@ async function logout() {
   showAuthGate();
 }
 
-/* ── KEY STATUS ──────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   API HELPER
+   ═══════════════════════════════════════════════════════════════ */
+
+function api(method, path, body) {
+  const opts = {
+    method,
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+  };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  return fetch(path, opts);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   KEY STATUS
+   ═══════════════════════════════════════════════════════════════ */
+
 async function checkKeyStatus() {
   try {
     const res  = await api('GET', '/api/keys/status');
     const data = await res.json();
-    // /api/keys/status → { higgsfield: { connected: true, saved_at: ... } }
     const has  = data?.higgsfield?.connected === true;
 
-    // Nav dot
     const navDot = $('hf-key-dot');
     if (navDot) {
       navDot.classList.toggle('active',   has);
       navDot.classList.toggle('inactive', !has);
     }
 
-    // Drawer status
-    const statusEl  = $('hf-key-status');
-    const dotEl     = statusEl?.querySelector('.vg-key-dot');
-    const textEl    = statusEl?.querySelector('.vg-key-status-text');
+    const statusEl = $('hf-key-status');
+    const dotEl    = statusEl?.querySelector('.vg-key-dot');
+    const textEl   = statusEl?.querySelector('.vg-key-status-text');
     if (dotEl)  dotEl.classList.toggle('active', has);
     if (textEl) textEl.textContent = has ? 'Connected' : 'Not set';
     return has;
@@ -165,13 +306,10 @@ async function checkKeyStatus() {
   }
 }
 
-function updateKeyDot() {
-  checkKeyStatus();
-}
+function updateKeyDot() { checkKeyStatus(); }
 
 async function saveKey(provider) {
-  const inputId = `key-${provider}`;
-  const input   = $(inputId);
+  const input = $(`key-${provider}`);
   if (!input) return;
 
   const value = input.value.trim();
@@ -183,7 +321,6 @@ async function saveKey(provider) {
   try {
     const res  = await api('POST', '/api/keys/save', { provider, key: value });
     const data = await res.json();
-
     if (res.ok) {
       input.value = '';
       input.type  = 'password';
@@ -199,7 +336,10 @@ async function saveKey(provider) {
   }
 }
 
-/* ── SETTINGS DRAWER ─────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   SETTINGS DRAWER
+   ═══════════════════════════════════════════════════════════════ */
+
 function openSettings() {
   $('settings-drawer').classList.add('open');
   $('settings-overlay').classList.add('open');
@@ -214,20 +354,18 @@ function closeSettings() {
 async function loadSettingsInfo() {
   if (!VG.user) return;
 
-  // Account info
   const infoEl = $('settings-account-info');
   if (infoEl) {
     infoEl.textContent = `${VG.user.email} · ${capitalize(VG.user.tier)} plan`;
   }
 
-  // Tier limits
   const limitsEl = $('settings-limits');
   if (limitsEl) {
     const tierLimits = {
-      free:    { projects: 1,    shots: 10,   label: 'Free' },
-      creator: { projects: 5,    shots: 100,  label: 'Creator' },
-      studio:  { projects: 25,   shots: 500,  label: 'Studio' },
-      pro:     { projects: '∞',  shots: '∞',  label: 'Pro' },
+      free:    { projects: 1,   shots: 10,   label: 'Free' },
+      creator: { projects: 5,   shots: 100,  label: 'Creator' },
+      studio:  { projects: 25,  shots: 500,  label: 'Studio' },
+      pro:     { projects: '∞', shots: '∞',  label: 'Pro' },
     };
     const lim = tierLimits[VG.user.tier] || tierLimits.free;
     limitsEl.innerHTML = `
@@ -246,14 +384,397 @@ async function loadSettingsInfo() {
       <div class="vg-limit-item">
         <div class="vg-limit-item-label">Credits</div>
         <div class="vg-limit-item-value">${VG.user.credits ?? 0}</div>
-      </div>
-    `;
+      </div>`;
   }
 
   await checkKeyStatus();
 }
 
-/* ── PROJECTS ────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   MODEL CARDS
+   ═══════════════════════════════════════════════════════════════ */
+
+function renderModelCards() {
+  const container = $('vg-model-cards');
+  if (!container) return;
+
+  container.innerHTML = HF_MODELS_DATA.map(m => `
+    <button class="vg-model-card ${m.id === VG.selectedModel ? 'active' : ''}"
+            data-model-id="${m.id}" title="${escAttr(m.desc)}">
+      <div class="vg-model-card-header">
+        <span class="vg-model-card-name">${escHtml(m.label)}</span>
+        <span class="vg-model-speed-badge speed-${escAttr(m.speedClass)}">${escHtml(m.speed)}</span>
+      </div>
+      <div class="vg-model-card-desc">${escHtml(m.desc)}</div>
+      <div class="vg-model-card-type">${m.type === 'i2v' ? 'Image → Video' : 'Text → Image'}</div>
+    </button>
+  `).join('');
+
+  container.querySelectorAll('.vg-model-card').forEach(card => {
+    card.addEventListener('click', () => selectModel(card.dataset.modelId));
+  });
+}
+
+function selectModel(modelId) {
+  VG.selectedModel = modelId;
+
+  // Update card active states
+  $$('.vg-model-card').forEach(c => {
+    c.classList.toggle('active', c.dataset.modelId === modelId);
+  });
+
+  // Update type badge
+  const model  = HF_MODELS_DATA.find(m => m.id === modelId);
+  const badge  = $('vg-model-type-badge');
+  if (badge && model) {
+    badge.textContent = model.type.toUpperCase();
+    badge.className   = `vg-model-type-badge ${model.type}`;
+  }
+
+  // Update image block required/optional badges
+  updateImageRequirement(modelId);
+}
+
+function updateImageRequirement(modelId) {
+  const isI2V     = I2V_MODELS.has(modelId);
+  const reqBadge  = $('vg-image-required-badge');
+  const optBadge  = $('vg-image-optional-badge');
+  if (reqBadge) reqBadge.style.display = isI2V ? 'inline' : 'none';
+  if (optBadge) optBadge.style.display = isI2V ? 'none' : 'inline';
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   IMAGE UPLOAD SYSTEM
+   ═══════════════════════════════════════════════════════════════ */
+
+function initUploadZone() {
+  const zone      = $('vg-upload-zone');
+  const dropArea  = $('vg-upload-drop');
+  const fileInput = $('vg-file-input');
+  const browseBtn = $('btn-browse-image');
+  const clearBtn  = $('btn-clear-image');
+  const urlInput  = $('vg-image-url');
+
+  if (!zone) return;
+
+  // Browse button → trigger file input
+  browseBtn?.addEventListener('click', () => fileInput?.click());
+
+  // File input change
+  fileInput?.addEventListener('change', () => {
+    const file = fileInput.files?.[0];
+    if (file) handleFileUpload(file);
+  });
+
+  // Clear image
+  clearBtn?.addEventListener('click', clearImage);
+
+  // URL input → paste/blur to set image
+  urlInput?.addEventListener('change', () => {
+    const url = urlInput.value.trim();
+    if (url) {
+      VG.uploadedImageKey = null;
+      VG.uploadedImageUrl = url;
+      showUploadPreview(url);
+    }
+  });
+  urlInput?.addEventListener('blur', () => {
+    const url = urlInput.value.trim();
+    if (url && !VG.uploadedImageUrl) {
+      VG.uploadedImageKey = null;
+      VG.uploadedImageUrl = url;
+      showUploadPreview(url);
+    }
+  });
+
+  // Drag and drop
+  if (dropArea) {
+    dropArea.addEventListener('dragover', e => {
+      e.preventDefault();
+      dropArea.classList.add('drag-over');
+    });
+    dropArea.addEventListener('dragleave', () => {
+      dropArea.classList.remove('drag-over');
+    });
+    dropArea.addEventListener('drop', e => {
+      e.preventDefault();
+      dropArea.classList.remove('drag-over');
+      const file = e.dataTransfer.files?.[0];
+      if (file && file.type.startsWith('image/')) {
+        handleFileUpload(file);
+      } else if (file) {
+        showToast('Please drop an image file (JPEG, PNG, WebP, GIF)', true);
+      }
+    });
+  }
+}
+
+async function handleFileUpload(file) {
+  // Validate
+  const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+  if (!allowedTypes.includes(file.type)) {
+    showToast('Unsupported file type. Use JPEG, PNG, WebP, or GIF.', true);
+    return;
+  }
+  if (file.size > 10 * 1024 * 1024) {
+    showToast('File too large. Max 10MB.', true);
+    return;
+  }
+
+  // Show local preview immediately
+  const objectUrl = URL.createObjectURL(file);
+  showUploadPreview(objectUrl, true); // isLoading=true
+
+  // Upload to R2 via /api/upload
+  try {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const res = await fetch('/api/upload', {
+      method:      'POST',
+      credentials: 'include',
+      body:        formData,
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      showToast(data.error || 'Upload failed', true);
+      clearImage();
+      return;
+    }
+
+    VG.uploadedImageKey = data.key;
+    VG.uploadedImageUrl = data.url;
+    showUploadPreview(data.url);
+    showToast('Image uploaded ✓');
+  } catch {
+    showToast('Upload failed — check connection', true);
+    clearImage();
+  }
+}
+
+function showUploadPreview(src, loading = false) {
+  const preview = $('vg-upload-preview');
+  const dropEl  = $('vg-upload-drop');
+  const img     = $('vg-upload-img');
+
+  if (preview) preview.style.display = 'flex';
+  if (dropEl)  dropEl.style.display  = 'none';
+  if (img) {
+    img.src = src;
+    img.style.opacity = loading ? '0.5' : '1';
+  }
+}
+
+function clearImage() {
+  VG.uploadedImageKey = null;
+  VG.uploadedImageUrl = null;
+
+  const preview   = $('vg-upload-preview');
+  const dropEl    = $('vg-upload-drop');
+  const img       = $('vg-upload-img');
+  const urlInput  = $('vg-image-url');
+  const fileInput = $('vg-file-input');
+
+  if (preview) preview.style.display = 'none';
+  if (dropEl)  dropEl.style.display  = 'flex';
+  if (img)     img.src = '';
+  if (urlInput) urlInput.value = '';
+  if (fileInput) fileInput.value = '';
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   STYLE PRESETS
+   ═══════════════════════════════════════════════════════════════ */
+
+function renderStylePresets() {
+  const container = $('vg-style-scroll');
+  if (!container) return;
+
+  container.innerHTML = STYLE_PRESETS.map(p => `
+    <button class="vg-preset-chip ${p.id === VG.selectedPreset ? 'active' : ''}"
+            data-preset-id="${p.id}" title="${escAttr(p.label)}">
+      <span class="vg-preset-emoji">${p.emoji}</span>
+      <span class="vg-preset-label">${escHtml(p.label)}</span>
+    </button>
+  `).join('');
+
+  container.querySelectorAll('.vg-preset-chip').forEach(chip => {
+    chip.addEventListener('click', () => togglePreset(chip.dataset.presetId));
+  });
+}
+
+function togglePreset(presetId) {
+  // Toggle — clicking active preset deselects it
+  VG.selectedPreset = VG.selectedPreset === presetId ? null : presetId;
+
+  $$('.vg-preset-chip').forEach(c => {
+    c.classList.toggle('active', c.dataset.presetId === VG.selectedPreset);
+  });
+}
+
+function clearPreset() {
+  VG.selectedPreset = null;
+  $$('.vg-preset-chip').forEach(c => c.classList.remove('active'));
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ENHANCE MODES
+   ═══════════════════════════════════════════════════════════════ */
+
+const ENHANCE_MODE_LABELS = {
+  cinematic:    'cinematic mode',
+  realism:      'realism mode',
+  motion:       'motion mode',
+  storytelling: 'storytelling mode',
+  camera:       'camera mode',
+};
+
+function setEnhanceMode(mode) {
+  VG.enhanceMode = mode;
+  $$('.vg-mode-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+  const labelEl = $('enhance-mode-label');
+  if (labelEl) labelEl.textContent = ENHANCE_MODE_LABELS[mode] || mode + ' mode';
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SEED CONTROL
+   ═══════════════════════════════════════════════════════════════ */
+
+function randomizeSeed() {
+  const seed     = Math.floor(Math.random() * 2147483647);
+  const input    = $('vg-seed-input');
+  if (input) input.value = seed;
+  VG.seedLocked = false;
+  updateLockIcon(false);
+}
+
+function toggleSeedLock() {
+  VG.seedLocked = !VG.seedLocked;
+  updateLockIcon(VG.seedLocked);
+
+  if (VG.seedLocked) {
+    // If no seed set, generate one on lock
+    const input = $('vg-seed-input');
+    if (input && !input.value) {
+      input.value = Math.floor(Math.random() * 2147483647);
+    }
+    showToast('Seed locked — results will be reproducible');
+  } else {
+    showToast('Seed unlocked — randomized each generation');
+  }
+}
+
+function updateLockIcon(locked) {
+  const btn      = $('btn-lock-seed');
+  const lockIcon = $('lock-icon');
+  if (btn)      btn.classList.toggle('active', locked);
+  if (lockIcon) lockIcon.setAttribute('stroke', locked ? 'var(--accent)' : 'currentColor');
+}
+
+function getCurrentSeed() {
+  const input = $('vg-seed-input');
+  const val   = input?.value?.trim();
+  if (!val) return undefined;
+  const n = parseInt(val, 10);
+  return isNaN(n) ? undefined : n;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   QUALITY SLIDERS
+   ═══════════════════════════════════════════════════════════════ */
+
+function initQualitySliders() {
+  const sliders = [
+    { id: 'slider-motion', valId: 'val-motion', key: 'motion' },
+    { id: 'slider-style',  valId: 'val-style',  key: 'style'  },
+    { id: 'slider-detail', valId: 'val-detail', key: 'detail' },
+  ];
+
+  sliders.forEach(({ id, valId, key }) => {
+    const slider = $(id);
+    const valEl  = $(valId);
+    if (!slider) return;
+
+    // Set initial display
+    slider.value = VG.quality[key];
+    if (valEl) valEl.textContent = VG.quality[key];
+
+    slider.addEventListener('input', () => {
+      const v = parseInt(slider.value, 10);
+      VG.quality[key] = v;
+      if (valEl) valEl.textContent = v;
+      // Update slider fill track CSS var
+      updateSliderTrack(slider);
+    });
+
+    // Init track fill
+    updateSliderTrack(slider);
+  });
+}
+
+function updateSliderTrack(slider) {
+  const min = parseInt(slider.min, 10) || 1;
+  const max = parseInt(slider.max, 10) || 10;
+  const val = parseInt(slider.value, 10);
+  const pct = ((val - min) / (max - min)) * 100;
+  slider.style.setProperty('--fill', `${pct}%`);
+}
+
+function resetQuality() {
+  VG.quality = { motion: 5, style: 5, detail: 7 };
+
+  [
+    { id: 'slider-motion', valId: 'val-motion', key: 'motion' },
+    { id: 'slider-style',  valId: 'val-style',  key: 'style'  },
+    { id: 'slider-detail', valId: 'val-detail', key: 'detail' },
+  ].forEach(({ id, valId, key }) => {
+    const slider = $(id);
+    const valEl  = $(valId);
+    if (slider) { slider.value = VG.quality[key]; updateSliderTrack(slider); }
+    if (valEl)  valEl.textContent = VG.quality[key];
+  });
+
+  showToast('Quality reset to defaults');
+}
+
+function getQualityString() {
+  const { motion, style, detail } = VG.quality;
+  return `motion:${motion},style:${style},detail:${detail}`;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   STORYBOARD VIEW TOGGLE
+   ═══════════════════════════════════════════════════════════════ */
+
+function toggleStoryboardView() {
+  VG.storyboardView = VG.storyboardView === 'grid' ? 'strip' : 'grid';
+
+  const grid     = $('vg-shot-grid');
+  const iconEl   = $('view-toggle-icon');
+  const btn      = $('btn-toggle-view');
+
+  if (grid) {
+    grid.classList.toggle('grid-view',  VG.storyboardView === 'grid');
+    grid.classList.toggle('strip-view', VG.storyboardView === 'strip');
+  }
+
+  if (btn) btn.title = VG.storyboardView === 'grid' ? 'Switch to strip view' : 'Switch to grid view';
+
+  // Swap icon between grid-squares and horizontal-strip
+  if (iconEl) {
+    if (VG.storyboardView === 'strip') {
+      iconEl.innerHTML = `<line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/>`;
+    } else {
+      iconEl.innerHTML = `<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>`;
+    }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   PROJECTS
+   ═══════════════════════════════════════════════════════════════ */
+
 async function loadProjects() {
   const container = $('vg-project-selector');
   if (!container) return;
@@ -263,14 +784,14 @@ async function loadProjects() {
   try {
     const res  = await api('GET', '/api/projects');
     const data = await res.json();
+    if (!res.ok) {
+      container.innerHTML = '<div class="vg-project-loading">Error loading projects</div>';
+      return;
+    }
 
-    if (!res.ok) { container.innerHTML = '<div class="vg-project-loading">Error loading projects</div>'; return; }
-
-    // /api/projects returns a bare array
     VG.projects = Array.isArray(data) ? data : (data.projects || []);
     renderProjectList();
 
-    // Auto-select first project if none selected
     if (!VG.activeProjectId && VG.projects.length > 0) {
       selectProject(VG.projects[0].id);
     } else if (VG.projects.length === 0) {
@@ -312,17 +833,17 @@ async function selectProject(id) {
   const project = VG.projects.find(p => p.id === id);
   if (!project) return;
 
-  // Update project header
-  const header = $('vg-project-header');
+  // Update board header
+  const header = $('vg-board-header');
   if (header) {
     header.style.display = 'flex';
-    $('vg-current-project-name').textContent = project.name;
+    const nameEl = $('vg-current-project-name');
+    if (nameEl) nameEl.textContent = project.name;
   }
 
   // Set default model for this project
   if (project.default_model) {
-    const sel = $('vg-model-select');
-    if (sel) sel.value = project.default_model;
+    selectModel(project.default_model);
   }
 
   // Hide empty, show grid
@@ -335,7 +856,7 @@ async function selectProject(id) {
 function showEmptyState() {
   $('vg-empty').style.display    = 'flex';
   $('vg-shot-grid').style.display = 'none';
-  const header = $('vg-project-header');
+  const header = $('vg-board-header');
   if (header) header.style.display = 'none';
 }
 
@@ -345,21 +866,17 @@ async function loadShots(projectId) {
     const data = await res.json();
     if (!res.ok) return;
 
-    // /api/projects/:id returns { ...project, shots: [...], characters: [...] }
     const shots = data.shots || [];
     VG.shots[projectId] = shots;
 
-    // Update shot count
     const countEl = $('vg-project-shot-count');
     if (countEl) countEl.textContent = `${shots.length} shot${shots.length !== 1 ? 's' : ''}`;
 
-    // Update project list count too
     const proj = VG.projects.find(p => p.id === projectId);
     if (proj) proj.shot_count = shots.length;
 
     renderShotGrid(projectId);
 
-    // Resume polling for any active shots
     shots.forEach(shot => {
       if (shot.status === 'queued' || shot.status === 'in_progress') {
         startPolling(shot.id, projectId);
@@ -370,7 +887,10 @@ async function loadShots(projectId) {
   }
 }
 
-/* ── SHOT GRID RENDER ────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   SHOT GRID RENDER
+   ═══════════════════════════════════════════════════════════════ */
+
 function renderShotGrid(projectId) {
   const grid = $('vg-shot-grid');
   if (!grid) return;
@@ -379,15 +899,13 @@ function renderShotGrid(projectId) {
 
   if (shots.length === 0) {
     grid.innerHTML = `
-      <div style="grid-column:1/-1;text-align:center;padding:3rem 1rem;color:var(--ice-dim);font-size:0.82rem">
+      <div style="grid-column:1/-1;text-align:center;padding:3rem 1rem;color:var(--text-muted);font-size:0.82rem">
         No shots yet — write a prompt and hit Generate Shot
       </div>`;
     return;
   }
 
-  // Newest first
   const sorted = [...shots].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-
   grid.innerHTML = sorted.map(shot => renderShotCard(shot)).join('');
 
   // Bind shot actions
@@ -406,9 +924,17 @@ function renderShotGrid(projectId) {
 }
 
 function renderShotCard(shot) {
+  const statusDotClass = {
+    queued:      'dot-queued',
+    in_progress: 'dot-progress',
+    completed:   'dot-done',
+    failed:      'dot-failed',
+    nsfw:        'dot-failed',
+  }[shot.status] || 'dot-failed';
+
   const statusLabel = {
     queued:      'Queued',
-    in_progress: 'Generating',
+    in_progress: 'Rendering',
     completed:   'Done',
     failed:      'Failed',
     nsfw:        'Blocked',
@@ -417,9 +943,10 @@ function renderShotCard(shot) {
   const modelShort = (shot.model || '').split('/').pop() || '';
 
   const thumbContent = (() => {
-    if (shot.status === 'completed' && shot.video_url) {
+    if (shot.status === 'completed' && (shot.video_url || shot.hf_video_url)) {
+      const videoUrl = shot.video_url || shot.hf_video_url;
       return `
-        <video src="${escAttr(shot.video_url)}" muted loop preload="metadata"
+        <video src="${escAttr(videoUrl)}" muted loop preload="metadata"
                onmouseenter="this.play()" onmouseleave="this.pause();this.currentTime=0"
                style="width:100%;height:100%;object-fit:cover;display:block"></video>
         <div class="vg-shot-play">
@@ -428,23 +955,11 @@ function renderShotCard(shot) {
           </button>
         </div>`;
     }
-    if (shot.status === 'completed' && shot.hf_video_url) {
-      return `
-        <video src="${escAttr(shot.hf_video_url)}" muted loop preload="metadata"
-               onmouseenter="this.play()" onmouseleave="this.pause();this.currentTime=0"
-               style="width:100%;height:100%;object-fit:cover;display:block"></video>
-        <div class="vg-shot-play">
-          <button class="vg-shot-play-btn" data-shot-id="${shot.id}" data-action="play" title="Play full screen">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-          </button>
-        </div>`;
-    }
-    // Queued / in_progress / failed
     const icons = {
-      queued: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`,
+      queued:      `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`,
       in_progress: `<svg class="vg-spin" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>`,
-      failed: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>`,
-      nsfw:   `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
+      failed:      `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>`,
+      nsfw:        `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`,
     };
     const icon = icons[shot.status] || icons.failed;
     return `
@@ -456,15 +971,29 @@ function renderShotCard(shot) {
 
   const videoUrl = shot.video_url || shot.hf_video_url || '';
 
+  // Build seed/style tags
+  const tags = [];
+  if (shot.seed != null) {
+    tags.push(`<span class="vg-shot-tag tag-seed">seed:${shot.seed}</span>`);
+  }
+  if (shot.style_preset) {
+    const preset = STYLE_PRESETS.find(p => p.id === shot.style_preset);
+    const label  = preset ? preset.label : shot.style_preset;
+    tags.push(`<span class="vg-shot-tag tag-style">${escHtml(label)}</span>`);
+  }
+  const tagsHtml = tags.length ? `<div class="vg-shot-tags">${tags.join('')}</div>` : '';
+
   return `
     <article class="vg-shot-card" data-status="${shot.status}" data-shot-id="${shot.id}">
       <div class="vg-shot-thumb">
         ${thumbContent}
-        <span class="vg-shot-aspect-badge">${shot.aspect_ratio || '16:9'}</span>
+        <span class="vg-shot-aspect-badge">${escHtml(shot.aspect_ratio || '16:9')}</span>
         <span class="vg-shot-model-badge">${escHtml(modelShort)}</span>
+        <span class="vg-shot-status-dot ${statusDotClass}" title="${statusLabel}"></span>
       </div>
       <div class="vg-shot-body">
         <p class="vg-shot-prompt">${escHtml(shot.prompt || '')}</p>
+        ${tagsHtml}
         <div class="vg-shot-meta">
           <span class="vg-shot-time">${timeAgo(shot.created_at)}</span>
           <div class="vg-shot-actions">
@@ -475,7 +1004,7 @@ function renderShotCard(shot) {
             <button class="vg-shot-action-btn vg-shot-dl-btn" data-shot-id="${shot.id}" data-action="download" title="Download">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             </button>` : ''}
-            <button class="vg-shot-action-btn delete" data-shot-id="${shot.id}" data-action="delete" title="Delete shot">
+            <button class="vg-shot-action-btn delete" data-shot-id="${shot.id}" data-action="delete" title="Delete">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/></svg>
             </button>
           </div>
@@ -484,9 +1013,12 @@ function renderShotCard(shot) {
     </article>`;
 }
 
-/* ── SHOT POLLING ────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   SHOT POLLING
+   ═══════════════════════════════════════════════════════════════ */
+
 function startPolling(shotId, projectId) {
-  if (VG.pollTimers[shotId]) return; // already polling
+  if (VG.pollTimers[shotId]) return;
 
   VG.pollTimers[shotId] = setInterval(async () => {
     try {
@@ -499,9 +1031,6 @@ function startPolling(shotId, projectId) {
         return;
       }
 
-      const status = data.status;
-
-      // Update shot in local state
       if (VG.shots[projectId]) {
         const idx = VG.shots[projectId].findIndex(s => s.id === shotId);
         if (idx !== -1) {
@@ -509,29 +1038,36 @@ function startPolling(shotId, projectId) {
         }
       }
 
-      // Update card in DOM
       updateShotCardInDOM(shotId, data);
 
-      // Terminal states
-      if (status === 'completed' || status === 'failed' || status === 'nsfw') {
+      if (data.status === 'completed' || data.status === 'failed' || data.status === 'nsfw') {
         clearInterval(VG.pollTimers[shotId]);
         delete VG.pollTimers[shotId];
-
-        // Refresh full project to get updated shot counts
         await loadShots(projectId);
       }
     } catch (err) {
       console.error('Poll error for shot', shotId, err);
     }
-  }, 4000); // poll every 4 seconds
+  }, 4000);
 }
 
 function updateShotCardInDOM(shotId, data) {
   const card = document.querySelector(`.vg-shot-card[data-shot-id="${shotId}"]`);
   if (!card) return;
 
-  // Update status attribute (triggers CSS state changes)
   card.dataset.status = data.status;
+
+  // Update status dot
+  const dot = card.querySelector('.vg-shot-status-dot');
+  if (dot) {
+    dot.className = `vg-shot-status-dot ${({
+      queued:      'dot-queued',
+      in_progress: 'dot-progress',
+      completed:   'dot-done',
+      failed:      'dot-failed',
+      nsfw:        'dot-failed',
+    }[data.status] || 'dot-failed')}`;
+  }
 
   const thumb = card.querySelector('.vg-shot-thumb');
   if (!thumb) return;
@@ -539,7 +1075,6 @@ function updateShotCardInDOM(shotId, data) {
   if (data.status === 'completed') {
     const videoUrl = data.video_url || data.hf_video_url || '';
     if (videoUrl) {
-      // Remove overlay, add video
       thumb.querySelector('.vg-shot-status-overlay')?.remove();
       if (!thumb.querySelector('video')) {
         const vid = document.createElement('video');
@@ -552,7 +1087,6 @@ function updateShotCardInDOM(shotId, data) {
         vid.addEventListener('mouseleave', () => { vid.pause(); vid.currentTime = 0; });
         thumb.insertBefore(vid, thumb.firstChild);
 
-        // Add play button overlay
         const playDiv = document.createElement('div');
         playDiv.className = 'vg-shot-play';
         playDiv.innerHTML = `<button class="vg-shot-play-btn" title="Play full screen">
@@ -565,16 +1099,14 @@ function updateShotCardInDOM(shotId, data) {
         thumb.appendChild(playDiv);
       }
 
-      // Update download button
-      const body    = card.querySelector('.vg-shot-actions');
-      const hasDl   = body?.querySelector('.vg-shot-dl-btn');
+      const body  = card.querySelector('.vg-shot-actions');
+      const hasDl = body?.querySelector('.vg-shot-dl-btn');
       if (body && !hasDl) {
         const dlBtn = document.createElement('button');
-        dlBtn.className           = 'vg-shot-action-btn vg-shot-dl-btn';
-        dlBtn.title               = 'Download';
-        dlBtn.innerHTML           = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
+        dlBtn.className = 'vg-shot-action-btn vg-shot-dl-btn';
+        dlBtn.title     = 'Download';
+        dlBtn.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
         dlBtn.addEventListener('click', (e) => { e.stopPropagation(); downloadShot(shotId, VG.activeProjectId); });
-        // Insert before delete button
         const delBtn = body.querySelector('.delete');
         if (delBtn) body.insertBefore(dlBtn, delBtn);
       }
@@ -590,69 +1122,63 @@ function updateShotCardInDOM(shotId, data) {
   }
 }
 
-/* ── MODEL HINT ──────────────────────────────────────────────── */
-// Models that require an image_url (image-to-video)
-const I2V_MODELS = new Set([
-  'higgsfield-ai/dop/lite',
-  'higgsfield-ai/dop/standard',
-  'higgsfield-ai/dop/turbo',
-  'kling-video/v2.1/pro/image-to-video',
-  'kling-video/v2.1/standard/image-to-video',
-  'bytedance/seedance/v1/pro/image-to-video',
-  'bytedance/seedance/v1/lite/image-to-video',
-]);
+/* ═══════════════════════════════════════════════════════════════
+   GENERATE
+   ═══════════════════════════════════════════════════════════════ */
 
-function updateModelHint() {
-  const model   = $('vg-model-select')?.value || '';
-  const hintEl  = $('vg-model-hint');
-  const labelEl = $('vg-image-label-note');
-  const isI2V   = I2V_MODELS.has(model);
-
-  if (hintEl) {
-    hintEl.textContent = isI2V
-      ? '⚠ This model requires a reference image URL'
-      : '✓ Text-to-image — no reference image needed';
-    hintEl.style.color = isI2V ? 'var(--yellow)' : 'var(--green)';
-  }
-  if (labelEl) {
-    labelEl.textContent = isI2V ? '(required for this model)' : '(not required)';
-    labelEl.style.color = isI2V ? 'var(--yellow)' : 'var(--ice-ghost)';
-  }
-}
-
-/* ── GENERATE ────────────────────────────────────────────────── */
 async function generate() {
   if (VG.generating) return;
   if (!VG.activeProjectId) { showToast('Select a project first', true); return; }
 
-  const prompt    = $('vg-prompt').value.trim();
-  const imageUrl  = $('vg-image-url').value.trim();
-  const model     = $('vg-model-select').value;
+  const prompt   = $('vg-prompt').value.trim();
+  const model    = VG.selectedModel;
 
   if (!prompt) { showToast('Enter a shot prompt', true); return; }
 
-  // Validate image_url required for i2v models
+  // Get image URL: prefer uploaded R2 key URL, fall back to pasted URL input
+  const urlInput  = $('vg-image-url');
+  const imageUrl  = VG.uploadedImageUrl || urlInput?.value?.trim() || '';
+
+  // Validate image required for i2v
   if (I2V_MODELS.has(model) && !imageUrl) {
-    showToast('This model requires a reference image URL', true);
-    $('vg-image-url').focus();
+    showToast('This model requires a reference image', true);
+    $('vg-upload-zone')?.classList.add('shake');
+    setTimeout(() => $('vg-upload-zone')?.classList.remove('shake'), 500);
     return;
   }
 
   VG.generating = true;
   const btn = $('btn-generate');
-  btn.disabled    = true;
+  btn.disabled = true;
   btn.classList.add('loading');
-  btn.innerHTML   = `<span class="vg-spinner"></span> Submitting…`;
+  btn.innerHTML = `<span class="vg-spinner"></span> Submitting…`;
+
+  // Get seed
+  const seed = getCurrentSeed();
+  if (!VG.seedLocked && $('vg-seed-input')) {
+    // Generate and display a new random seed for non-locked state
+    if (!$('vg-seed-input').value) {
+      const newSeed = Math.floor(Math.random() * 2147483647);
+      $('vg-seed-input').value = newSeed;
+    }
+  }
 
   try {
-    const res  = await api('POST', '/api/generate', {
+    const payload = {
       project_id:   VG.activeProjectId,
       prompt,
       model,
-      image_url:    imageUrl || undefined,
-      duration:     VG.selectedDur,
       aspect_ratio: VG.selectedAspect,
-    });
+      duration:     VG.selectedDur,
+      enhance_mode: VG.enhanceMode,
+    };
+
+    if (imageUrl)          payload.image_url    = imageUrl;
+    if (seed != null)      payload.seed         = seed;
+    if (VG.selectedPreset) payload.style_preset = VG.selectedPreset;
+    if (VG.quality)        payload.quality      = getQualityString();
+
+    const res  = await api('POST', '/api/generate', payload);
     const data = await res.json();
 
     if (!res.ok) {
@@ -660,8 +1186,6 @@ async function generate() {
       return;
     }
 
-    // Add shot to local state immediately with queued status
-    // /api/generate returns { ok, shot_id, request_id, status, prompt_enhanced }
     const newShot = {
       id:              data.shot_id,
       project_id:      VG.activeProjectId,
@@ -675,61 +1199,72 @@ async function generate() {
       hf_request_id:   data.request_id,
       video_url:       null,
       hf_video_url:    null,
+      seed:            data.seed ?? seed,
+      style_preset:    data.style_preset || VG.selectedPreset || null,
+      quality:         payload.quality || null,
       created_at:      new Date().toISOString(),
     };
 
     if (!VG.shots[VG.activeProjectId]) VG.shots[VG.activeProjectId] = [];
     VG.shots[VG.activeProjectId].unshift(newShot);
 
-    // Show grid
     $('vg-empty').style.display    = 'none';
     $('vg-shot-grid').style.display = 'grid';
-
     renderShotGrid(VG.activeProjectId);
 
-    // Start polling
     if (newShot.id) startPolling(newShot.id, VG.activeProjectId);
 
     showToast('Shot submitted — generating now');
 
-    // Clear prompt
+    // Clear prompt and unlock seed for next generation
     $('vg-prompt').value = '';
     updateCharCount();
 
-    // Update usage bar
+    if (!VG.seedLocked) {
+      const seedInput = $('vg-seed-input');
+      if (seedInput) seedInput.value = '';
+    }
+
     await updateUsageBar();
-  } catch (err) {
+  } catch {
     showToast('Network error — try again', true);
   } finally {
     VG.generating = false;
     btn.disabled  = false;
     btn.classList.remove('loading');
-    btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg> Generate Shot`;
+    btn.innerHTML = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg> Generate Shot`;
   }
 }
 
-/* ── ENHANCE PROMPT ──────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   ENHANCE PROMPT
+   ═══════════════════════════════════════════════════════════════ */
+
 async function enhancePrompt() {
   const textarea = $('vg-prompt');
-  const prompt   = textarea.value.trim();
+  const prompt   = textarea?.value.trim();
   if (!prompt) { showToast('Enter a prompt to enhance', true); return; }
 
   const btn = $('btn-enhance-prompt');
-  btn.disabled    = true;
-  btn.innerHTML   = `<span class="vg-spinner"></span> Enhancing…`;
+  btn.disabled  = true;
+  btn.innerHTML = `<span class="vg-spinner"></span> Enhancing…`;
 
   try {
-    const res  = await api('POST', '/api/enhance-prompt', {
+    const payload = {
       prompt,
-      model:       $('vg-model-select').value,
+      model:        VG.selectedModel,
       aspect_ratio: VG.selectedAspect,
-    });
+      mode:         VG.enhanceMode,
+    };
+    if (VG.selectedPreset) payload.style_preset = VG.selectedPreset;
+
+    const res  = await api('POST', '/api/enhance-prompt', payload);
     const data = await res.json();
 
     if (res.ok && data.enhanced) {
       textarea.value = data.enhanced;
       updateCharCount();
-      showToast('Prompt enhanced ✓');
+      showToast(`Prompt enhanced · ${VG.enhanceMode} mode ✓`);
     } else {
       showToast(data.error || 'Enhancement failed', true);
     }
@@ -737,19 +1272,21 @@ async function enhancePrompt() {
     showToast('Network error', true);
   } finally {
     btn.disabled  = false;
-    btn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> Enhance with AI`;
+    btn.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> Enhance`;
   }
 }
 
-/* ── USAGE BAR ───────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   USAGE BAR
+   ═══════════════════════════════════════════════════════════════ */
+
 async function updateUsageBar() {
   if (!VG.user) return;
   const tierShots = { free: 10, creator: 100, studio: 500, pro: 999999 };
   const limit     = tierShots[VG.user.tier] || 10;
 
-  // Count shots this month from local state
-  let thisMonth = 0;
-  const now     = new Date();
+  let thisMonth    = 0;
+  const now        = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
   Object.values(VG.shots).forEach(shots => {
     shots.forEach(s => {
@@ -762,31 +1299,29 @@ async function updateUsageBar() {
   const labelEl = $('vg-usage-label');
   if (fillEl)  fillEl.style.width = `${pct}%`;
   if (labelEl) {
-    if (limit === 999999) {
-      labelEl.textContent = `${thisMonth} shots this month (unlimited)`;
-    } else {
-      labelEl.textContent = `${thisMonth} / ${limit} shots this month`;
-    }
+    labelEl.textContent = limit === 999999
+      ? `${thisMonth} shots this month (unlimited)`
+      : `${thisMonth} / ${limit} shots this month`;
   }
 }
 
-/* ── SHOT ACTIONS ────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   SHOT ACTIONS
+   ═══════════════════════════════════════════════════════════════ */
+
 async function deleteShot(shotId, projectId) {
   if (!confirm('Delete this shot?')) return;
 
   try {
     const res = await api('DELETE', `/api/shots/${shotId}`);
     if (res.ok) {
-      // Stop polling
       if (VG.pollTimers[shotId]) {
         clearInterval(VG.pollTimers[shotId]);
         delete VG.pollTimers[shotId];
       }
-      // Remove from local state
       if (VG.shots[projectId]) {
         VG.shots[projectId] = VG.shots[projectId].filter(s => s.id !== shotId);
       }
-      // Update project count
       const proj = VG.projects.find(p => p.id === projectId);
       if (proj && proj.shot_count > 0) proj.shot_count--;
 
@@ -816,7 +1351,7 @@ function downloadShot(shotId, projectId) {
   const url  = shot?.video_url || shot?.hf_video_url;
   if (!url) { showToast('No video available yet', true); return; }
 
-  const a = document.createElement('a');
+  const a    = document.createElement('a');
   a.href     = url;
   a.download = `spectra-shot-${shotId.slice(0, 8)}.mp4`;
   a.target   = '_blank';
@@ -831,7 +1366,6 @@ function playShot(shotId, projectId) {
   const url  = shot?.video_url || shot?.hf_video_url;
   if (!url) return;
 
-  // Build inline player overlay if not present
   let overlay = $('vg-player-overlay');
   if (!overlay) {
     overlay = document.createElement('div');
@@ -858,7 +1392,10 @@ function closePlayer() {
   if (vid) { vid.pause(); vid.src = ''; }
 }
 
-/* ── NEW PROJECT MODAL ───────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   NEW PROJECT MODAL
+   ═══════════════════════════════════════════════════════════════ */
+
 function openProjectModal() {
   $('project-modal-overlay').classList.add('open');
   $('project-name-input').focus();
@@ -867,15 +1404,14 @@ function openProjectModal() {
 
 function closeProjectModal() {
   $('project-modal-overlay').classList.remove('open');
-  // Clear inputs
   ['project-name-input','project-style-input','project-mood-input','project-palette-input'].forEach(id => {
     const el = $(id); if (el) el.value = '';
   });
 }
 
 async function saveProject() {
-  const name    = $('project-name-input').value.trim();
-  const errEl   = $('project-modal-error');
+  const name  = $('project-name-input').value.trim();
+  const errEl = $('project-modal-error');
   errEl.style.display = 'none';
 
   if (!name) {
@@ -891,8 +1427,7 @@ async function saveProject() {
   const style   = $('project-style-input')?.value.trim()   || '';
   const mood    = $('project-mood-input')?.value.trim()    || '';
   const palette = $('project-palette-input')?.value.trim() || '';
-  const model   = $('project-model-select')?.value          || 'higgsfield-ai/dop/preview';
-
+  const model   = $('project-model-select')?.value          || 'higgsfield-ai/dop/standard';
   const styleBible = buildStyleBible({ style, mood, palette });
 
   try {
@@ -909,9 +1444,10 @@ async function saveProject() {
       return;
     }
 
-    // /api/projects POST returns { ok, id, name } — build local project object
-    const newProject = { id: data.id, name: data.name, shot_count: 0,
-      default_model: model, style_bible: styleBible };
+    const newProject = {
+      id: data.id, name: data.name, shot_count: 0,
+      default_model: model, style_bible: styleBible,
+    };
     VG.projects.unshift(newProject);
     renderProjectList();
     closeProjectModal();
@@ -926,19 +1462,21 @@ async function saveProject() {
   }
 }
 
-/* ── STYLE BIBLE MODAL ───────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   STYLE BIBLE MODAL
+   ═══════════════════════════════════════════════════════════════ */
+
 function openBibleModal() {
   const project = VG.projects.find(p => p.id === VG.activeProjectId);
   if (!project) return;
 
-  // Pre-fill from existing style bible
-  const bible = project.style_bible || {};
+  const bible  = project.style_bible || {};
   const parsed = typeof bible === 'string' ? tryParseJSON(bible) : bible;
   if (parsed) {
-    $('bible-style-input').value  = parsed.style   || '';
-    $('bible-mood-input').value   = parsed.mood    || '';
+    $('bible-style-input').value   = parsed.style   || '';
+    $('bible-mood-input').value    = parsed.mood    || '';
     $('bible-palette-input').value = parsed.palette || '';
-    $('bible-camera-input').value = parsed.camera  || '';
+    $('bible-camera-input').value  = parsed.camera  || '';
   }
 
   $('bible-modal-overlay').classList.add('open');
@@ -967,7 +1505,6 @@ async function saveBible() {
     const data = await res.json();
 
     if (res.ok) {
-      // Update local state
       const proj = VG.projects.find(p => p.id === VG.activeProjectId);
       if (proj) proj.style_bible = bible;
       closeBibleModal();
@@ -983,7 +1520,10 @@ async function saveBible() {
   }
 }
 
-/* ── HELPERS ─────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   HELPERS
+   ═══════════════════════════════════════════════════════════════ */
+
 function buildStyleBible({ style, mood, palette }) {
   const parts = {};
   if (style)   parts.style   = style;
@@ -1006,9 +1546,7 @@ function escHtml(str) {
     .replace(/'/g, '&#39;');
 }
 
-function escAttr(str) {
-  return escHtml(str);
-}
+function escAttr(str) { return escHtml(str); }
 
 function tryParseJSON(str) {
   try { return typeof str === 'string' ? JSON.parse(str) : str; } catch { return null; }
@@ -1017,7 +1555,7 @@ function tryParseJSON(str) {
 function timeAgo(dateStr) {
   if (!dateStr) return '';
   const diff = Date.now() - new Date(dateStr).getTime();
-  const mins  = Math.floor(diff / 60000);
+  const mins = Math.floor(diff / 60000);
   if (mins < 1)  return 'just now';
   if (mins < 60) return `${mins}m ago`;
   const hrs = Math.floor(mins / 60);
@@ -1026,23 +1564,26 @@ function timeAgo(dateStr) {
 }
 
 function updateCharCount() {
-  const ta    = $('vg-prompt');
-  const el    = $('vg-prompt-count');
+  const ta = $('vg-prompt');
+  const el = $('vg-prompt-count');
   if (!ta || !el) return;
-  el.textContent = `${ta.value.length}/500`;
+  el.textContent = `${ta.value.length}/600`;
 }
 
 function showToast(msg, isError = false) {
   const toast = $('vg-toast');
   if (!toast) return;
-  toast.textContent  = msg;
-  toast.style.color  = isError ? 'var(--red)' : 'var(--ice)';
-  toast.style.borderColor = isError ? 'rgba(248,113,113,0.25)' : 'var(--border)';
+  toast.textContent       = msg;
+  toast.style.color       = isError ? 'var(--red)' : 'var(--text-primary)';
+  toast.style.borderColor = isError ? 'rgba(248,113,113,0.3)' : 'var(--border-subtle)';
   toast.classList.add('show');
-  setTimeout(() => toast.classList.remove('show'), 2500);
+  setTimeout(() => toast.classList.remove('show'), 2800);
 }
 
-/* ── BIND UI ─────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   BIND UI
+   ═══════════════════════════════════════════════════════════════ */
+
 function bindUI() {
   // Auth tabs
   $$('.vg-auth-tab').forEach(tab => {
@@ -1063,7 +1604,7 @@ function bindUI() {
     btn.addEventListener('click', () => saveKey(btn.dataset.saveProvider));
   });
 
-  // Key toggle (show/hide)
+  // Key toggle show/hide
   document.querySelectorAll('.vg-key-toggle').forEach(btn => {
     btn.addEventListener('click', () => {
       const input = $(btn.dataset.target);
@@ -1078,8 +1619,6 @@ function bindUI() {
   $('btn-close-project-modal')?.addEventListener('click', closeProjectModal);
   $('btn-cancel-project-modal')?.addEventListener('click', closeProjectModal);
   $('btn-save-project')?.addEventListener('click', saveProject);
-
-  // Close modal on overlay click
   $('project-modal-overlay')?.addEventListener('click', e => {
     if (e.target === $('project-modal-overlay')) closeProjectModal();
   });
@@ -1111,12 +1650,10 @@ function bindUI() {
     });
   });
 
-  // Model select — update hint on change, and on init
-  const modelSel = $('vg-model-select');
-  if (modelSel) {
-    modelSel.addEventListener('change', updateModelHint);
-    updateModelHint(); // init hint on page load
-  }
+  // Enhance mode buttons
+  $$('.vg-mode-btn').forEach(btn => {
+    btn.addEventListener('click', () => setEnhanceMode(btn.dataset.mode));
+  });
 
   // Prompt char count
   $('vg-prompt')?.addEventListener('input', updateCharCount);
@@ -1126,6 +1663,19 @@ function bindUI() {
 
   // Generate
   $('btn-generate')?.addEventListener('click', generate);
+
+  // Style preset clear
+  $('btn-clear-preset')?.addEventListener('click', clearPreset);
+
+  // Seed controls
+  $('btn-randomize-seed')?.addEventListener('click', randomizeSeed);
+  $('btn-lock-seed')?.addEventListener('click', toggleSeedLock);
+
+  // Quality reset
+  $('btn-reset-quality')?.addEventListener('click', resetQuality);
+
+  // Storyboard view toggle
+  $('btn-toggle-view')?.addEventListener('click', toggleStoryboardView);
 
   // Upgrade button (placeholder)
   $('btn-upgrade')?.addEventListener('click', () => {
@@ -1141,26 +1691,34 @@ function bindUI() {
       closePlayer();
     }
   });
+
+  // Init upload zone
+  initUploadZone();
+
+  // Init quality sliders
+  initQualitySliders();
+
+  // Init enhance mode label
+  setEnhanceMode(VG.enhanceMode);
+
+  // Init model type badge
+  updateImageRequirement(VG.selectedModel);
 }
 
 /* ════════════════════════════════════════════════════════════════
    ANALYTICS MODULE
-   - View switcher (Studio ↔ Analytics)
-   - Data fetching from /api/analytics
-   - SVG activity chart, model table, comparison bars,
-     duration dist, aspect ratio chips, project velocity,
-     status breakdown, per-model deep dive
+   View switcher · /api/analytics fetch · SVG chart · tables
    ════════════════════════════════════════════════════════════════ */
 
 'use strict';
 
 /* ── ANALYTICS STATE ──────────────────────────────────────────── */
 const AN = {
-  data:          null,   // last fetched analytics response
-  range:         '30d',
-  modelFilter:   'all',  // 'all' | 'dop' | 'soul' | 'kling' | 'seedance' | 'flux'
-  focusedModel:  null,   // model id currently drilled into
-  loading:       false,
+  data:         null,
+  range:        '30d',
+  modelFilter:  'all',
+  focusedModel: null,
+  loading:      false,
 };
 
 /* ── MODEL FAMILY COLOURS ─────────────────────────────────────── */
@@ -1190,23 +1748,19 @@ function initViewSwitcher() {
   });
 
   btnAnalytics.addEventListener('click', () => {
-    // Only available if logged in
     if (!VG.user) { showToast('Sign in to view analytics', true); return; }
     btnAnalytics.classList.add('active');
     btnStudio.classList.remove('active');
     studioEl.style.display    = 'none';
     analyticsEl.style.display = 'block';
-    // Load analytics if not yet loaded
     if (!AN.data) loadAnalytics();
   });
 
-  // Default: studio active
   btnStudio.classList.add('active');
 }
 
-/* ── RANGE BUTTONS ────────────────────────────────────────────── */
+/* ── RANGE + MODEL FILTER CONTROLS ───────────────────────────── */
 function initAnalyticsControls() {
-  // Range tabs
   document.querySelectorAll('.an-range-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.an-range-btn').forEach(b => b.classList.remove('active'));
@@ -1216,7 +1770,6 @@ function initAnalyticsControls() {
     });
   });
 
-  // Model filter tabs
   document.querySelectorAll('.an-model-tab').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.an-model-tab').forEach(b => b.classList.remove('active'));
@@ -1227,14 +1780,11 @@ function initAnalyticsControls() {
     });
   });
 
-  // Refresh button
   const refreshBtn = $('btn-an-refresh');
   if (refreshBtn) {
     refreshBtn.addEventListener('click', () => {
       refreshBtn.classList.add('spinning');
-      loadAnalytics().finally(() => {
-        refreshBtn.classList.remove('spinning');
-      });
+      loadAnalytics().finally(() => refreshBtn.classList.remove('spinning'));
     });
   }
 }
@@ -1243,8 +1793,6 @@ function initAnalyticsControls() {
 async function loadAnalytics() {
   if (AN.loading) return;
   AN.loading = true;
-
-  // Show skeleton loading states
   setAnalyticsLoading(true);
 
   try {
@@ -1269,17 +1817,15 @@ async function loadAnalytics() {
 }
 
 function setAnalyticsLoading(loading) {
-  const loadingHtml = '<div class="an-loading-state">Loading…</div>';
-  if (loading) {
-    ['an-model-table-wrap','an-compare-bars','an-project-list',
-     'an-status-row','an-dur-bars','an-aspect-wrap','an-deep-cards'].forEach(id => {
-      const el = $(id);
-      if (el) el.innerHTML = loadingHtml;
-    });
-  }
+  if (!loading) return;
+  const html = '<div class="an-loading-state">Loading…</div>';
+  ['an-model-table-wrap','an-compare-bars','an-project-list',
+   'an-status-row','an-dur-bars','an-aspect-wrap','an-deep-cards'].forEach(id => {
+    const el = $(id);
+    if (el) el.innerHTML = html;
+  });
 }
 
-/* ── FILTER MODELS BY FAMILY ──────────────────────────────────── */
 function filteredModels(allModels) {
   if (AN.modelFilter === 'all') return allModels;
   return allModels.filter(m => m.family === AN.modelFilter);
@@ -1288,7 +1834,6 @@ function filteredModels(allModels) {
 /* ── RENDER ALL ANALYTICS ─────────────────────────────────────── */
 function renderAnalytics(data) {
   const models = filteredModels(data.models || []);
-
   renderSummaryCards(data, models);
   renderActivityChart(data.daily || []);
   renderModelTable(models);
@@ -1299,11 +1844,10 @@ function renderAnalytics(data) {
   renderStatusBreakdown(data.overview || {}, models);
   renderDeepDive(AN.focusedModel, models);
 
-  // Update activity period badge
   const periodBadge = $('an-activity-period');
   if (periodBadge) {
-    const rangeLabels = { '7d': 'Last 7 days', '30d': 'Last 30 days', '90d': 'Last 90 days', 'all': 'All time' };
-    periodBadge.textContent = rangeLabels[AN.range] || AN.range;
+    const labels = { '7d': 'Last 7 days', '30d': 'Last 30 days', '90d': 'Last 90 days', all: 'All time' };
+    periodBadge.textContent = labels[AN.range] || AN.range;
   }
 }
 
@@ -1311,7 +1855,6 @@ function renderAnalytics(data) {
 function renderSummaryCards(data, filteredMods) {
   const ov = data.overview || {};
 
-  // Aggregate filtered model stats if filter is active
   let totalReqs   = ov.total_shots  || 0;
   let successRate = ov.success_rate || 0;
   let totalSecs   = ov.total_seconds || 0;
@@ -1319,47 +1862,42 @@ function renderSummaryCards(data, filteredMods) {
 
   if (AN.modelFilter !== 'all' && filteredMods.length > 0) {
     totalReqs   = filteredMods.reduce((a, m) => a + (m.total || 0), 0);
-    const totalCompleted = filteredMods.reduce((a, m) => a + (m.completed || 0), 0);
-    successRate = totalReqs > 0 ? Math.round((totalCompleted / totalReqs) * 100) : 0;
+    const completed = filteredMods.reduce((a, m) => a + (m.completed || 0), 0);
+    successRate = totalReqs > 0 ? Math.round((completed / totalReqs) * 100) : 0;
     totalSecs   = filteredMods.reduce((a, m) => a + (m.total_seconds_gen || 0), 0);
     totalCost   = filteredMods.reduce((a, m) => a + parseFloat(m.est_cost_usd || 0), 0);
   }
 
-  // P50 / P90 — weighted average across filtered models
   let p50 = null, p90 = null;
   const modelsWithSpeed = filteredMods.filter(m => m.p50_gen_sec != null && m.total > 0);
   if (modelsWithSpeed.length > 0) {
-    const totalWeight = modelsWithSpeed.reduce((a, m) => a + m.total, 0);
-    p50 = Math.round(modelsWithSpeed.reduce((a, m) => a + (m.p50_gen_sec * m.total), 0) / totalWeight);
-    p90 = Math.round(modelsWithSpeed.reduce((a, m) => a + (m.p90_gen_sec * m.total), 0) / totalWeight);
+    const tw = modelsWithSpeed.reduce((a, m) => a + m.total, 0);
+    p50 = Math.round(modelsWithSpeed.reduce((a, m) => a + (m.p50_gen_sec * m.total), 0) / tw);
+    p90 = Math.round(modelsWithSpeed.reduce((a, m) => a + (m.p90_gen_sec * m.total), 0) / tw);
   } else if (AN.modelFilter === 'all') {
-    // Fallback to overview avg
     p50 = ov.avg_gen_time_sec ? Math.round(ov.avg_gen_time_sec) : null;
     p90 = ov.avg_gen_time_sec ? Math.round(ov.avg_gen_time_sec * 1.3) : null;
   }
 
   setText('an-total-requests', totalReqs.toLocaleString());
-  setText('an-total-sub', `${filteredMods.length || data.models?.length || 0} model${(filteredMods.length || 1) !== 1 ? 's' : ''} active`);
-  setText('an-success-rate', `${successRate}%`);
-  setText('an-speed-p50',   p50 != null ? `${p50}s` : '—');
-  setText('an-speed-p90',   p90 != null ? `${p90}s` : '—');
-  setText('an-total-cost',  `$${totalCost.toFixed(2)}`);
+  setText('an-total-sub',     `${filteredMods.length || data.models?.length || 0} model${(filteredMods.length || 1) !== 1 ? 's' : ''} active`);
+  setText('an-success-rate',  `${successRate}%`);
+  setText('an-speed-p50',     p50 != null ? `${p50}s` : '—');
+  setText('an-speed-p90',     p90 != null ? `${p90}s` : '—');
+  setText('an-total-cost',    `$${totalCost.toFixed(2)}`);
   setText('an-total-seconds', `${totalSecs}s`);
 
-  // Animate success bar
   const bar = $('an-success-bar');
   if (bar) {
-    // Colour based on rate
     bar.style.background = successRate >= 80 ? 'var(--green)' : successRate >= 50 ? 'var(--yellow)' : 'var(--red)';
-    // Defer to allow CSS transition
     requestAnimationFrame(() => { bar.style.width = `${successRate}%`; });
   }
 }
 
-/* ── ACTIVITY CHART (SVG bar chart) ──────────────────────────── */
+/* ── ACTIVITY CHART (SVG) ─────────────────────────────────────── */
 function renderActivityChart(dailyData) {
-  const svg      = $('an-activity-svg');
-  const emptyEl  = $('an-activity-empty');
+  const svg     = $('an-activity-svg');
+  const emptyEl = $('an-activity-empty');
   if (!svg) return;
 
   if (!dailyData.length) {
@@ -1374,28 +1912,23 @@ function renderActivityChart(dailyData) {
   const chartW = W - padL - padR;
   const chartH = H - LABEL_H;
 
-  const maxVal = Math.max(...dailyData.map(d => (d.total || 0)), 1);
+  const maxVal = Math.max(...dailyData.map(d => d.total || 0), 1);
   const n      = dailyData.length;
   const bw     = Math.max(2, (chartW / n) - 2);
   const gap    = (chartW - bw * n) / Math.max(n - 1, 1);
 
-  let svgContent = '';
-
-  // Axis line
-  svgContent += `<line class="bar-axis" x1="${padL}" y1="${H - LABEL_H}" x2="${W - padR}" y2="${H - LABEL_H}"/>`;
+  let svgContent = `<line class="bar-axis" x1="${padL}" y1="${H - LABEL_H}" x2="${W - padR}" y2="${H - LABEL_H}"/>`;
 
   dailyData.forEach((d, i) => {
-    const x        = padL + i * (bw + gap);
-    const total    = d.total    || 0;
+    const x         = padL + i * (bw + gap);
+    const total     = d.total     || 0;
     const completed = d.completed || 0;
-    const failed   = d.failed   || 0;
-    const active   = total - completed - failed;
+    const failed    = d.failed    || 0;
 
-    const hTotal    = total    > 0 ? Math.max((total    / maxVal) * chartH, 2) : 0;
-    const hCompleted= completed> 0 ? Math.max((completed/ maxVal) * chartH, 2) : 0;
-    const hFailed   = failed   > 0 ? Math.max((failed   / maxVal) * chartH, 2) : 0;
+    const hTotal     = total     > 0 ? Math.max((total     / maxVal) * chartH, 2) : 0;
+    const hCompleted = completed > 0 ? Math.max((completed / maxVal) * chartH, 2) : 0;
+    const hFailed    = failed    > 0 ? Math.max((failed    / maxVal) * chartH, 2) : 0;
 
-    // Stacked: completed (bottom) + failed (top) — proportional
     if (hTotal > 0) {
       svgContent += `<rect class="bar-completed" x="${x}" y="${(H - LABEL_H) - hCompleted}" width="${bw}" height="${hCompleted}" rx="1"/>`;
       if (hFailed > 0) {
@@ -1403,10 +1936,9 @@ function renderActivityChart(dailyData) {
       }
     }
 
-    // Label every Nth bar depending on density
     const step = n <= 10 ? 1 : n <= 20 ? 2 : n <= 31 ? 3 : 7;
     if (i % step === 0) {
-      const dayLabel = d.day ? d.day.slice(5) : '';   // MM-DD
+      const dayLabel = d.day ? d.day.slice(5) : '';
       svgContent += `<text class="bar-label" x="${x + bw / 2}" y="${H}">${escHtml(dayLabel)}</text>`;
     }
   });
@@ -1437,7 +1969,7 @@ function renderModelTable(models) {
             ${escHtml(m.label)}
           </div>
         </td>
-        <td style="text-align:right;font-family:'Space Mono',monospace;color:var(--ice);font-weight:700">${m.total}</td>
+        <td style="text-align:right;font-family:'Space Mono',monospace;color:var(--text-primary);font-weight:700">${m.total}</td>
         <td><span class="an-rate-pill ${rateClass}">${m.success_rate}%</span></td>
         <td><span class="an-speed-val">${p50}</span></td>
         <td><span class="an-speed-val">${p90}</span></td>
@@ -1460,12 +1992,10 @@ function renderModelTable(models) {
       <tbody>${rows}</tbody>
     </table>`;
 
-  // Click row → deep dive
   wrap.querySelectorAll('tr[data-model-id]').forEach(row => {
     row.addEventListener('click', () => {
       const mid = row.dataset.modelId;
       AN.focusedModel = AN.focusedModel === mid ? null : mid;
-      // Re-render table highlighting + deep dive
       renderModelTable(models);
       renderDeepDive(AN.focusedModel, models);
     });
@@ -1477,13 +2007,9 @@ function renderCompareBars(models) {
   const wrap = $('an-compare-bars');
   if (!wrap) return;
 
-  if (!models.length) {
-    wrap.innerHTML = '<div class="an-empty-state">No data yet.</div>';
-    return;
-  }
+  if (!models.length) { wrap.innerHTML = '<div class="an-empty-state">No data yet.</div>'; return; }
 
   const sorted = [...models].sort((a, b) => b.success_rate - a.success_rate);
-
   wrap.innerHTML = sorted.map(m => {
     const colour = MODEL_COLOURS[m.family] || MODEL_COLOURS.other;
     return `
@@ -1502,13 +2028,9 @@ function renderDurationBars(durationData) {
   const wrap = $('an-dur-bars');
   if (!wrap) return;
 
-  if (!durationData.length) {
-    wrap.innerHTML = '<div class="an-empty-state">No data yet.</div>';
-    return;
-  }
+  if (!durationData.length) { wrap.innerHTML = '<div class="an-empty-state">No data yet.</div>'; return; }
 
   const maxCount = Math.max(...durationData.map(d => d.count || 0), 1);
-
   wrap.innerHTML = durationData.map(d => {
     const pct = Math.round(((d.count || 0) / maxCount) * 100);
     return `
@@ -1527,15 +2049,10 @@ function renderAspectRatio(aspectData) {
   const wrap = $('an-aspect-wrap');
   if (!wrap) return;
 
-  if (!aspectData.length) {
-    wrap.innerHTML = '<div class="an-empty-state">No data yet.</div>';
-    return;
-  }
+  if (!aspectData.length) { wrap.innerHTML = '<div class="an-empty-state">No data yet.</div>'; return; }
 
   const total = aspectData.reduce((a, d) => a + (d.count || 0), 0) || 1;
-
-  // Visual dimensions for aspect ratio icons
-  const dims = {
+  const dims  = {
     '16:9': { w: 32, h: 18 }, '9:16': { w: 16, h: 28 },
     '1:1':  { w: 24, h: 24 }, '4:5':  { w: 20, h: 25 },
     '4:3':  { w: 28, h: 21 }, '3:4':  { w: 21, h: 28 },
@@ -1560,24 +2077,20 @@ function renderProjectVelocity(projects) {
   if (!wrap) return;
 
   const active = projects.filter(p => (p.total_shots || 0) > 0);
-
   if (!active.length) {
     wrap.innerHTML = '<div class="an-proj-empty">No projects with shots yet.</div>';
     return;
   }
 
-  // Header row
   let html = `
     <div class="an-proj-row" style="opacity:0.5;font-size:0.62rem;text-transform:uppercase;letter-spacing:0.06em">
-      <div style="color:var(--ice-ghost)">Project</div>
-      <div style="color:var(--ice-ghost);text-align:right">Shots</div>
-      <div style="color:var(--ice-ghost);text-align:right">Done</div>
+      <div style="color:var(--text-muted)">Project</div>
+      <div style="color:var(--text-muted);text-align:right">Shots</div>
+      <div style="color:var(--text-muted);text-align:right">Done</div>
     </div>`;
 
   html += active.map(p => {
-    const pct = p.total_shots > 0
-      ? Math.round(((p.completed_shots || 0) / p.total_shots) * 100)
-      : 0;
+    const pct      = p.total_shots > 0 ? Math.round(((p.completed_shots || 0) / p.total_shots) * 100) : 0;
     const rateStyle = pct >= 80 ? 'color:var(--green)' : pct >= 50 ? 'color:var(--yellow)' : 'color:var(--red)';
     return `
       <div class="an-proj-row">
@@ -1600,15 +2113,12 @@ function renderStatusBreakdown(overview, models) {
   let nsfw      = overview.nsfw      || 0;
   let active    = overview.active    || 0;
 
-  // Aggregate from filtered models if filter is active
   if (AN.modelFilter !== 'all' && models.length > 0) {
     completed = models.reduce((a, m) => a + (m.completed || 0), 0);
     failed    = models.reduce((a, m) => a + (m.failed    || 0), 0);
     nsfw      = models.reduce((a, m) => a + (m.nsfw      || 0), 0);
     active    = models.reduce((a, m) => a + (m.active    || 0), 0);
   }
-
-  const total = completed + failed + nsfw + active || 1;
 
   wrap.innerHTML = `
     <div class="an-status-seg completed" title="${completed} completed">
@@ -1636,8 +2146,7 @@ function renderDeepDive(modelId, models) {
   if (!wrap || !panel) return;
 
   if (!modelId) {
-    wrap.innerHTML = '<div class="an-loading-state" style="color:var(--ice-ghost)">Click a model row above to drill into its metrics</div>';
-    // Reset deep-dive header hint
+    wrap.innerHTML = '<div class="an-loading-state" style="color:var(--text-muted)">Click a model row above to drill into its metrics</div>';
     const hint = panel.querySelector('.an-panel-hint');
     if (hint) hint.textContent = 'click a model in the table above to focus';
     return;
@@ -1649,38 +2158,25 @@ function renderDeepDive(modelId, models) {
     return;
   }
 
-  // Update panel hint to show focused model name
   const hint = panel.querySelector('.an-panel-hint');
   if (hint) hint.textContent = m.label;
 
-  const colour = MODEL_COLOURS[m.family] || MODEL_COLOURS.other;
-
-  // Estimated cost per generation
-  const costPerGen = m.total > 0
-    ? (parseFloat(m.est_cost_usd || 0) / m.total).toFixed(3)
-    : '0.000';
-
-  // Output video minutes
-  const outputMins = m.total_seconds_gen
-    ? (m.total_seconds_gen / 60).toFixed(1)
-    : '0.0';
-
-  // Error rate
-  const errRate = m.total > 0
-    ? Math.round(((( m.failed || 0) + (m.nsfw || 0)) / m.total) * 100)
-    : 0;
+  const colour     = MODEL_COLOURS[m.family] || MODEL_COLOURS.other;
+  const costPerGen = m.total > 0 ? (parseFloat(m.est_cost_usd || 0) / m.total).toFixed(3) : '0.000';
+  const outputMins = m.total_seconds_gen ? (m.total_seconds_gen / 60).toFixed(1) : '0.0';
+  const errRate    = m.total > 0 ? Math.round((((m.failed || 0) + (m.nsfw || 0)) / m.total) * 100) : 0;
 
   const cards = [
-    { label: 'Total Requests',    value: m.total,            sub: `${m.total} generations` },
-    { label: 'Completed',         value: m.completed || 0,   sub: `${m.success_rate}% success rate` },
-    { label: 'Failed / Blocked',  value: `${(m.failed||0) + (m.nsfw||0)}`, sub: `${errRate}% error rate` },
-    { label: 'Speed P50',         value: m.p50_gen_sec != null ? `${m.p50_gen_sec}s` : '—', sub: 'median gen time' },
-    { label: 'Speed P90',         value: m.p90_gen_sec != null ? `${m.p90_gen_sec}s` : '—', sub: '90th percentile' },
-    { label: 'Min Gen Time',      value: m.min_gen_sec  != null ? `${Math.round(m.min_gen_sec)}s`  : '—', sub: 'fastest job' },
-    { label: 'Max Gen Time',      value: m.max_gen_sec  != null ? `${Math.round(m.max_gen_sec)}s`  : '—', sub: 'slowest job' },
-    { label: 'Est. Total Cost',   value: `$${m.est_cost_usd}`, sub: `$${costPerGen} per gen` },
-    { label: 'Output Video',      value: `${m.total_seconds_gen || 0}s`, sub: `${outputMins} mins generated` },
-    { label: 'Active Jobs',       value: m.active || 0,      sub: 'currently running' },
+    { label: 'Total Requests',   value: m.total,                                         sub: `${m.total} generations` },
+    { label: 'Completed',        value: m.completed || 0,                                sub: `${m.success_rate}% success rate` },
+    { label: 'Failed / Blocked', value: `${(m.failed || 0) + (m.nsfw || 0)}`,            sub: `${errRate}% error rate` },
+    { label: 'Speed P50',        value: m.p50_gen_sec != null ? `${m.p50_gen_sec}s` : '—', sub: 'median gen time' },
+    { label: 'Speed P90',        value: m.p90_gen_sec != null ? `${m.p90_gen_sec}s` : '—', sub: '90th percentile' },
+    { label: 'Min Gen Time',     value: m.min_gen_sec != null ? `${Math.round(m.min_gen_sec)}s` : '—', sub: 'fastest job' },
+    { label: 'Max Gen Time',     value: m.max_gen_sec != null ? `${Math.round(m.max_gen_sec)}s` : '—', sub: 'slowest job' },
+    { label: 'Est. Total Cost',  value: `$${m.est_cost_usd}`,                            sub: `$${costPerGen} per gen` },
+    { label: 'Output Video',     value: `${m.total_seconds_gen || 0}s`,                  sub: `${outputMins} mins generated` },
+    { label: 'Active Jobs',      value: m.active || 0,                                   sub: 'currently running' },
   ];
 
   wrap.innerHTML = cards.map(card => `
@@ -1691,24 +2187,8 @@ function renderDeepDive(modelId, models) {
     </div>`).join('');
 }
 
-/* ── HELPER: setText ──────────────────────────────────────────── */
+/* ── setText HELPER ───────────────────────────────────────────── */
 function setText(id, val) {
   const el = $(id);
   if (el) el.textContent = val;
 }
-
-/* ── INIT ANALYTICS ON DOM READY ─────────────────────────────── */
-// We hook into the existing DOMContentLoaded flow by patching bindUI
-const _origBindUI = typeof bindUI === 'function' ? bindUI : null;
-
-// Patch: run analytics init after the main bindUI
-document.addEventListener('DOMContentLoaded', () => {
-  initViewSwitcher();
-  initAnalyticsControls();
-});
-
-// Also hook into enterApp so analytics reloads when user logs in
-const _origEnterApp = enterApp;
-// Override enterApp to also set up analytics when auth gate clears
-// (We use a flag to avoid double-init)
-let _analyticsInited = false;

@@ -284,8 +284,116 @@ ${params.style_bible ? `- Project style bible: ${params.style_bible}` : ''}
 }
 
 /* ══════════════════════════════════════════════════════════════════
-   TIER ENFORCEMENT HELPER
+   GPT-4o PROMPT ENHANCER — ADVANCED (mode-aware)
 ══════════════════════════════════════════════════════════════════ */
+
+// Style preset definitions — injected into prompt enhancement
+const STYLE_PRESETS: Record<string, { label: string; modifier: string }> = {
+  neon_noir:        { label: 'Neon Noir',        modifier: 'neon-lit cyberpunk noir, wet reflective streets, deep shadows with colored light, high contrast chiaroscuro' },
+  golden_hour:      { label: 'Golden Hour',      modifier: 'warm golden hour cinematography, long shadows, lens flare, rich amber and orange tones, hazy atmosphere' },
+  studio_clean:     { label: 'Studio Clean',     modifier: 'pristine studio lighting, pure white or charcoal background, sharp product-level detail, commercial photography' },
+  analog_grain:     { label: 'Analog Film',      modifier: 'analog 35mm film grain, Kodachrome color palette, slight vignette, vintage lens softness, warm nostalgic tones' },
+  arctic_cold:      { label: 'Arctic Cold',      modifier: 'icy cold color palette, desaturated blues and whites, stark minimalist composition, crisp frozen atmosphere' },
+  hyperreal:        { label: 'Hyperreal',        modifier: 'hyperrealistic detail, ultra-sharp 8K texture, photorealistic lighting simulation, no stylization' },
+  dreamlike:        { label: 'Dreamlike',        modifier: 'ethereal dream sequence, soft bloom, pastel haze, floating particles, surreal impossible geometry' },
+  brutalist:        { label: 'Brutalist',        modifier: 'harsh brutalist architecture aesthetic, raw concrete textures, severe geometric shadows, monochrome urban grit' },
+  sunset_epic:      { label: 'Sunset Epic',      modifier: 'epic sunset cinematography, silhouette compositions, deep magenta and gold sky, dramatic cloud formations' },
+  underwater:       { label: 'Underwater',       modifier: 'underwater cinematography, caustic light patterns, blue-green color wash, floating debris, depth haze' },
+  infrared:         { label: 'Infrared',         modifier: 'infrared photography aesthetic, white foliage, dark skies, surreal high-contrast tones, dreamlike landscape' },
+  fashion_editorial: { label: 'Fashion Editorial', modifier: 'high-fashion editorial photography, bold graphic composition, strong single light source, luxury aesthetic' },
+  horror_dread:     { label: 'Horror Dread',     modifier: 'atmospheric horror cinematography, low key lighting, oppressive shadows, desaturated palette, unsettling stillness' },
+  retro_wave:       { label: 'Retrowave',        modifier: 'retrowave synthwave aesthetic, neon pink and blue gradients, grid lines, chrome reflections, 80s futurism' },
+  nature_epic:      { label: 'Nature Epic',      modifier: 'epic nature documentary cinematography, drone aerial perspective, sweeping landscape, neutral natural light' },
+  minimalist:       { label: 'Minimalist',       modifier: 'stark minimalist composition, single subject, vast negative space, muted neutral palette, clean lines' },
+  smoke_haze:       { label: 'Smoke & Haze',    modifier: 'heavy atmospheric haze and smoke, volumetric light shafts, fog machine density, mysterious silhouettes' },
+  raw_documentary:  { label: 'Documentary',      modifier: 'raw handheld documentary style, natural available light, observational framing, authentic unposed moments' },
+  sci_fi_clinical:  { label: 'Sci-Fi Clinical',  modifier: 'clean sci-fi laboratory aesthetic, cold blue-white lighting, holographic UI elements, antiseptic precision' },
+  western_dust:     { label: 'Western Dust',     modifier: 'spaghetti western cinematography, dusty warm tones, extreme closeup eye shots, sparse arid landscape' },
+}
+
+// Mode-specific system prompts
+const ENHANCE_MODE_PROMPTS: Record<string, string> = {
+  cinematic: `You are a world-class AI video director. Transform the prompt into a rich, cinematic production-quality prompt.
+- Add specific camera movement (dolly push, orbital tracking, static locked, handheld verité)
+- Add precise lighting description (motivated key light, golden fill, practical neon, moonlight)  
+- Add lens and depth of field (wide 24mm, compressed 85mm telephoto, anamorphic, deep focus)
+- Add atmospheric elements (volumetric fog, dust motes, lens flare, bokeh quality)
+- Keep subject/action faithful to original — amplify the visual language
+- Output ONLY the enhanced prompt. Max 160 words.`,
+
+  realism: `You are a photorealistic video director. Transform the prompt to maximize believability.
+- Emphasize naturalistic lighting (overcast diffuse, window light, practical sources)
+- Specify realistic camera (Sony Venice, ARRI Alexa, handheld subtle drift)
+- Add authentic environmental detail (ambient occlusion, micro-textures, real physics)
+- Remove fantastical elements — ground everything in observable reality
+- Mention realistic color grade (low contrast, skin-accurate, slight digital grain)
+- Output ONLY the enhanced prompt. Max 160 words.`,
+
+  motion: `You are a motion-design director. Transform the prompt to emphasize movement and dynamics.
+- Describe specific movement arcs (sweeping 180° arc, rapid whip pan, slow creep push)
+- Add subject motion details (flowing fabric, hair movement, liquid physics, crowd energy)
+- Specify momentum and pacing (sudden burst, graceful deceleration, rhythmic pulse)
+- Add particle and environmental motion (wind, dust, water, fire behavior)
+- Consider frame rate feel (slow-motion stretch, overcranked silky motion)
+- Output ONLY the enhanced prompt. Max 160 words.`,
+
+  storytelling: `You are a narrative film director. Transform the prompt to tell a visual story.
+- Establish clear subject emotional state and arc
+- Add visual storytelling elements (symbolic framing, negative space meaning, color as emotion)
+- Specify POV and perspective relationship (intimate close-up, god-eye overhead, character POV)
+- Add temporal context (time of day, season, before/during/after key moment)
+- Include subtle environmental storytelling (setting details that reveal character)
+- Output ONLY the enhanced prompt. Max 160 words.`,
+
+  camera: `You are a cinematography expert. Transform the prompt to showcase exceptional camera craft.
+- Lead with the specific shot type (extreme close-up, medium two-shot, cowboy shot, establishing wide)
+- Specify exact lens focal length and characteristic (35mm Cooke S4, 50mm vintage Zeiss)
+- Define camera movement with precision (fluid head tilt, doorway dolly, shoulder rig walk)
+- Add focus technique (rack focus hero-to-background, shallow 1.4 bokeh, deep focus 22)
+- Specify exposure and sensor feel (slightly overexposed highlights, lifted blacks)
+- Output ONLY the enhanced prompt. Max 160 words.`,
+}
+
+async function enhancePromptAdvanced(env: Bindings, params: {
+  prompt:       string
+  style_bible?: string
+  model:        string
+  aspect_ratio: string
+  mode?:        string
+  style_preset?: string
+}): Promise<string> {
+  try {
+    const ai   = getAIClient(env)
+    const mode = params.mode || 'cinematic'
+
+    // Build system prompt from mode
+    const modePrompt = ENHANCE_MODE_PROMPTS[mode] || ENHANCE_MODE_PROMPTS.cinematic
+
+    // Append style preset modifier if provided
+    const presetModifier = params.style_preset && STYLE_PRESETS[params.style_preset]
+      ? `\n- Apply this visual style: ${STYLE_PRESETS[params.style_preset].modifier}`
+      : ''
+
+    const systemPrompt = `${modePrompt}${presetModifier}
+- Reference the generation model: ${params.model}
+- Target aspect ratio: ${params.aspect_ratio}${params.style_bible ? `\n- Project style bible: ${params.style_bible}` : ''}`
+
+    const resp = await ai.chat.completions.create({
+      model:       'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: params.prompt },
+      ],
+      temperature: 0.75,
+      max_tokens:  220,
+    })
+    return resp.choices[0]?.message?.content?.trim() || params.prompt
+  } catch {
+    return params.prompt
+  }
+}
+
+
 async function checkTierLimits(db: D1Database, userId: string, tier: string): Promise<{ ok: boolean; reason?: string }> {
   const limits = TIER_LIMITS[tier] || TIER_LIMITS.free
 
@@ -671,10 +779,14 @@ app.post('/api/generate', requireAuth, async (c) => {
     const {
       project_id,
       prompt,
-      model        = 'higgsfield-ai/dop/preview',
+      model        = 'higgsfield-ai/dop/standard',
       aspect_ratio = '16:9',
       duration     = 5,
       image_url,
+      seed,
+      style_preset,
+      quality,
+      enhance_mode = 'cinematic',
     } = body
 
     if (!project_id) return c.json({ error: 'project_id required' }, 400)
@@ -695,33 +807,43 @@ app.post('/api/generate', requireAuth, async (c) => {
 
     const credentials = await decryptKey(keyRow.encrypted_key, keyRow.iv, c.env.ENCRYPTION_KEY)
 
-    // Enhance prompt with GPT-4o
+    // Enhance prompt with GPT-4o (advanced mode-aware)
     const styleBible = project.style_bible ? JSON.parse(project.style_bible) : null
-    const promptEnhanced = await enhancePrompt(c.env, {
+    const promptEnhanced = await enhancePromptAdvanced(c.env, {
       prompt,
       style_bible:  styleBible ? JSON.stringify(styleBible) : undefined,
       model,
       aspect_ratio,
+      mode:         enhance_mode,
+      style_preset,
     })
 
-    // Create shot record with pending status
+    // Create shot record with pending status (includes new upgrade fields)
     const shotId = uuid()
     await c.env.DB.prepare(
-      `INSERT INTO shots (id, project_id, user_id, prompt_raw, prompt_enhanced, provider, model, aspect_ratio, duration, status)
-       VALUES (?, ?, ?, ?, ?, 'higgsfield', ?, ?, ?, 'pending')`
-    ).bind(shotId, project_id, userId, prompt, promptEnhanced, model, aspect_ratio, duration).run()
+      `INSERT INTO shots (id, project_id, user_id, prompt_raw, prompt_enhanced, provider, model, aspect_ratio, duration, status, seed, style_preset, quality)
+       VALUES (?, ?, ?, ?, ?, 'higgsfield', ?, ?, ?, 'pending', ?, ?, ?)`
+    ).bind(
+      shotId, project_id, userId, prompt, promptEnhanced,
+      model, aspect_ratio, duration,
+      seed ?? null, style_preset ?? null, quality ?? null,
+    ).run()
+
+    // Build Higgsfield body — include seed if provided
+    const hfBody: Record<string, any> = {
+      model,
+      prompt:      promptEnhanced,
+      image_url,
+      duration,
+      aspect_ratio,
+      credentials,
+    }
+    if (seed !== undefined && seed !== null) hfBody.seed = seed
 
     // Submit to Higgsfield
     let hfResult: any
     try {
-      hfResult = await hfSubmitJob({
-        model,
-        prompt:      promptEnhanced,
-        image_url,
-        duration,
-        aspect_ratio,
-        credentials,
-      })
+      hfResult = await hfSubmitJob(hfBody)
     } catch (hfErr: any) {
       await c.env.DB.prepare(
         `UPDATE shots SET status='failed', error_message=? WHERE id=?`
@@ -740,11 +862,13 @@ app.post('/api/generate', requireAuth, async (c) => {
     ).bind(project_id).run()
 
     return c.json({
-      ok:             true,
-      shot_id:        shotId,
-      request_id:     hfResult.request_id,
-      status:         'queued',
+      ok:              true,
+      shot_id:         shotId,
+      request_id:      hfResult.request_id,
+      status:          'queued',
       prompt_enhanced: promptEnhanced,
+      seed:            seed ?? null,
+      style_preset:    style_preset ?? null,
     }, 202)
 
   } catch (err: any) {
@@ -1039,14 +1163,83 @@ function modelFamily(id: string): string {
   return 'other'
 }
 
-// POST /api/enhance-prompt — standalone prompt enhancer
+// POST /api/enhance-prompt — standalone prompt enhancer with mode support
 app.post('/api/enhance-prompt', requireAuth, async (c) => {
   try {
-    const { prompt, model = 'higgsfield-ai/dop/preview', aspect_ratio = '16:9', style_bible } = await c.req.json()
+    const {
+      prompt,
+      model        = 'higgsfield-ai/dop/standard',
+      aspect_ratio = '16:9',
+      style_bible,
+      mode         = 'cinematic',
+      style_preset,
+    } = await c.req.json()
     if (!prompt?.trim()) return c.json({ error: 'Prompt required' }, 400)
 
-    const enhanced = await enhancePrompt(c.env, { prompt, model, aspect_ratio, style_bible })
-    return c.json({ original: prompt, enhanced })
+    const enhanced = await enhancePromptAdvanced(c.env, {
+      prompt,
+      model,
+      aspect_ratio,
+      style_bible,
+      mode,
+      style_preset,
+    })
+    return c.json({ original: prompt, enhanced, mode })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// POST /api/upload — upload reference image to R2, return public URL
+app.post('/api/upload', requireAuth, async (c) => {
+  try {
+    if (!c.env.STORAGE) return c.json({ error: 'Storage not configured' }, 500)
+
+    const formData  = await c.req.formData()
+    const file      = formData.get('file') as File | null
+    if (!file) return c.json({ error: 'No file provided' }, 400)
+
+    // Validate image type
+    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+    if (!allowed.includes(file.type)) {
+      return c.json({ error: 'Only JPEG, PNG, WebP and GIF images are supported' }, 400)
+    }
+
+    // 10MB size limit
+    if (file.size > 10 * 1024 * 1024) {
+      return c.json({ error: 'Image must be under 10MB' }, 400)
+    }
+
+    const userId  = c.get('userId')
+    const ext     = file.type.split('/')[1].replace('jpeg', 'jpg')
+    const key     = `uploads/${userId}/${uuid()}.${ext}`
+
+    const buffer  = await file.arrayBuffer()
+    await c.env.STORAGE.put(key, buffer, {
+      httpMetadata: { contentType: file.type },
+    })
+
+    // Build a public URL using R2 custom domain or workers route
+    // Format: /api/image/:key — served by the endpoint below
+    const url = `/api/image/${encodeURIComponent(key)}`
+
+    return c.json({ ok: true, url, key, size: file.size, type: file.type })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// GET /api/image/:key — serve an R2 image
+app.get('/api/image/:key', async (c) => {
+  try {
+    if (!c.env.STORAGE) return c.json({ error: 'Storage not configured' }, 500)
+    const key    = decodeURIComponent(c.req.param('key'))
+    const object = await c.env.STORAGE.get(key)
+    if (!object) return c.json({ error: 'Image not found' }, 404)
+    const headers = new Headers()
+    headers.set('Content-Type', object.httpMetadata?.contentType || 'image/jpeg')
+    headers.set('Cache-Control', 'public, max-age=31536000')
+    return new Response(object.body, { headers })
   } catch (err: any) {
     return c.json({ error: err.message }, 500)
   }
@@ -1218,7 +1411,7 @@ app.get('/', (c) => c.html(landingPage()))
 export default app
 
 /* ══════════════════════════════════════════════════════════════════
-   VIDEO GENERATOR PAGE
+   VIDEO GENERATOR PAGE — CINEMATIC STUDIO v2
 ══════════════════════════════════════════════════════════════════ */
 function videoGeneratorPage(): string {
   return `<!DOCTYPE html>
@@ -1227,17 +1420,19 @@ function videoGeneratorPage(): string {
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Video Generator — Spectra</title>
-  <meta name="description" content="AI-powered video production with persistent project memory, character consistency, and multi-model generation.">
+  <meta name="description" content="AI-powered cinematic video production. Multi-model generation, style presets, seed control.">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/video-generator.css"/>
 </head>
 <body>
+
+<!-- NAV -->
 <nav id="vg-nav">
   <a href="/" class="vg-nav-logo">
     <span class="vg-logo-mark">S</span>
-    <span>SPECTRA</span>
+    <span class="vg-logo-text">SPECTRA</span>
   </a>
   <div class="vg-nav-center">
     <span class="vg-tool-badge">
@@ -1246,16 +1441,16 @@ function videoGeneratorPage(): string {
     </span>
   </div>
   <div class="vg-nav-right">
-    <button class="vg-nav-tab-btn" id="btn-show-studio" data-view="studio">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+    <button class="vg-nav-tab-btn active" id="btn-show-studio" data-view="studio">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="5 3 19 12 5 21 5 3"/></svg>
       Studio
     </button>
     <button class="vg-nav-tab-btn" id="btn-show-analytics" data-view="analytics">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
       Analytics
     </button>
     <button class="vg-keys-btn" id="btn-open-settings" title="Settings">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
       Settings
       <span class="vg-keys-status-dot" id="hf-key-dot"></span>
     </button>
@@ -1271,7 +1466,7 @@ function videoGeneratorPage(): string {
   <div class="vg-auth-card">
     <div class="vg-auth-logo"><span class="vg-logo-mark">S</span></div>
     <h2>Video Generator</h2>
-    <p>Sign in to access your projects and start generating.</p>
+    <p>Sign in to your studio and start generating.</p>
     <div class="vg-auth-tabs">
       <button class="vg-auth-tab active" data-auth-tab="login">Sign In</button>
       <button class="vg-auth-tab" data-auth-tab="register">Create Account</button>
@@ -1284,15 +1479,13 @@ function videoGeneratorPage(): string {
         <input type="password" id="auth-password" class="vg-input" placeholder="Password (min 8 chars)" autocomplete="current-password" required/>
       </div>
       <div id="auth-error" class="vg-auth-error" style="display:none"></div>
-      <button type="submit" class="vg-btn-generate" id="btn-auth-submit" style="width:100%;justify-content:center">
-        Sign In
-      </button>
+      <button type="submit" class="vg-btn-primary full-width" id="btn-auth-submit">Sign In</button>
     </form>
     <div class="vg-auth-tier-info">
-      <div class="vg-tier-chip free">Free — 10 generations/mo</div>
+      <div class="vg-tier-chip free">Free — 10/mo</div>
       <div class="vg-tier-chip creator">Creator $29 — 100/mo</div>
       <div class="vg-tier-chip studio">Studio $79 — 500/mo</div>
-      <div class="vg-tier-chip pro">Pro $149 — Unlimited</div>
+      <div class="vg-tier-chip pro">Pro $149 — ∞</div>
     </div>
   </div>
 </div>
@@ -1301,31 +1494,28 @@ function videoGeneratorPage(): string {
 <div class="vg-drawer-overlay" id="settings-overlay"></div>
 <aside class="vg-settings-drawer" id="settings-drawer">
   <div class="vg-drawer-header">
-    <div class="vg-drawer-title">Settings</div>
-    <div class="vg-drawer-subtitle">API keys are encrypted at rest and never exposed</div>
+    <div class="vg-drawer-title">Studio Settings</div>
+    <div class="vg-drawer-subtitle">API keys are encrypted at rest — never exposed</div>
     <button class="vg-drawer-close" id="btn-close-settings">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
     </button>
   </div>
   <div class="vg-drawer-body">
-    <!-- Account info -->
     <div class="vg-key-block">
       <div class="vg-key-block-header">
         <div class="vg-key-block-info">
           <div class="vg-key-block-name">Account</div>
           <div class="vg-key-block-desc" id="settings-account-info">Loading...</div>
         </div>
-        <button class="vg-key-save" id="btn-logout" style="background:rgba(248,113,113,0.1);border-color:rgba(248,113,113,0.3);color:#F87171">Sign Out</button>
+        <button class="vg-key-save danger" id="btn-logout">Sign Out</button>
       </div>
       <div class="vg-tier-limits-grid" id="settings-limits"></div>
     </div>
-
-    <!-- Higgsfield key -->
     <div class="vg-key-block">
       <div class="vg-key-block-header">
         <div class="vg-key-block-info">
           <div class="vg-key-block-name">Higgsfield API</div>
-          <div class="vg-key-block-desc">Format: KEY_ID:KEY_SECRET — found in your Higgsfield Cloud dashboard</div>
+          <div class="vg-key-block-desc">Format: KEY_ID:KEY_SECRET — from your Higgsfield Cloud dashboard</div>
         </div>
         <div class="vg-key-block-status" id="hf-key-status">
           <span class="vg-key-dot inactive"></span>
@@ -1343,11 +1533,9 @@ function videoGeneratorPage(): string {
       </div>
       <a class="vg-key-get-link" href="https://cloud.higgsfield.ai" target="_blank" rel="noopener">
         <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-        Get your keys → Higgsfield Cloud Dashboard
+        Get API keys → Higgsfield Cloud
       </a>
     </div>
-
-    <!-- Upgrade teaser -->
     <div class="vg-upgrade-card">
       <div class="vg-upgrade-title">Upgrade Your Plan</div>
       <div class="vg-upgrade-tiers">
@@ -1355,144 +1543,278 @@ function videoGeneratorPage(): string {
         <div class="vg-upgrade-tier"><span class="vg-ut-name">Studio</span><span class="vg-ut-price">$79/mo</span><span class="vg-ut-shots">500 shots · 25 projects</span></div>
         <div class="vg-upgrade-tier featured"><span class="vg-ut-name">Pro</span><span class="vg-ut-price">$149/mo</span><span class="vg-ut-shots">Unlimited</span></div>
       </div>
-      <button class="vg-btn-upgrade" id="btn-upgrade">Upgrade Plan</button>
+      <button class="vg-btn-primary full-width" id="btn-upgrade">Upgrade Plan</button>
     </div>
   </div>
 </aside>
 
-<!-- MAIN APP (shown after auth) -->
+<!-- MAIN STUDIO APP -->
 <main id="vg-app" style="display:none">
 
-  <!-- LEFT PANEL -->
+  <!-- ═══════════════ LEFT PANEL ═══════════════ -->
   <aside id="vg-input-panel">
 
     <!-- Project selector -->
-    <div class="vg-section">
-      <div class="vg-section-label-row">
+    <section class="vg-panel-section" id="vg-project-section">
+      <div class="vg-section-header">
         <span class="vg-section-label">Project</span>
-        <button class="vg-btn-new-project" id="btn-new-project">+ New</button>
+        <button class="vg-btn-chip" id="btn-new-project">
+          <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2v12M2 8h12"/></svg>
+          New
+        </button>
       </div>
       <div id="vg-project-selector">
         <div class="vg-project-loading">Loading projects...</div>
       </div>
-    </div>
+    </section>
 
-    <!-- Model selector -->
-    <div class="vg-section" id="vg-model-section">
-      <div class="vg-section-label">Generation Model</div>
-      <select id="vg-model-select" class="vg-input vg-select">
-        <option value="higgsfield-ai/dop/lite">DoP Lite (Fast · image-to-video)</option>
-        <option value="higgsfield-ai/dop/standard" selected>DoP Standard (image-to-video)</option>
-        <option value="higgsfield-ai/dop/turbo">DoP Turbo (image-to-video)</option>
-        <option value="kling-video/v2.1/pro/image-to-video">Kling 2.1 Pro (Cinematic · i2v)</option>
-        <option value="kling-video/v2.1/standard/image-to-video">Kling 2.1 Standard (i2v)</option>
-        <option value="bytedance/seedance/v1/pro/image-to-video">Seedance v1 Pro (i2v)</option>
-        <option value="bytedance/seedance/v1/lite/image-to-video">Seedance v1 Lite (Fast · i2v)</option>
-        <option value="higgsfield-ai/soul/standard">Soul — Text to Image</option>
-        <option value="flux-pro/kontext/max/text-to-image">Flux Kontext Max — Text to Image</option>
-      </select>
-      <div id="vg-model-hint" style="font-size:0.68rem;color:var(--ice-dim);margin-top:0.4rem"></div>
-    </div>
+    <!-- Divider -->
+    <div class="vg-panel-divider"></div>
 
-    <!-- Aspect ratio -->
-    <div class="vg-section">
-      <div class="vg-section-label">Aspect Ratio</div>
+    <!-- MODEL CARDS -->
+    <section class="vg-panel-section">
+      <div class="vg-section-header">
+        <span class="vg-section-label">Model</span>
+        <span class="vg-model-type-badge" id="vg-model-type-badge">i2v</span>
+      </div>
+      <div class="vg-model-cards" id="vg-model-cards">
+        <!-- Injected by JS -->
+      </div>
+    </section>
+
+    <!-- Divider -->
+    <div class="vg-panel-divider"></div>
+
+    <!-- ASPECT RATIO -->
+    <section class="vg-panel-section">
+      <div class="vg-section-header">
+        <span class="vg-section-label">Format</span>
+      </div>
       <div class="vg-aspect-row">
-        <button class="vg-aspect-btn" data-aspect="9:16"><div class="vg-aspect-icon vg-aspect-916"></div><span>9:16</span></button>
-        <button class="vg-aspect-btn active" data-aspect="16:9"><div class="vg-aspect-icon vg-aspect-169"></div><span>16:9</span></button>
-        <button class="vg-aspect-btn" data-aspect="1:1"><div class="vg-aspect-icon vg-aspect-11"></div><span>1:1</span></button>
-        <button class="vg-aspect-btn" data-aspect="4:5"><div class="vg-aspect-icon vg-aspect-45"></div><span>4:5</span></button>
-      </div>
-    </div>
-
-    <!-- Image input (required for i2v models) -->
-    <div class="vg-section" id="vg-image-section">
-      <div class="vg-section-label">Reference Image URL <span class="vg-optional" id="vg-image-label-note">(required for video models)</span></div>
-      <input type="url" id="vg-image-url" class="vg-input" placeholder="https://... (JPG, PNG, WebP — publicly accessible)"/>
-    </div>
-
-    <!-- Prompt -->
-    <div class="vg-section">
-      <div class="vg-section-label">Shot Prompt <span class="vg-required">*</span></div>
-      <div class="vg-textarea-wrap">
-        <textarea id="vg-prompt" class="vg-textarea" rows="4"
-          placeholder="Describe the shot — subject, action, camera movement, atmosphere...&#10;&#10;e.g. A woman walks through neon-lit Tokyo streets at night, slow tracking shot, rain on pavement, cinematic shallow depth of field"
-          maxlength="500"></textarea>
-        <span class="vg-char-count" id="vg-prompt-count">0/500</span>
-      </div>
-      <div class="vg-enhance-row">
-        <button class="vg-btn-enhance" id="btn-enhance-prompt">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-          Enhance with AI
+        <button class="vg-aspect-btn" data-aspect="9:16">
+          <div class="vg-aspect-icon vg-aspect-916"></div>
+          <span>9:16</span>
         </button>
-        <span class="vg-enhance-note">GPT-4o rewrites for cinematic quality</span>
+        <button class="vg-aspect-btn active" data-aspect="16:9">
+          <div class="vg-aspect-icon vg-aspect-169"></div>
+          <span>16:9</span>
+        </button>
+        <button class="vg-aspect-btn" data-aspect="1:1">
+          <div class="vg-aspect-icon vg-aspect-11"></div>
+          <span>1:1</span>
+        </button>
+        <button class="vg-aspect-btn" data-aspect="4:5">
+          <div class="vg-aspect-icon vg-aspect-45"></div>
+          <span>4:5</span>
+        </button>
       </div>
-    </div>
+    </section>
 
-    <!-- Duration -->
-    <div class="vg-section">
-      <div class="vg-section-label">Duration</div>
+    <!-- Divider -->
+    <div class="vg-panel-divider"></div>
+
+    <!-- DURATION -->
+    <section class="vg-panel-section">
+      <div class="vg-section-header">
+        <span class="vg-section-label">Duration</span>
+      </div>
       <div class="vg-duration-row">
         <button class="vg-dur-btn active" data-dur="5">5s</button>
         <button class="vg-dur-btn" data-dur="8">8s</button>
         <button class="vg-dur-btn" data-dur="10">10s</button>
         <button class="vg-dur-btn" data-dur="15">15s</button>
       </div>
-    </div>
+    </section>
 
-    <!-- Generate button -->
-    <div class="vg-actions">
-      <button class="vg-btn-generate" id="btn-generate">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polygon points="5 3 19 12 5 21 5 3"/>
-        </svg>
-        Generate Shot
-      </button>
-      <div class="vg-usage-bar" id="vg-usage-bar">
-        <div class="vg-usage-fill" id="vg-usage-fill"></div>
+    <!-- Divider -->
+    <div class="vg-panel-divider"></div>
+
+    <!-- QUALITY CONTROLS -->
+    <section class="vg-panel-section" id="vg-quality-section">
+      <div class="vg-section-header">
+        <span class="vg-section-label">Quality Controls</span>
+        <button class="vg-btn-chip" id="btn-reset-quality">Reset</button>
       </div>
-      <div class="vg-usage-label" id="vg-usage-label"></div>
-    </div>
+      <div class="vg-quality-sliders">
+        <div class="vg-slider-row">
+          <div class="vg-slider-info">
+            <span class="vg-slider-label">Motion Intensity</span>
+            <span class="vg-slider-val" id="val-motion">5</span>
+          </div>
+          <input type="range" class="vg-slider" id="slider-motion" min="1" max="10" value="5"/>
+          <div class="vg-slider-ends"><span>Subtle</span><span>Dynamic</span></div>
+        </div>
+        <div class="vg-slider-row">
+          <div class="vg-slider-info">
+            <span class="vg-slider-label">Stylization</span>
+            <span class="vg-slider-val" id="val-style">5</span>
+          </div>
+          <input type="range" class="vg-slider" id="slider-style" min="1" max="10" value="5"/>
+          <div class="vg-slider-ends"><span>Natural</span><span>Artistic</span></div>
+        </div>
+        <div class="vg-slider-row">
+          <div class="vg-slider-info">
+            <span class="vg-slider-label">Detail Level</span>
+            <span class="vg-slider-val" id="val-detail">7</span>
+          </div>
+          <input type="range" class="vg-slider" id="slider-detail" min="1" max="10" value="7"/>
+          <div class="vg-slider-ends"><span>Loose</span><span>Sharp</span></div>
+        </div>
+      </div>
+    </section>
 
   </aside>
 
-  <!-- RIGHT PANEL — SHOTS -->
-  <section id="vg-output-panel">
+  <!-- ═══════════════ CENTER STAGE ═══════════════ -->
+  <section id="vg-stage">
 
-    <!-- Project header -->
-    <div class="vg-project-header" id="vg-project-header" style="display:none">
-      <div class="vg-project-header-left">
-        <h2 class="vg-project-name" id="vg-current-project-name"></h2>
-        <span class="vg-project-shot-count" id="vg-project-shot-count"></span>
+    <!-- COMPOSE PANEL (generation form) -->
+    <div id="vg-compose">
+
+      <!-- Image upload zone -->
+      <div class="vg-compose-block" id="vg-image-block">
+        <div class="vg-compose-label">
+          Reference Image
+          <span class="vg-required-badge" id="vg-image-required-badge">required</span>
+          <span class="vg-optional-badge" id="vg-image-optional-badge" style="display:none">optional</span>
+        </div>
+        <div class="vg-upload-zone" id="vg-upload-zone">
+          <!-- Preview -->
+          <div class="vg-upload-preview" id="vg-upload-preview" style="display:none">
+            <img id="vg-upload-img" src="" alt="Reference"/>
+            <button class="vg-upload-clear" id="btn-clear-image" title="Remove image">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg>
+            </button>
+          </div>
+          <!-- Drop target -->
+          <div class="vg-upload-drop" id="vg-upload-drop">
+            <div class="vg-upload-icon">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+            </div>
+            <div class="vg-upload-text">Drop image here or</div>
+            <button class="vg-btn-upload-browse" id="btn-browse-image">Browse</button>
+            <div class="vg-upload-sub">or</div>
+            <input type="url" id="vg-image-url" class="vg-input vg-url-input" placeholder="Paste image URL..."/>
+          </div>
+          <input type="file" id="vg-file-input" accept="image/jpeg,image/png,image/webp,image/gif" style="display:none"/>
+        </div>
       </div>
-      <div class="vg-project-header-right">
-        <button class="vg-btn-icon" id="btn-edit-project" title="Edit style bible">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+
+      <!-- Prompt -->
+      <div class="vg-compose-block">
+        <div class="vg-compose-label-row">
+          <span class="vg-compose-label">Shot Prompt <span class="vg-required-star">*</span></span>
+          <div class="vg-enhance-modes" id="vg-enhance-modes">
+            <button class="vg-mode-btn active" data-mode="cinematic" title="Cinematic — camera language, lighting, lens">🎬</button>
+            <button class="vg-mode-btn" data-mode="realism" title="Realism — photorealistic, naturalistic">📷</button>
+            <button class="vg-mode-btn" data-mode="motion" title="Motion — movement, dynamics, physics">💫</button>
+            <button class="vg-mode-btn" data-mode="storytelling" title="Storytelling — narrative, emotion, POV">🎭</button>
+            <button class="vg-mode-btn" data-mode="camera" title="Camera — shot type, focal length, focus">🔭</button>
+          </div>
+        </div>
+        <div class="vg-textarea-wrap">
+          <textarea id="vg-prompt" class="vg-textarea" rows="4"
+            placeholder="Describe your shot — subject, action, atmosphere, camera movement...&#10;&#10;e.g. A woman walks through rain-soaked Tokyo streets at night, slow push-in, neon reflections"
+            maxlength="600"></textarea>
+          <span class="vg-char-count" id="vg-prompt-count">0/600</span>
+        </div>
+        <div class="vg-enhance-bar">
+          <button class="vg-btn-enhance" id="btn-enhance-prompt">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+            Enhance
+          </button>
+          <span class="vg-enhance-mode-label" id="enhance-mode-label">cinematic mode</span>
+          <div class="vg-enhance-divider"></div>
+          <span class="vg-enhance-note">GPT-4o rewrite</span>
+        </div>
+      </div>
+
+      <!-- Style Presets -->
+      <div class="vg-compose-block">
+        <div class="vg-compose-label-row">
+          <span class="vg-compose-label">Style Preset</span>
+          <button class="vg-btn-chip" id="btn-clear-preset">Clear</button>
+        </div>
+        <div class="vg-style-scroll" id="vg-style-scroll">
+          <!-- Injected by JS -->
+        </div>
+      </div>
+
+      <!-- Seed Control -->
+      <div class="vg-compose-block vg-seed-block">
+        <div class="vg-compose-label">Seed Control</div>
+        <div class="vg-seed-row">
+          <input type="number" id="vg-seed-input" class="vg-input vg-seed-input" placeholder="Random" min="0" max="2147483647"/>
+          <button class="vg-btn-seed-action" id="btn-randomize-seed" title="Randomize seed">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/></svg>
+          </button>
+          <button class="vg-btn-seed-action" id="btn-lock-seed" title="Lock current seed">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" id="lock-icon"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+          </button>
+        </div>
+        <div class="vg-seed-hint">Empty = random each time · Lock to reproduce exact results</div>
+      </div>
+
+      <!-- Generate button -->
+      <div class="vg-compose-actions">
+        <button class="vg-btn-generate" id="btn-generate">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          Generate Shot
+        </button>
+        <div class="vg-usage-wrap">
+          <div class="vg-usage-bar"><div class="vg-usage-fill" id="vg-usage-fill"></div></div>
+          <div class="vg-usage-label" id="vg-usage-label"></div>
+        </div>
+      </div>
+
+    </div><!-- /vg-compose -->
+
+    <!-- STORYBOARD PANEL -->
+    <div id="vg-storyboard">
+
+      <!-- Project header -->
+      <div class="vg-board-header" id="vg-board-header" style="display:none">
+        <div class="vg-board-header-left">
+          <h2 class="vg-project-name" id="vg-current-project-name"></h2>
+          <span class="vg-shot-count" id="vg-project-shot-count"></span>
+        </div>
+        <div class="vg-board-header-right">
+          <button class="vg-btn-icon-sm" id="btn-edit-project" title="Edit style bible">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          </button>
+          <button class="vg-btn-icon-sm" id="btn-toggle-view" title="Toggle view">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" id="view-toggle-icon"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Empty state -->
+      <div id="vg-empty" class="vg-empty-state">
+        <div class="vg-empty-icon">
+          <svg viewBox="0 0 80 80" fill="none">
+            <rect x="8" y="18" width="50" height="35" rx="3" stroke="currentColor" stroke-width="1.5" opacity="0.25"/>
+            <path d="M58 18l16-8v43l-16-8V18z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" opacity="0.25"/>
+            <circle cx="25" cy="33" r="4" stroke="currentColor" stroke-width="1.5" opacity="0.4"/>
+            <path d="M8 44l16-13 10 10 10-8 14 11" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.4"/>
+            <rect x="4" y="60" width="16" height="12" rx="1.5" stroke="currentColor" stroke-width="1.2" opacity="0.15"/>
+            <rect x="24" y="60" width="16" height="12" rx="1.5" stroke="currentColor" stroke-width="1.2" opacity="0.15"/>
+            <rect x="44" y="60" width="16" height="12" rx="1.5" stroke="currentColor" stroke-width="1.2" opacity="0.15"/>
+          </svg>
+        </div>
+        <h2 class="vg-empty-title">Select or create a project</h2>
+        <p class="vg-empty-sub">Projects remember your style bible, characters, and every shot you generate. Your creative memory lives here.</p>
+        <button class="vg-btn-primary" id="btn-new-project-empty">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2v12M2 8h12"/></svg>
+          Create First Project
         </button>
       </div>
-    </div>
 
-    <!-- Empty state -->
-    <div id="vg-empty" class="vg-empty-state">
-      <div class="vg-empty-icon">
-        <svg viewBox="0 0 64 64" fill="none">
-          <rect x="6" y="14" width="40" height="28" rx="3" stroke="currentColor" stroke-width="1.5" opacity="0.3"/>
-          <path d="M46 14l12-6v36l-12-6V14z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" opacity="0.3"/>
-          <circle cx="20" cy="26" r="3" stroke="currentColor" stroke-width="1.5" opacity="0.5"/>
-          <path d="M6 35l12-10 8 8 8-6 12 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
-        </svg>
-      </div>
-      <h2 class="vg-empty-title">Select or create a project</h2>
-      <p class="vg-empty-sub">Projects remember your style, characters, and every shot you generate. Your creative memory lives here.</p>
-      <button class="vg-btn-generate" id="btn-new-project-empty" style="margin-top:1.5rem">
-        + Create First Project
-      </button>
-    </div>
+      <!-- Shot grid / storyboard -->
+      <div id="vg-shot-grid" class="vg-shot-grid grid-view" style="display:none"></div>
 
-    <!-- Shot grid -->
-    <div id="vg-shot-grid" class="vg-shot-grid" style="display:none"></div>
+    </div><!-- /vg-storyboard -->
 
-  </section>
+  </section><!-- /vg-stage -->
 
 </main>
 
@@ -1507,7 +1829,7 @@ function videoGeneratorPage(): string {
     </div>
     <div class="vg-modal-body">
       <div class="vg-field">
-        <label class="vg-label">Project Name <span class="vg-required">*</span></label>
+        <label class="vg-label">Project Name <span class="vg-required-star">*</span></label>
         <input type="text" id="project-name-input" class="vg-input" placeholder="e.g. Dark Fantasy Trailer, Brand Campaign Q2"/>
       </div>
       <div class="vg-field">
@@ -1525,8 +1847,9 @@ function videoGeneratorPage(): string {
       <div class="vg-field">
         <label class="vg-label">Default Model</label>
         <select id="project-model-select" class="vg-input vg-select">
-          <option value="higgsfield-ai/dop/preview">DoP Preview (Recommended)</option>
-          <option value="higgsfield-ai/dop/standard">DoP Standard</option>
+          <option value="higgsfield-ai/dop/standard">DoP Standard (Recommended)</option>
+          <option value="higgsfield-ai/dop/lite">DoP Lite (Fast)</option>
+          <option value="higgsfield-ai/dop/turbo">DoP Turbo</option>
           <option value="kling-video/v2.1/pro/image-to-video">Kling 2.1 Pro</option>
           <option value="bytedance/seedance/v1/pro/image-to-video">Seedance v1 Pro</option>
         </select>
@@ -1535,7 +1858,7 @@ function videoGeneratorPage(): string {
     </div>
     <div class="vg-modal-footer">
       <button class="vg-btn-ghost" id="btn-cancel-project-modal">Cancel</button>
-      <button class="vg-btn-generate" id="btn-save-project" style="min-width:140px;justify-content:center">Create Project</button>
+      <button class="vg-btn-primary" id="btn-save-project">Create Project</button>
     </div>
   </div>
 </div>
@@ -1550,7 +1873,7 @@ function videoGeneratorPage(): string {
       </button>
     </div>
     <div class="vg-modal-body">
-      <p style="color:var(--ice-dim);font-size:0.82rem;margin-bottom:1.2rem;line-height:1.6">The style bible is injected into every prompt enhancement automatically — keeping all your shots consistent.</p>
+      <p class="vg-modal-desc">The style bible is injected into every AI prompt enhancement — keeping all your shots consistent.</p>
       <div class="vg-field">
         <label class="vg-label">Visual Style</label>
         <input type="text" id="bible-style-input" class="vg-input"/>
@@ -1570,19 +1893,18 @@ function videoGeneratorPage(): string {
     </div>
     <div class="vg-modal-footer">
       <button class="vg-btn-ghost" id="btn-cancel-bible-modal">Cancel</button>
-      <button class="vg-btn-generate" id="btn-save-bible" style="min-width:140px;justify-content:center">Save Style Bible</button>
+      <button class="vg-btn-primary" id="btn-save-bible">Save Style Bible</button>
     </div>
   </div>
 </div>
 
-<div class="vg-copied-toast" id="vg-toast">Copied!</div>
+<div class="vg-toast" id="vg-toast"></div>
 
-<!-- ═══════════════════════════════════════════════════════════════
+<!-- ══════════════════════════════════════════════════════
      ANALYTICS PANEL
-════════════════════════════════════════════════════════════════ -->
+═══════════════════════════════════════════════════════ -->
 <section id="vg-analytics" style="display:none">
 
-  <!-- Analytics nav bar -->
   <div class="an-topbar">
     <div class="an-topbar-left">
       <h2 class="an-title">
@@ -1604,7 +1926,6 @@ function videoGeneratorPage(): string {
     </div>
   </div>
 
-  <!-- Model filter tabs -->
   <div class="an-model-tabs" id="an-model-tabs">
     <button class="an-model-tab active" data-model="all">All Models</button>
     <button class="an-model-tab" data-model="dop">DoP</button>
@@ -1614,7 +1935,6 @@ function videoGeneratorPage(): string {
     <button class="an-model-tab" data-model="flux">Flux</button>
   </div>
 
-  <!-- Summary cards row -->
   <div class="an-summary-row" id="an-summary-row">
     <div class="an-card an-card-accent">
       <div class="an-card-label">Total Requests</div>
@@ -1648,13 +1968,8 @@ function videoGeneratorPage(): string {
     </div>
   </div>
 
-  <!-- Main analytics grid -->
   <div class="an-grid">
-
-    <!-- LEFT: Activity chart + Job stats -->
     <div class="an-col-main">
-
-      <!-- Activity timeline chart -->
       <div class="an-panel">
         <div class="an-panel-header">
           <span class="an-panel-title">Job Activity</span>
@@ -1662,90 +1977,54 @@ function videoGeneratorPage(): string {
         </div>
         <div class="an-chart-wrap" id="an-activity-chart">
           <svg id="an-activity-svg" class="an-activity-svg" viewBox="0 0 700 120" preserveAspectRatio="none"></svg>
-          <div class="an-chart-empty" id="an-activity-empty" style="display:none">
-            No generation activity in this period
-          </div>
+          <div class="an-chart-empty" id="an-activity-empty" style="display:none">No generation activity in this period</div>
         </div>
         <div class="an-chart-legend">
           <span class="an-legend-dot completed"></span><span>Completed</span>
           <span class="an-legend-dot failed"></span><span>Failed/NSFW</span>
         </div>
       </div>
-
-      <!-- Job Duration distribution -->
       <div class="an-panel">
         <div class="an-panel-header">
           <span class="an-panel-title">Job Duration Distribution</span>
           <span class="an-panel-hint">seconds per output clip</span>
         </div>
-        <div class="an-dur-bars" id="an-dur-bars">
-          <div class="an-loading-state">Loading…</div>
-        </div>
+        <div class="an-dur-bars" id="an-dur-bars"><div class="an-loading-state">Loading…</div></div>
       </div>
-
-      <!-- Aspect Ratio breakdown -->
       <div class="an-panel">
-        <div class="an-panel-header">
-          <span class="an-panel-title">Aspect Ratio Usage</span>
-        </div>
-        <div class="an-aspect-wrap" id="an-aspect-wrap">
-          <div class="an-loading-state">Loading…</div>
-        </div>
+        <div class="an-panel-header"><span class="an-panel-title">Aspect Ratio Usage</span></div>
+        <div class="an-aspect-wrap" id="an-aspect-wrap"><div class="an-loading-state">Loading…</div></div>
       </div>
-
     </div>
-
-    <!-- RIGHT: Per-model table + Project velocity -->
     <div class="an-col-side">
-
-      <!-- Per-model breakdown table -->
       <div class="an-panel">
         <div class="an-panel-header">
           <span class="an-panel-title">Model Performance</span>
           <span class="an-panel-hint">sorted by requests</span>
         </div>
-        <div class="an-model-table-wrap" id="an-model-table-wrap">
-          <div class="an-loading-state">Loading…</div>
-        </div>
+        <div class="an-model-table-wrap" id="an-model-table-wrap"><div class="an-loading-state">Loading…</div></div>
       </div>
-
-      <!-- Model comparison radar / bar -->
       <div class="an-panel">
         <div class="an-panel-header">
           <span class="an-panel-title">Model Comparison</span>
           <span class="an-panel-hint">success rate by model</span>
         </div>
-        <div class="an-compare-bars" id="an-compare-bars">
-          <div class="an-loading-state">Loading…</div>
-        </div>
+        <div class="an-compare-bars" id="an-compare-bars"><div class="an-loading-state">Loading…</div></div>
       </div>
-
-      <!-- Project velocity -->
       <div class="an-panel">
         <div class="an-panel-header">
           <span class="an-panel-title">Project Velocity</span>
           <span class="an-panel-hint">shots per project</span>
         </div>
-        <div class="an-project-list" id="an-project-list">
-          <div class="an-loading-state">Loading…</div>
-        </div>
+        <div class="an-project-list" id="an-project-list"><div class="an-loading-state">Loading…</div></div>
       </div>
-
-      <!-- Status breakdown donut -->
       <div class="an-panel">
-        <div class="an-panel-header">
-          <span class="an-panel-title">Job Status Breakdown</span>
-        </div>
-        <div class="an-status-row" id="an-status-row">
-          <div class="an-loading-state">Loading…</div>
-        </div>
+        <div class="an-panel-header"><span class="an-panel-title">Job Status Breakdown</span></div>
+        <div class="an-status-row" id="an-status-row"><div class="an-loading-state">Loading…</div></div>
       </div>
-
     </div>
+  </div>
 
-  </div><!-- /an-grid -->
-
-  <!-- Higgsfield-equivalent deep dive: per-model analytics -->
   <div class="an-model-deep" id="an-model-deep">
     <div class="an-panel-header">
       <span class="an-panel-title">Per-Model Deep Dive</span>
@@ -1756,7 +2035,7 @@ function videoGeneratorPage(): string {
     </div>
   </div>
 
-</section><!-- /vg-analytics -->
+</section>
 
 <script src="/static/video-generator.js"></script>
 </body>
