@@ -163,6 +163,7 @@ const $$ = (sel) => document.querySelectorAll(sel);
 document.addEventListener('DOMContentLoaded', () => {
   bindUI();
   renderModelCards();
+  initModelPicker();
   renderStylePresets();
   initViewSwitcher();
   initAnalyticsControls();
@@ -398,37 +399,113 @@ function renderModelCards() {
   const container = $('vg-model-cards');
   if (!container) return;
 
-  container.innerHTML = HF_MODELS_DATA.map(m => `
-    <button class="vg-model-card ${m.id === VG.selectedModel ? 'active' : ''}"
-            data-model-id="${m.id}" title="${escAttr(m.desc)}">
-      <div class="vg-model-card-header">
-        <span class="vg-model-card-name">${escHtml(m.label)}</span>
-        <span class="vg-model-speed-badge speed-${escAttr(m.speedClass)}">${escHtml(m.speed)}</span>
-      </div>
-      <div class="vg-model-card-desc">${escHtml(m.desc)}</div>
-      <div class="vg-model-card-type">${m.type === 'i2v' ? 'Image → Video' : 'Text → Image'}</div>
-    </button>
-  `).join('');
+  // Group by type
+  const i2v = HF_MODELS_DATA.filter(m => m.type === 'i2v');
+  const t2v = HF_MODELS_DATA.filter(m => m.type === 't2v');
 
-  container.querySelectorAll('.vg-model-card').forEach(card => {
-    card.addEventListener('click', () => selectModel(card.dataset.modelId));
+  function renderGroup(label, models) {
+    return `
+      <div class="vg-model-group-label">${label}</div>
+      ${models.map(m => `
+        <button class="vg-model-option ${m.id === VG.selectedModel ? 'active' : ''}"
+                data-model-id="${escAttr(m.id)}" role="option"
+                aria-selected="${m.id === VG.selectedModel}">
+          <div class="vg-model-option-left">
+            <span class="vg-model-option-name">${escHtml(m.label)}</span>
+            <span class="vg-model-option-desc">${escHtml(m.desc)}</span>
+          </div>
+          <div class="vg-model-option-right">
+            <span class="vg-model-speed-badge speed-${escAttr(m.speedClass)}">${escHtml(m.speed)}</span>
+            <svg class="vg-model-option-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+          </div>
+        </button>
+      `).join('')}
+    `;
+  }
+
+  container.innerHTML =
+    renderGroup('Image → Video', i2v) +
+    renderGroup('Text → Image', t2v);
+
+  container.querySelectorAll('.vg-model-option').forEach(opt => {
+    opt.addEventListener('click', () => {
+      selectModel(opt.dataset.modelId);
+      closeModelPicker();
+    });
+  });
+}
+
+function openModelPicker() {
+  const trigger  = $('vg-model-trigger');
+  const dropdown = $('vg-model-dropdown');
+  const chevron  = $('vg-model-trigger-chevron');
+  if (!dropdown) return;
+  dropdown.classList.add('open');
+  dropdown.setAttribute('aria-hidden', 'false');
+  trigger?.setAttribute('aria-expanded', 'true');
+  chevron?.classList.add('open');
+}
+
+function closeModelPicker() {
+  const trigger  = $('vg-model-trigger');
+  const dropdown = $('vg-model-dropdown');
+  const chevron  = $('vg-model-trigger-chevron');
+  if (!dropdown) return;
+  dropdown.classList.remove('open');
+  dropdown.setAttribute('aria-hidden', 'true');
+  trigger?.setAttribute('aria-expanded', 'false');
+  chevron?.classList.remove('open');
+}
+
+function initModelPicker() {
+  const trigger = $('vg-model-trigger');
+  if (!trigger) return;
+  trigger.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const dropdown = $('vg-model-dropdown');
+    if (dropdown?.classList.contains('open')) {
+      closeModelPicker();
+    } else {
+      openModelPicker();
+    }
+  });
+  // Close on outside click
+  document.addEventListener('click', (e) => {
+    const section = trigger.closest('.vg-model-picker-section');
+    if (section && !section.contains(e.target)) {
+      closeModelPicker();
+    }
   });
 }
 
 function selectModel(modelId) {
   VG.selectedModel = modelId;
 
-  // Update card active states
-  $$('.vg-model-card').forEach(c => {
-    c.classList.toggle('active', c.dataset.modelId === modelId);
+  // Update option active states
+  $$('.vg-model-option').forEach(o => {
+    const isActive = o.dataset.modelId === modelId;
+    o.classList.toggle('active', isActive);
+    o.setAttribute('aria-selected', isActive);
   });
 
-  // Update type badge
-  const model  = HF_MODELS_DATA.find(m => m.id === modelId);
-  const badge  = $('vg-model-type-badge');
-  if (badge && model) {
-    badge.textContent = model.type.toUpperCase();
-    badge.className   = `vg-model-type-badge ${model.type}`;
+  // Update trigger pill display
+  const model = HF_MODELS_DATA.find(m => m.id === modelId);
+  if (model) {
+    const nameEl  = $('vg-model-trigger-name');
+    const descEl  = $('vg-model-trigger-desc');
+    const speedEl = $('vg-model-trigger-speed');
+    if (nameEl)  nameEl.textContent  = model.label;
+    if (descEl)  descEl.textContent  = model.desc;
+    if (speedEl) {
+      speedEl.textContent  = model.speed;
+      speedEl.className    = `vg-model-trigger-speed speed-${model.speedClass}`;
+    }
+    // Update type badge
+    const badge = $('vg-model-type-badge');
+    if (badge) {
+      badge.textContent = model.type.toUpperCase();
+      badge.className   = `vg-model-type-badge ${model.type}`;
+    }
   }
 
   // Update image block required/optional badges
@@ -436,11 +513,11 @@ function selectModel(modelId) {
 }
 
 function updateImageRequirement(modelId) {
-  const isI2V     = I2V_MODELS.has(modelId);
-  const reqBadge  = $('vg-image-required-badge');
-  const optBadge  = $('vg-image-optional-badge');
+  const isI2V   = I2V_MODELS.has(modelId);
+  const reqBadge = $('vg-image-required-badge');
+  const optBadge = $('vg-image-optional-badge');
   if (reqBadge) reqBadge.style.display = isI2V ? 'inline' : 'none';
-  if (optBadge) optBadge.style.display = isI2V ? 'none' : 'inline';
+  if (optBadge) optBadge.style.display = isI2V ? 'none'   : 'inline';
 }
 
 /* ═══════════════════════════════════════════════════════════════

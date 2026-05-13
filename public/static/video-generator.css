@@ -507,49 +507,122 @@ body {
   color: var(--accent-bright);
 }
 
-/* ── MODEL CARDS ──────────────────────────────────────────────── */
-.vg-model-cards { display: flex; flex-direction: column; gap: 5px; }
+/* ── MODEL PICKER ─────────────────────────────────────────────── */
+.vg-model-picker-section { position: relative; }
 
-.vg-model-card {
-  padding: 10px 11px; border-radius: var(--r-md);
-  border: 1px solid var(--border-subtle);
+/* Trigger pill */
+.vg-model-trigger {
+  width: 100%; display: flex; align-items: center; justify-content: space-between;
+  padding: 9px 11px; border-radius: var(--r-md);
+  border: 1px solid var(--border-glow);
   background: var(--bg-raised);
-  cursor: pointer; transition: all 0.18s; position: relative;
+  cursor: pointer; transition: all 0.18s; gap: 8px;
 }
-.vg-model-card:hover {
-  border-color: var(--border-glow);
+.vg-model-trigger:hover {
+  border-color: var(--accent);
   background: var(--bg-elevated);
 }
-.vg-model-card.active {
-  border-color: var(--accent);
-  background: var(--accent-ghost);
-  box-shadow: 0 0 0 1px var(--accent-ghost) inset;
+.vg-model-trigger-left {
+  display: flex; align-items: center; gap: 9px; min-width: 0;
 }
-.vg-model-card-top {
-  display: flex; align-items: center; gap: 7px; margin-bottom: 3px;
+.vg-model-trigger-icon {
+  color: var(--accent-bright); flex-shrink: 0;
+  display: flex; align-items: center;
 }
-.vg-model-card-name {
-  font-size: 0.78rem; font-weight: 600; color: var(--text-bright);
-  flex: 1;
+.vg-model-trigger-info {
+  display: flex; flex-direction: column; align-items: flex-start; min-width: 0;
 }
+.vg-model-trigger-name {
+  font-size: 0.8rem; font-weight: 600; color: var(--text-bright);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.vg-model-trigger-desc {
+  font-size: 0.62rem; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 130px;
+}
+.vg-model-trigger-right {
+  display: flex; align-items: center; gap: 6px; flex-shrink: 0;
+}
+.vg-model-trigger-speed {
+  font-size: 0.6rem; font-weight: 600; letter-spacing: 0.05em;
+  padding: 2px 7px; border-radius: 100px;
+}
+.vg-model-trigger-chevron {
+  color: var(--text-ghost); transition: transform 0.22s ease; flex-shrink: 0;
+}
+.vg-model-trigger-chevron.open { transform: rotate(180deg); }
+
+/* Dropdown */
+.vg-model-dropdown {
+  display: none; position: absolute; left: 14px; right: 14px;
+  top: calc(100% - 6px); z-index: 200;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-glow);
+  border-radius: var(--r-md);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+  overflow: hidden;
+  animation: modelDropIn 0.18s ease;
+}
+.vg-model-dropdown.open { display: block; }
+
+@keyframes modelDropIn {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.vg-model-dropdown-inner {
+  max-height: 320px; overflow-y: auto; padding: 6px;
+}
+.vg-model-dropdown-inner::-webkit-scrollbar { width: 4px; }
+.vg-model-dropdown-inner::-webkit-scrollbar-track { background: transparent; }
+.vg-model-dropdown-inner::-webkit-scrollbar-thumb { background: var(--border-glow); border-radius: 4px; }
+
+/* Group label */
+.vg-model-group-label {
+  font-size: 0.6rem; font-weight: 700; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--text-ghost);
+  padding: 6px 8px 3px;
+}
+
+/* Option row */
+.vg-model-option {
+  width: 100%; display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 10px; border-radius: var(--r-sm);
+  border: none; background: transparent;
+  cursor: pointer; transition: background 0.14s; gap: 8px;
+}
+.vg-model-option:hover { background: var(--bg-raised); }
+.vg-model-option.active { background: var(--accent-ghost); }
+
+.vg-model-option-left {
+  display: flex; flex-direction: column; align-items: flex-start; min-width: 0; flex: 1;
+}
+.vg-model-option-name {
+  font-size: 0.76rem; font-weight: 600; color: var(--text-bright);
+}
+.vg-model-option-desc {
+  font-size: 0.63rem; color: var(--text-dim); line-height: 1.3;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px;
+}
+.vg-model-option-right {
+  display: flex; align-items: center; gap: 7px; flex-shrink: 0;
+}
+.vg-model-option-check {
+  color: var(--accent-bright); opacity: 0; transition: opacity 0.14s;
+}
+.vg-model-option.active .vg-model-option-check { opacity: 1; }
+
+/* Speed badges shared */
 .vg-model-speed-badge {
   font-size: 0.6rem; font-weight: 600; letter-spacing: 0.06em;
-  padding: 1px 6px; border-radius: 100px;
+  padding: 2px 7px; border-radius: 100px;
 }
-.vg-model-speed-badge.fast   { background: var(--green-dim); color: var(--green); }
-.vg-model-speed-badge.normal { background: var(--yellow-dim); color: var(--yellow); }
-.vg-model-speed-badge.slow   { background: var(--orange-dim); color: var(--orange); }
-.vg-model-card-desc {
-  font-size: 0.66rem; color: var(--text-dim); line-height: 1.4;
-}
-.vg-model-card-tags {
-  display: flex; gap: 4px; margin-top: 5px;
-}
-.vg-model-tag {
-  font-size: 0.58rem; font-weight: 500; padding: 1px 6px;
-  border-radius: 100px; border: 1px solid var(--border-subtle);
-  color: var(--text-dim);
-}
+.vg-model-speed-badge.speed-fast,
+.vg-model-trigger-speed.speed-fast         { background: var(--green-dim);  color: var(--green); }
+.vg-model-speed-badge.speed-balanced,
+.vg-model-trigger-speed.speed-balanced     { background: var(--yellow-dim); color: var(--yellow); }
+.vg-model-speed-badge.speed-quality,
+.vg-model-trigger-speed.speed-quality      { background: rgba(124,106,247,0.15); color: var(--accent-bright); }
 
 /* ── ASPECT RATIO ─────────────────────────────────────────────── */
 .vg-aspect-row { display: grid; grid-template-columns: repeat(4,1fr); gap: 5px; }

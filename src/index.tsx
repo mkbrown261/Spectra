@@ -1979,14 +1979,33 @@ function videoGeneratorPage(): string {
     <!-- Divider -->
     <div class="vg-panel-divider"></div>
 
-    <!-- MODEL CARDS -->
-    <section class="vg-panel-section">
+    <!-- MODEL PICKER -->
+    <section class="vg-panel-section vg-model-picker-section">
       <div class="vg-section-header">
-        <span class="vg-section-label">Model</span>
+        <span class="vg-section-label">Generation Model</span>
         <span class="vg-model-type-badge" id="vg-model-type-badge">i2v</span>
       </div>
-      <div class="vg-model-cards" id="vg-model-cards">
-        <!-- Injected by JS -->
+      <!-- Trigger pill -->
+      <button class="vg-model-trigger" id="vg-model-trigger" aria-haspopup="listbox" aria-expanded="false">
+        <div class="vg-model-trigger-left">
+          <span class="vg-model-trigger-icon" id="vg-model-trigger-icon">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+          </span>
+          <div class="vg-model-trigger-info">
+            <span class="vg-model-trigger-name" id="vg-model-trigger-name">DoP Standard</span>
+            <span class="vg-model-trigger-desc" id="vg-model-trigger-desc">Balanced quality &amp; speed</span>
+          </div>
+        </div>
+        <div class="vg-model-trigger-right">
+          <span class="vg-model-trigger-speed" id="vg-model-trigger-speed">Balanced</span>
+          <svg class="vg-model-trigger-chevron" id="vg-model-trigger-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+      </button>
+      <!-- Dropdown -->
+      <div class="vg-model-dropdown" id="vg-model-dropdown" role="listbox" aria-hidden="true">
+        <div class="vg-model-dropdown-inner" id="vg-model-cards">
+          <!-- Injected by JS -->
+        </div>
       </div>
     </section>
 
