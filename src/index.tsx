@@ -513,7 +513,15 @@ const app = new Hono<{ Bindings: Bindings; Variables: {
 }}>()
 
 app.use('/api/*', cors({
-  origin: '*',
+  // Restrict to same origin (pages.dev subdomain) — wildcard + credentials is a browser security violation
+  origin: (origin) => {
+    if (!origin) return origin  // same-origin requests have no Origin header
+    // Allow any *.pages.dev subdomain and localhost for local dev
+    if (origin.endsWith('.pages.dev') || origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) {
+      return origin
+    }
+    return null  // reject cross-origin credential requests from unknown origins
+  },
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
@@ -1120,7 +1128,7 @@ app.delete('/api/shots/:shotId', requireAuth, async (c) => {
 ══════════════════════════════════════════════════════════════════ */
 
 // GET /api/video/:key — serve an R2 video (key is URL-encoded path)
-app.get('/api/video/:key', async (c) => {
+app.get('/api/video/:key', requireAuth, async (c) => {
   try {
     if (!c.env.STORAGE) return c.json({ error: 'Storage not configured' }, 500)
     const key    = decodeURIComponent(c.req.param('key'))
@@ -1180,7 +1188,7 @@ app.post('/api/billing/checkout', requireAuth, async (c) => {
     if (!customerId) {
       const customer = await stripeRequest('/customers', 'POST', {
         email,
-        metadata: JSON.stringify({ spectra_user_id: userId }),
+        metadata: { spectra_user_id: userId },
       }, c.env.STRIPE_SECRET_KEY)
       customerId = customer.id
       await c.env.DB.prepare(
@@ -1759,7 +1767,6 @@ Return ONLY a JSON array of ${shot_count} shot objects. No prose, no markdown, n
       ],
       temperature:     0.8,
       max_tokens:      2000,
-      response_format: { type: 'json_object' },
     })
 
     let raw = resp.choices[0]?.message?.content?.trim() || '[]'
@@ -1832,7 +1839,7 @@ app.post('/api/upload', requireAuth, async (c) => {
 })
 
 // GET /api/image/:key — serve an R2 image
-app.get('/api/image/:key', async (c) => {
+app.get('/api/image/:key', requireAuth, async (c) => {
   try {
     if (!c.env.STORAGE) return c.json({ error: 'Storage not configured' }, 500)
     const key    = decodeURIComponent(c.req.param('key'))
@@ -1891,7 +1898,7 @@ function buildSegments(duration_sec: number, dropoff_points: number[]): any[] {
 /* ══════════════════════════════════════════════════════════════════
    ATTENTION ENGINE ROUTES (preserved)
 ══════════════════════════════════════════════════════════════════ */
-app.post('/api/attention/analyze', async (c) => {
+app.post('/api/attention/analyze', requireAuth, async (c) => {
   try {
     const body = await c.req.json()
     const { platform='tiktok', content_url='', content_description='', duration_sec=60, metrics={}, dropoff_points=[], hook_text='', script_excerpt='' } = body
@@ -1938,7 +1945,7 @@ TIMELINE:\n${segments.map((s:any)=>`[${s.label}] Retention: ${s.retention}% ${s.
   } catch (err: any) { return c.json({ error: err.message }, 500) }
 })
 
-app.post('/api/attention/rewrite', async (c) => {
+app.post('/api/attention/rewrite', requireAuth, async (c) => {
   try {
     const body = await c.req.json()
     const { platform='tiktok', hook_text='', script_excerpt='', issues=[], target_audience='', tone='engaging' } = body
@@ -1955,7 +1962,7 @@ app.post('/api/attention/rewrite', async (c) => {
   } catch (err: any) { return c.json({ error: err.message }, 500) }
 })
 
-app.post('/api/attention/score', async (c) => {
+app.post('/api/attention/score', requireAuth, async (c) => {
   try {
     const body = await c.req.json()
     const { platform='tiktok', metrics={}, duration_sec=60, dropoff_points=[] } = body

@@ -947,19 +947,31 @@ function renderProjectList() {
   container.innerHTML = VG.projects.map(p => {
     const camp = p.campaignId ? campaigns.find(c => c.id === p.campaignId) : null;
     return `
-    <button class="vg-project-item ${p.id === VG.activeProjectId ? 'active' : ''}"
-            data-project-id="${p.id}">
-      <span class="vg-project-item-pip"></span>
-      <span class="vg-project-item-name">${escHtml(p.name)}</span>
-      <span class="vg-project-item-right">
-        ${camp ? `<span class="vg-project-campaign-tag" title="Campaign: ${escAttr(camp.name)}"><svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg></span>` : ''}
-        <span class="vg-project-item-shots">${p.shot_count ?? 0}s</span>
-      </span>
-    </button>`;
+    <div class="vg-project-row">
+      <button class="vg-project-item ${p.id === VG.activeProjectId ? 'active' : ''}"
+              data-project-id="${p.id}">
+        <span class="vg-project-item-pip"></span>
+        <span class="vg-project-item-name">${escHtml(p.name)}</span>
+        <span class="vg-project-item-right">
+          ${camp ? `<span class="vg-project-campaign-tag" title="Campaign: ${escAttr(camp.name)}"><svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg></span>` : ''}
+          <span class="vg-project-item-shots">${p.shot_count ?? 0}s</span>
+        </span>
+      </button>
+      <button class="vg-project-delete-btn" data-delete-id="${p.id}" title="Delete project" aria-label="Delete project">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>`;
   }).join('');
 
   container.querySelectorAll('.vg-project-item').forEach(btn => {
     btn.addEventListener('click', () => selectProject(btn.dataset.projectId));
+  });
+
+  container.querySelectorAll('.vg-project-delete-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteProject(btn.dataset.deleteId);
+    });
   });
 
   // #8 — refresh campaign list alongside project list
@@ -1009,6 +1021,48 @@ function showEmptyState() {
   $('vg-shot-grid').style.display = 'none';
   const header = $('vg-board-header');
   if (header) header.style.display = 'none';
+}
+
+async function deleteProject(projectId) {
+  const project = VG.projects.find(p => p.id === projectId);
+  if (!project) return;
+
+  const confirmed = confirm(`Delete "${project.name}"?\n\nThis will permanently remove the project and all its shots. This cannot be undone.`);
+  if (!confirmed) return;
+
+  try {
+    const res = await api('DELETE', `/api/projects/${projectId}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      showToast(err.error || 'Failed to delete project', 'error');
+      return;
+    }
+
+    // Remove from local array
+    VG.projects = VG.projects.filter(p => p.id !== projectId);
+
+    // Clean up any cached shots
+    delete VG.shots[projectId];
+
+    // If the deleted project was active, switch to next available or show empty state
+    if (VG.activeProjectId === projectId) {
+      VG.activeProjectId = null;
+      if (VG.projects.length > 0) {
+        renderProjectList();
+        await selectProject(VG.projects[0].id);
+      } else {
+        renderProjectList();
+        showEmptyState();
+      }
+    } else {
+      renderProjectList();
+    }
+
+    showToast(`Project "${project.name}" deleted`, 'info');
+  } catch (err) {
+    console.error('deleteProject error:', err);
+    showToast('Failed to delete project', 'error');
+  }
 }
 
 async function loadShots(projectId) {
@@ -2066,14 +2120,14 @@ function showToast(msg, isError = false) {
 function openUpgradeModal() {
   const overlay = $('upgrade-modal-overlay');
   if (overlay) {
-    overlay.classList.add('active');
+    overlay.classList.add('open');
     $('upgrade-modal-error') && ($('upgrade-modal-error').style.display = 'none');
   }
 }
 
 function closeUpgradeModal() {
   const overlay = $('upgrade-modal-overlay');
-  if (overlay) overlay.classList.remove('active');
+  if (overlay) overlay.classList.remove('open');
 }
 
 async function startCheckout(tier) {

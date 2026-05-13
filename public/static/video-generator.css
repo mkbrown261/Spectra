@@ -1227,6 +1227,29 @@ body {
 .vg-project-item-count { font-size: 0.62rem; color: var(--text-ghost); }
 .vg-project-item.active .vg-project-item-name { color: var(--text-bright); }
 
+/* Project row wrapper — holds item button + delete button side-by-side */
+.vg-project-row {
+  display: flex; align-items: center; gap: 2px; position: relative;
+}
+.vg-project-row .vg-project-item {
+  flex: 1; min-width: 0;
+}
+.vg-project-delete-btn {
+  display: none;
+  flex-shrink: 0;
+  align-items: center; justify-content: center;
+  width: 20px; height: 20px; border-radius: var(--r-sm);
+  border: none; background: transparent;
+  color: var(--text-ghost); cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+  padding: 0;
+}
+.vg-project-row:hover .vg-project-delete-btn { display: flex; }
+.vg-project-delete-btn:hover {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.12);
+}
+
 /* ══════════════════════════════════════════════════════════════════
    MODALS
 ══════════════════════════════════════════════════════════════════ */
