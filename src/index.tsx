@@ -2963,8 +2963,365 @@ app.get('/api/fetch-url', async (c) => {
 })
 
 /* ══════════════════════════════════════════════════════════════════
+   SHOT COMPARISON — GET /api/projects/:id/compare?shot_ids=a,b,c
+══════════════════════════════════════════════════════════════════ */
+app.get('/api/projects/:id/compare', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const projectId = c.req.param('id')
+    const idsParam  = c.req.query('shot_ids') || ''
+    const shotIds   = idsParam.split(',').map(s => s.trim()).filter(Boolean).slice(0, 4)
+    if (shotIds.length < 2) return c.json({ error: 'At least 2 shot_ids required' }, 400)
+
+    const project = await c.env.DB.prepare(
+      `SELECT id, name FROM projects WHERE id = ? AND user_id = ?`
+    ).bind(projectId, userId).first<{ id: string; name: string }>()
+    if (!project) return c.json({ error: 'Project not found' }, 404)
+
+    const placeholders = shotIds.map(() => '?').join(',')
+    const rows = await c.env.DB.prepare(
+      `SELECT id, prompt_raw, prompt_enhanced, model, aspect_ratio, duration,
+              status, video_url, hf_video_url, thumbnail_url,
+              seed, style_preset, quality, sort_order, created_at, completed_at,
+              CASE WHEN completed_at IS NOT NULL AND created_at IS NOT NULL
+                   THEN ROUND((julianday(completed_at) - julianday(created_at)) * 86400)
+                   ELSE NULL END AS gen_time_sec
+       FROM shots
+       WHERE id IN (${placeholders}) AND project_id = ? AND user_id = ?`
+    ).bind(...shotIds, projectId, userId).all<any>()
+
+    // Preserve requested order
+    const ordered = shotIds
+      .map(id => rows.results.find((r: any) => r.id === id))
+      .filter(Boolean)
+
+    return c.json({ project, shots: ordered })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   TIMELINE — GET /api/projects/:id/timeline
+   Returns shots in sort_order for the timeline editor
+══════════════════════════════════════════════════════════════════ */
+app.get('/api/projects/:id/timeline', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const projectId = c.req.param('id')
+
+    const project = await c.env.DB.prepare(
+      `SELECT id, name, style_bible, default_model FROM projects WHERE id = ? AND user_id = ?`
+    ).bind(projectId, userId).first<any>()
+    if (!project) return c.json({ error: 'Project not found' }, 404)
+
+    const shots = await c.env.DB.prepare(
+      `SELECT id, prompt_raw, prompt_enhanced, model, aspect_ratio, duration,
+              status, video_url, hf_video_url, thumbnail_url, sort_order,
+              seed, style_preset, created_at
+       FROM shots
+       WHERE project_id = ? AND user_id = ? AND status = 'completed'
+       ORDER BY sort_order ASC, created_at ASC`
+    ).bind(projectId, userId).all<any>()
+
+    return c.json({ project, shots: shots.results })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   TIMELINE EXPORT — POST /api/projects/:id/timeline/export
+   Returns a JSON manifest + EDL-style metadata for the sequence
+══════════════════════════════════════════════════════════════════ */
+app.post('/api/projects/:id/timeline/export', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const projectId = c.req.param('id')
+    const { shot_ids, format = 'json' } = await c.req.json()
+
+    const project = await c.env.DB.prepare(
+      `SELECT id, name, style_bible, default_model FROM projects WHERE id = ? AND user_id = ?`
+    ).bind(projectId, userId).first<any>()
+    if (!project) return c.json({ error: 'Project not found' }, 404)
+
+    // Use supplied order or all completed shots
+    let shots: any[]
+    if (Array.isArray(shot_ids) && shot_ids.length > 0) {
+      const placeholders = shot_ids.map(() => '?').join(',')
+      const rows = await c.env.DB.prepare(
+        `SELECT id, prompt_raw, prompt_enhanced, model, aspect_ratio, duration,
+                video_url, hf_video_url, thumbnail_url, seed, style_preset, sort_order, created_at
+         FROM shots WHERE id IN (${placeholders}) AND project_id = ? AND user_id = ? AND status = 'completed'`
+      ).bind(...shot_ids, projectId, userId).all<any>()
+      const map = new Map(rows.results.map((r: any) => [r.id, r]))
+      shots = shot_ids.map((id: string) => map.get(id)).filter(Boolean)
+    } else {
+      const rows = await c.env.DB.prepare(
+        `SELECT id, prompt_raw, prompt_enhanced, model, aspect_ratio, duration,
+                video_url, hf_video_url, thumbnail_url, seed, style_preset, sort_order, created_at
+         FROM shots WHERE project_id = ? AND user_id = ? AND status = 'completed'
+         ORDER BY sort_order ASC, created_at ASC`
+      ).bind(projectId, userId).all<any>()
+      shots = rows.results
+    }
+
+    const origin = new URL(c.req.url).origin
+    const manifest = {
+      spectra_version: '1.0',
+      exported_at:     new Date().toISOString(),
+      project: {
+        id:    project.id,
+        name:  project.name,
+        style: project.style_bible ? JSON.parse(project.style_bible) : null,
+      },
+      sequence: shots.map((s: any, idx: number) => ({
+        index:          idx + 1,
+        shot_id:        s.id,
+        prompt:         s.prompt_enhanced || s.prompt_raw,
+        prompt_raw:     s.prompt_raw,
+        model:          s.model,
+        aspect_ratio:   s.aspect_ratio,
+        duration_sec:   s.duration || 5,
+        video_url:      s.video_url || s.hf_video_url || null,
+        thumbnail_url:  s.thumbnail_url || null,
+        seed:           s.seed || null,
+        style_preset:   s.style_preset || null,
+        timecode_in:    formatTimecode(shots.slice(0, idx).reduce((a: number, sh: any) => a + (sh.duration || 5), 0)),
+        timecode_out:   formatTimecode(shots.slice(0, idx + 1).reduce((a: number, sh: any) => a + (sh.duration || 5), 0)),
+      })),
+      total_duration_sec: shots.reduce((a: number, s: any) => a + (s.duration || 5), 0),
+      shot_count:         shots.length,
+    }
+
+    return c.json({ ok: true, manifest })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+function formatTimecode(totalSeconds: number): string {
+  const h  = Math.floor(totalSeconds / 3600)
+  const m  = Math.floor((totalSeconds % 3600) / 60)
+  const s  = Math.floor(totalSeconds % 60)
+  const fr = 0
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}:${String(fr).padStart(2,'0')}`
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   ADMIN PANEL — secret-key gated
+   ADMIN_SECRET env var must be set; passed as ?secret= or X-Admin-Secret header
+══════════════════════════════════════════════════════════════════ */
+
+async function requireAdmin(c: any, next: any) {
+  const secret = c.req.query('secret') || c.req.header('X-Admin-Secret') || ''
+  const adminSecret = (c.env as any).ADMIN_SECRET || ''
+  if (!adminSecret || secret !== adminSecret) {
+    return c.json({ error: 'Forbidden' }, 403)
+  }
+  await next()
+}
+
+// GET /api/admin/stats — platform-wide overview
+app.get('/api/admin/stats', requireAdmin, async (c) => {
+  try {
+    const [users, shots, projects, sessions, revenue] = await Promise.all([
+      c.env.DB.prepare(`
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN tier='free'    THEN 1 ELSE 0 END) AS free_count,
+          SUM(CASE WHEN tier='creator' THEN 1 ELSE 0 END) AS creator_count,
+          SUM(CASE WHEN tier='studio'  THEN 1 ELSE 0 END) AS studio_count,
+          SUM(CASE WHEN tier='pro'     THEN 1 ELSE 0 END) AS pro_count,
+          SUM(CASE WHEN created_at >= datetime('now','-7 days') THEN 1 ELSE 0 END) AS new_7d,
+          SUM(CASE WHEN created_at >= datetime('now','-30 days') THEN 1 ELSE 0 END) AS new_30d
+        FROM users`).first<any>(),
+
+      c.env.DB.prepare(`
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN status='completed'   THEN 1 ELSE 0 END) AS completed,
+          SUM(CASE WHEN status='failed'      THEN 1 ELSE 0 END) AS failed,
+          SUM(CASE WHEN status='nsfw'        THEN 1 ELSE 0 END) AS nsfw,
+          SUM(CASE WHEN status IN ('queued','in_progress') THEN 1 ELSE 0 END) AS active,
+          SUM(CASE WHEN created_at >= datetime('now','-24 hours') THEN 1 ELSE 0 END) AS last_24h,
+          SUM(CASE WHEN created_at >= datetime('now','-7 days')   THEN 1 ELSE 0 END) AS last_7d,
+          SUM(CASE WHEN status='completed' AND duration IS NOT NULL THEN duration ELSE 0 END) AS total_seconds
+        FROM shots`).first<any>(),
+
+      c.env.DB.prepare(`SELECT COUNT(*) AS total FROM projects`).first<any>(),
+
+      c.env.DB.prepare(`
+        SELECT COUNT(*) AS active FROM sessions
+        WHERE expires_at > datetime('now')`).first<any>(),
+
+      c.env.DB.prepare(`
+        SELECT
+          SUM(CASE WHEN tier='creator' THEN 29 WHEN tier='studio' THEN 79 WHEN tier='pro' THEN 149 ELSE 0 END) AS mrr
+        FROM users WHERE tier != 'free'`).first<any>(),
+    ])
+
+    return c.json({ users, shots, projects, sessions, revenue })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// GET /api/admin/users?page=1&limit=50&search=&tier= — paginated user list
+app.get('/api/admin/users', requireAdmin, async (c) => {
+  try {
+    const page   = Math.max(1, parseInt(c.req.query('page') || '1'))
+    const limit  = Math.min(100, parseInt(c.req.query('limit') || '50'))
+    const search = c.req.query('search') || ''
+    const tier   = c.req.query('tier') || ''
+    const offset = (page - 1) * limit
+
+    let where = 'WHERE 1=1'
+    const params: any[] = []
+    if (search) { where += ` AND (email LIKE ? OR id = ?)`; params.push(`%${search}%`, search) }
+    if (tier)   { where += ` AND tier = ?`; params.push(tier) }
+
+    const [rows, countRow] = await Promise.all([
+      c.env.DB.prepare(`
+        SELECT u.id, u.email, u.tier, u.credits, u.stripe_customer_id,
+               u.stripe_subscription_id, u.created_at, u.updated_at,
+               (SELECT COUNT(*) FROM projects p WHERE p.user_id = u.id) AS project_count,
+               (SELECT COUNT(*) FROM shots   s WHERE s.user_id = u.id) AS shot_count,
+               (SELECT COUNT(*) FROM shots   s WHERE s.user_id = u.id AND s.status='completed') AS completed_shots
+        FROM users u ${where}
+        ORDER BY u.created_at DESC
+        LIMIT ? OFFSET ?`
+      ).bind(...params, limit, offset).all<any>(),
+
+      c.env.DB.prepare(
+        `SELECT COUNT(*) AS total FROM users ${where}`
+      ).bind(...params).first<any>(),
+    ])
+
+    return c.json({
+      users:   rows.results,
+      total:   countRow?.total || 0,
+      page,
+      limit,
+      pages:   Math.ceil((countRow?.total || 0) / limit),
+    })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// PATCH /api/admin/users/:id — update tier / credits
+app.patch('/api/admin/users/:id', requireAdmin, async (c) => {
+  try {
+    const userId = c.req.param('id')
+    const body   = await c.req.json()
+    const fields: string[] = []
+    const values: any[]    = []
+
+    if (body.tier !== undefined) {
+      if (!['free','creator','studio','pro'].includes(body.tier)) {
+        return c.json({ error: 'Invalid tier' }, 400)
+      }
+      fields.push('tier = ?'); values.push(body.tier)
+    }
+    if (body.credits !== undefined) {
+      const cr = parseInt(body.credits)
+      if (isNaN(cr) || cr < 0) return c.json({ error: 'Invalid credits' }, 400)
+      fields.push('credits = ?'); values.push(cr)
+    }
+    if (fields.length === 0) return c.json({ error: 'Nothing to update' }, 400)
+    fields.push('updated_at = datetime(\'now\')')
+
+    const result = await c.env.DB.prepare(
+      `UPDATE users SET ${fields.join(', ')} WHERE id = ?`
+    ).bind(...values, userId).run()
+
+    if (result.meta.changes === 0) return c.json({ error: 'User not found' }, 404)
+    return c.json({ ok: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// DELETE /api/admin/users/:id — hard delete user + cascade
+app.delete('/api/admin/users/:id', requireAdmin, async (c) => {
+  try {
+    const userId = c.req.param('id')
+    const user = await c.env.DB.prepare(`SELECT id, email FROM users WHERE id = ?`).bind(userId).first<any>()
+    if (!user) return c.json({ error: 'User not found' }, 404)
+
+    await c.env.DB.prepare(`DELETE FROM users WHERE id = ?`).bind(userId).run()
+    return c.json({ ok: true, deleted: user.email })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// GET /api/admin/activity — recent shots across all users
+app.get('/api/admin/activity', requireAdmin, async (c) => {
+  try {
+    const limit = Math.min(100, parseInt(c.req.query('limit') || '50'))
+    const rows = await c.env.DB.prepare(`
+      SELECT s.id, s.status, s.model, s.aspect_ratio, s.duration, s.created_at, s.completed_at,
+             u.email, u.tier, p.name AS project_name
+      FROM shots s
+      JOIN users    u ON s.user_id    = u.id
+      JOIN projects p ON s.project_id = p.id
+      ORDER BY s.created_at DESC
+      LIMIT ?`
+    ).bind(limit).all<any>()
+    return c.json({ activity: rows.results })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// GET /api/admin/model-stats — aggregate per-model stats across all users
+app.get('/api/admin/model-stats', requireAdmin, async (c) => {
+  try {
+    const rows = await c.env.DB.prepare(`
+      SELECT model,
+             COUNT(*) AS total,
+             SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
+             SUM(CASE WHEN status='failed'    THEN 1 ELSE 0 END) AS failed,
+             SUM(CASE WHEN status='nsfw'      THEN 1 ELSE 0 END) AS nsfw,
+             AVG(CASE WHEN status='completed' AND completed_at IS NOT NULL
+                 THEN (julianday(completed_at)-julianday(created_at))*86400 ELSE NULL END) AS avg_sec
+      FROM shots
+      GROUP BY model ORDER BY total DESC`
+    ).all<any>()
+    return c.json({ models: rows.results })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// GET /api/admin/growth — daily signups + shots for last 30 days
+app.get('/api/admin/growth', requireAdmin, async (c) => {
+  try {
+    const [signups, shots] = await Promise.all([
+      c.env.DB.prepare(`
+        SELECT date(created_at) AS day, COUNT(*) AS count
+        FROM users WHERE created_at >= datetime('now','-30 days')
+        GROUP BY date(created_at) ORDER BY day ASC`).all<any>(),
+      c.env.DB.prepare(`
+        SELECT date(created_at) AS day,
+               COUNT(*) AS total,
+               SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed
+        FROM shots WHERE created_at >= datetime('now','-30 days')
+        GROUP BY date(created_at) ORDER BY day ASC`).all<any>(),
+    ])
+    return c.json({ signups: signups.results, shots: shots.results })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+/* ══════════════════════════════════════════════════════════════════
    PAGE ROUTES
 ══════════════════════════════════════════════════════════════════ */
+app.get('/admin',  (c) => c.redirect('/admin/'))
+app.get('/admin/', (c) => c.html(adminPage()))
 app.get('/tools/attention-engine',   (c) => c.redirect('/tools/attention-engine/'))
 app.get('/tools/attention-engine/',  (c) => c.html(attentionEnginePage()))
 app.get('/tools/video-generator',    (c) => c.redirect('/tools/video-generator/'))
@@ -3017,6 +3374,14 @@ function videoGeneratorPage(): string {
     <button class="vg-nav-tab-btn" id="btn-show-analytics" data-view="analytics">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
       Analytics
+    </button>
+    <button class="vg-nav-tab-btn" id="btn-show-compare" data-view="compare">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="3" width="9" height="18" rx="1"/><rect x="13" y="3" width="9" height="18" rx="1"/></svg>
+      Compare
+    </button>
+    <button class="vg-nav-tab-btn" id="btn-show-timeline" data-view="timeline">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="7" width="20" height="10" rx="1"/><line x1="6" y1="7" x2="6" y2="17"/><line x1="10" y1="7" x2="10" y2="17"/><line x1="14" y1="7" x2="14" y2="17"/><line x1="18" y1="7" x2="18" y2="17"/></svg>
+      Timeline
     </button>
     <button class="vg-keys-btn" id="btn-open-settings" title="Settings">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
@@ -3578,6 +3943,14 @@ function videoGeneratorPage(): string {
           <span class="vg-shot-count" id="vg-project-shot-count"></span>
         </div>
         <div class="vg-board-header-right">
+          <button class="vg-btn-icon-sm" id="btn-open-timeline" title="Sequence Timeline Editor" style="display:none">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="4" height="10" rx="1"/><rect x="8" y="4" width="4" height="13" rx="1"/><rect x="14" y="9" width="4" height="8" rx="1"/><rect x="20" y="6" width="2" height="11" rx="1"/></svg>
+            Timeline
+          </button>
+          <button class="vg-btn-icon-sm vg-compare-trigger" id="btn-open-compare" title="Compare shots A/B" style="display:none" disabled>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="9" height="18" rx="1.5"/><rect x="13" y="3" width="9" height="18" rx="1.5"/></svg>
+            Compare <span class="vg-compare-count" id="compare-badge">0</span>
+          </button>
           <button class="vg-btn-icon-sm" id="btn-edit-project" title="Edit style bible">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
           </button>
@@ -3616,6 +3989,126 @@ function videoGeneratorPage(): string {
   </section><!-- /vg-stage -->
 
 </main>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     COMPARE MODAL  (A/B Shot Viewer)
+     ═══════════════════════════════════════════════════════════════ -->
+<div class="vg-compare-overlay" id="compare-overlay">
+  <div class="vg-compare-modal">
+
+    <!-- Header -->
+    <div class="vg-compare-header">
+      <div class="vg-compare-header-left">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="9" height="18" rx="1.5"/><rect x="13" y="3" width="9" height="18" rx="1.5"/></svg>
+        <span>Shot Comparison</span>
+        <span class="vg-compare-mode-badge" id="compare-mode-badge">2-UP</span>
+      </div>
+      <div class="vg-compare-header-right">
+        <button class="vg-compare-sync-btn" id="compare-sync-btn" title="Sync playback">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 014-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg>
+          Sync
+        </button>
+        <button class="vg-compare-play-all-btn" id="compare-play-all">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          Play All
+        </button>
+        <button class="vg-compare-close-btn" id="compare-close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Video panels grid -->
+    <div class="vg-compare-grid" id="compare-grid"></div>
+
+    <!-- Metadata diff table -->
+    <div class="vg-compare-meta-section">
+      <div class="vg-compare-meta-label">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        Metadata Diff
+      </div>
+      <div class="vg-compare-meta-table" id="compare-meta-table"></div>
+    </div>
+
+    <!-- Winner row -->
+    <div class="vg-compare-footer">
+      <span class="vg-compare-footer-label">Select Winner</span>
+      <div class="vg-compare-winner-row" id="compare-winner-row"></div>
+      <button class="vg-compare-export-btn" id="compare-export-json">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Export Diff JSON
+      </button>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     TIMELINE PANEL  (Sequence / Timeline Editor)
+     ═══════════════════════════════════════════════════════════════ -->
+<div class="vg-timeline-overlay" id="timeline-overlay">
+  <div class="vg-timeline-panel">
+
+    <!-- Header -->
+    <div class="vg-timeline-header">
+      <div class="vg-timeline-header-left">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="4" height="10" rx="1"/><rect x="8" y="4" width="4" height="13" rx="1"/><rect x="14" y="9" width="4" height="8" rx="1"/><rect x="20" y="6" width="2" height="11" rx="1"/></svg>
+        <span>Sequence Timeline</span>
+        <span class="vg-timeline-project-name" id="timeline-project-name"></span>
+      </div>
+      <div class="vg-timeline-header-right">
+        <span class="vg-timeline-duration" id="timeline-total-duration">0:00 total</span>
+        <button class="vg-timeline-shuffle-btn" id="timeline-shuffle" title="Auto-sort by creation date">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/></svg>
+          Sort
+        </button>
+        <button class="vg-timeline-export-btn" id="timeline-export">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export Manifest
+        </button>
+        <button class="vg-timeline-close-btn" id="timeline-close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Ruler -->
+    <div class="vg-timeline-ruler" id="timeline-ruler"></div>
+
+    <!-- Film strip track -->
+    <div class="vg-timeline-track-wrap">
+      <div class="vg-timeline-track" id="timeline-track">
+        <!-- clips injected by JS -->
+      </div>
+    </div>
+
+    <!-- Playhead controls -->
+    <div class="vg-timeline-controls">
+      <button class="vg-tl-ctrl-btn" id="tl-play-seq" title="Play sequence in order">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        Preview Sequence
+      </button>
+      <div class="vg-timeline-order-hint">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+        Drag clips to reorder · changes sync to storyboard
+      </div>
+      <div class="vg-timeline-stats" id="timeline-stats">0 shots</div>
+    </div>
+
+    <!-- Sequence preview player (hidden until play pressed) -->
+    <div class="vg-timeline-preview" id="timeline-preview" style="display:none">
+      <video id="tl-preview-video" autoplay muted style="max-height:260px;border-radius:6px;background:#000"></video>
+      <div class="vg-timeline-preview-controls">
+        <span id="tl-preview-label" style="font-size:0.72rem;color:var(--text-muted)">Shot 1 / 1</span>
+        <button class="vg-tl-ctrl-btn" id="tl-stop-seq">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+          Stop
+        </button>
+      </div>
+    </div>
+
+  </div>
+</div>
 
 <!-- NEW PROJECT MODAL -->
 <div class="vg-modal-overlay" id="project-modal-overlay">
@@ -3992,6 +4485,141 @@ function videoGeneratorPage(): string {
     <div class="an-deep-cards" id="an-deep-cards">
       <div class="an-loading-state">Select a model to drill into its metrics</div>
     </div>
+  </div>
+
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     COMPARE VIEW — A/B Shot Comparison
+═══════════════════════════════════════════════════════ -->
+<section id="vg-compare" style="display:none">
+
+  <div class="vg-cmp-topbar">
+    <div class="vg-cmp-topbar-left">
+      <h2 class="vg-cmp-title">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="9" height="18" rx="1"/><rect x="13" y="3" width="9" height="18" rx="1"/></svg>
+        Shot Compare
+      </h2>
+      <p class="vg-cmp-subtitle">Select up to 4 shots from your project to compare side-by-side</p>
+    </div>
+    <div class="vg-cmp-topbar-right">
+      <button class="vg-cmp-btn" id="btn-cmp-sync" title="Sync playback">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+        Sync
+      </button>
+      <button class="vg-cmp-btn active" id="btn-cmp-sync-toggle">Sync ON</button>
+      <button class="vg-cmp-btn" id="btn-cmp-clear">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        Clear
+      </button>
+    </div>
+  </div>
+
+  <!-- Shot picker strip -->
+  <div class="vg-cmp-picker-bar">
+    <span class="vg-cmp-picker-label">Pick shots:</span>
+    <div class="vg-cmp-picker-scroll" id="vg-cmp-picker-scroll">
+      <div class="vg-cmp-picker-empty">Load a project to see shots here</div>
+    </div>
+    <span class="vg-cmp-picker-hint" id="vg-cmp-picker-hint">0 / 4 selected</span>
+  </div>
+
+  <!-- Compare grid: 1-4 cells, auto-layout -->
+  <div class="vg-cmp-grid" id="vg-cmp-grid">
+    <div class="vg-cmp-empty-state">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><rect x="2" y="3" width="9" height="18" rx="1"/><rect x="13" y="3" width="9" height="18" rx="1"/></svg>
+      <p>Select 2–4 shots from the picker above to compare them</p>
+    </div>
+  </div>
+
+  <!-- Winner bar (appears once ≥2 shots loaded) -->
+  <div class="vg-cmp-winner-bar" id="vg-cmp-winner-bar" style="display:none">
+    <span class="vg-cmp-winner-label">Mark winner:</span>
+    <div class="vg-cmp-winner-btns" id="vg-cmp-winner-btns"></div>
+    <span class="vg-cmp-winner-note" id="vg-cmp-winner-note"></span>
+  </div>
+
+</section>
+
+<!-- ══════════════════════════════════════════════════════
+     TIMELINE EDITOR
+═══════════════════════════════════════════════════════ -->
+<section id="vg-timeline" style="display:none">
+
+  <div class="vg-tl-topbar">
+    <div class="vg-tl-topbar-left">
+      <h2 class="vg-tl-title">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="10" rx="1"/><line x1="6" y1="7" x2="6" y2="17"/><line x1="10" y1="7" x2="10" y2="17"/><line x1="14" y1="7" x2="14" y2="17"/><line x1="18" y1="7" x2="18" y2="17"/></svg>
+        Sequence Editor
+      </h2>
+      <p class="vg-tl-subtitle">Arrange completed shots into a sequence — drag to reorder, export manifest</p>
+    </div>
+    <div class="vg-tl-topbar-right">
+      <span class="vg-tl-duration-badge" id="vg-tl-total-duration">0:00:00</span>
+      <button class="vg-tl-btn" id="btn-tl-play-all" title="Preview sequence" disabled>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        Preview
+      </button>
+      <button class="vg-tl-btn primary" id="btn-tl-export" title="Export JSON manifest" disabled>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Export Manifest
+      </button>
+    </div>
+  </div>
+
+  <!-- Timecode ruler -->
+  <div class="vg-tl-ruler" id="vg-tl-ruler">
+    <div class="vg-tl-ruler-inner" id="vg-tl-ruler-inner"></div>
+  </div>
+
+  <!-- Timeline strip -->
+  <div class="vg-tl-strip-wrap" id="vg-tl-strip-wrap">
+    <div class="vg-tl-track-label">VIDEO</div>
+    <div class="vg-tl-strip" id="vg-tl-strip">
+      <div class="vg-tl-empty" id="vg-tl-empty">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><rect x="2" y="7" width="20" height="10" rx="1"/></svg>
+        <p>No completed shots yet — generate some shots first, then come back to arrange them here</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Shot bank (pool of available clips) -->
+  <div class="vg-tl-bank" id="vg-tl-bank">
+    <div class="vg-tl-bank-header">
+      <span class="vg-tl-bank-label">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        Shot Bank
+      </span>
+      <span class="vg-tl-bank-hint" id="vg-tl-bank-hint">drag clips to timeline</span>
+    </div>
+    <div class="vg-tl-bank-grid" id="vg-tl-bank-grid">
+      <div class="vg-tl-bank-empty">Loading shots…</div>
+    </div>
+  </div>
+
+  <!-- Sequence details panel -->
+  <div class="vg-tl-details" id="vg-tl-details" style="display:none">
+    <div class="vg-tl-details-header">
+      <span class="vg-tl-details-title">Selected Clip</span>
+      <button class="vg-tl-details-close" id="btn-tl-details-close">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="vg-tl-details-body" id="vg-tl-details-body"></div>
+  </div>
+
+  <!-- Preview player (hidden until Preview clicked) -->
+  <div class="vg-tl-preview" id="vg-tl-preview" style="display:none">
+    <div class="vg-tl-preview-header">
+      <span class="vg-tl-preview-title">Sequence Preview</span>
+      <div class="vg-tl-preview-controls">
+        <span class="vg-tl-preview-counter" id="vg-tl-preview-counter">Shot 1 / 1</span>
+        <button class="vg-tl-preview-close" id="btn-tl-preview-close">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+    </div>
+    <video class="vg-tl-preview-video" id="vg-tl-preview-video" controls autoplay></video>
   </div>
 
 </section>
@@ -4656,6 +5284,658 @@ function distributionPage(): string {
 <div class="dn-toast" id="dn-toast"></div>
 
 <script src="/static/distribution.js"></script>
+</body>
+</html>`
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   ADMIN PAGE
+══════════════════════════════════════════════════════════════════ */
+function adminPage(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Admin — Spectra</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{
+      --bg:#060810;--surface:#0D1117;--surface2:#111827;
+      --border:rgba(168,216,240,0.10);--border2:rgba(168,216,240,0.06);
+      --ice:#E8F4FD;--muted:rgba(232,244,253,0.45);--muted2:rgba(232,244,253,0.25);
+      --accent:#7BB8D4;--glow:#A8D8F0;
+      --green:#34D399;--red:#F87171;--yellow:#FBBF24;--purple:#A78BFA;--orange:#FB923C;
+    }
+    body{background:var(--bg);color:var(--ice);font-family:'Space Grotesk',sans-serif;min-height:100vh;-webkit-font-smoothing:antialiased}
+    /* NAV */
+    nav{display:flex;align-items:center;justify-content:space-between;padding:1rem 2rem;border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(6,8,16,0.95);backdrop-filter:blur(12px);z-index:100}
+    .nav-logo{font-family:'Space Mono',monospace;font-size:0.82rem;letter-spacing:.28em;color:var(--glow);text-decoration:none;display:flex;align-items:center;gap:.5rem}
+    .nav-mark{width:24px;height:24px;border:1px solid rgba(168,216,240,.3);border-radius:4px;display:grid;place-items:center;font-size:.68rem;font-weight:700}
+    .nav-badge{font-family:'Space Mono',monospace;font-size:.58rem;letter-spacing:.22em;padding:.25rem .65rem;border-radius:20px;border:1px solid rgba(251,146,60,.35);background:rgba(251,146,60,.08);color:var(--orange)}
+    .nav-right{display:flex;align-items:center;gap:1rem}
+    .nav-secret-wrap{display:flex;align-items:center;gap:.5rem}
+    .nav-secret-input{background:var(--surface);border:1px solid var(--border);color:var(--ice);padding:.35rem .7rem;border-radius:6px;font-size:.75rem;width:220px;font-family:'Space Mono',monospace;outline:none}
+    .nav-secret-input:focus{border-color:var(--accent)}
+    .nav-auth-btn{background:var(--accent);color:#060810;border:none;padding:.35rem .9rem;border-radius:6px;font-size:.75rem;font-weight:600;cursor:pointer;transition:opacity .2s}
+    .nav-auth-btn:hover{opacity:.85}
+    /* GATE */
+    #adm-gate{display:flex;align-items:center;justify-content:center;min-height:80vh}
+    .adm-gate-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:2.5rem;width:380px;text-align:center}
+    .adm-gate-icon{font-size:2rem;margin-bottom:1rem}
+    .adm-gate-title{font-size:1.2rem;font-weight:600;margin-bottom:.5rem}
+    .adm-gate-sub{color:var(--muted);font-size:.82rem;margin-bottom:1.5rem}
+    .adm-gate-input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--ice);padding:.65rem 1rem;border-radius:7px;font-size:.85rem;margin-bottom:.75rem;font-family:'Space Mono',monospace;outline:none}
+    .adm-gate-input:focus{border-color:var(--accent)}
+    .adm-gate-btn{width:100%;background:var(--accent);color:#060810;border:none;padding:.7rem;border-radius:7px;font-size:.85rem;font-weight:700;cursor:pointer;transition:opacity .2s}
+    .adm-gate-btn:hover{opacity:.85}
+    .adm-gate-error{color:var(--red);font-size:.78rem;margin-top:.5rem}
+    /* MAIN */
+    #adm-app{display:none;padding:2rem}
+    /* TABS */
+    .adm-tabs{display:flex;gap:.25rem;margin-bottom:2rem;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.3rem;width:fit-content}
+    .adm-tab{padding:.45rem 1.1rem;border-radius:6px;font-size:.78rem;font-weight:500;cursor:pointer;border:none;background:transparent;color:var(--muted);transition:all .2s;letter-spacing:.03em}
+    .adm-tab.active{background:var(--surface2);color:var(--ice)}
+    .adm-tab:hover:not(.active){color:var(--ice)}
+    .adm-panel{display:none}
+    .adm-panel.active{display:block}
+    /* STATS GRID */
+    .adm-stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:1rem;margin-bottom:2rem}
+    .adm-stat{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.1rem 1.2rem}
+    .adm-stat-val{font-size:1.8rem;font-weight:700;line-height:1;margin-bottom:.3rem}
+    .adm-stat-label{font-size:.72rem;color:var(--muted);letter-spacing:.06em;text-transform:uppercase}
+    .adm-stat-sub{font-size:.72rem;color:var(--muted2);margin-top:.25rem}
+    .adm-stat.green .adm-stat-val{color:var(--green)}
+    .adm-stat.red   .adm-stat-val{color:var(--red)}
+    .adm-stat.yellow .adm-stat-val{color:var(--yellow)}
+    .adm-stat.purple .adm-stat-val{color:var(--purple)}
+    .adm-stat.orange .adm-stat-val{color:var(--orange)}
+    /* PANELS */
+    .adm-panel-title{font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:1rem;font-family:'Space Mono',monospace}
+    .adm-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:2rem}
+    @media(max-width:900px){.adm-grid-2{grid-template-columns:1fr}}
+    /* CHARTS */
+    .adm-chart-wrap{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.2rem}
+    .adm-chart-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem}
+    .adm-chart-title{font-size:.82rem;font-weight:600}
+    .adm-svg-wrap{width:100%;overflow:hidden}
+    /* TABLE */
+    .adm-table-wrap{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+    .adm-table-header{display:flex;justify-content:space-between;align-items:center;padding:1rem 1.2rem;border-bottom:1px solid var(--border)}
+    .adm-table-title{font-size:.82rem;font-weight:600}
+    .adm-search-row{display:flex;gap:.5rem;padding:.75rem 1.2rem;border-bottom:1px solid var(--border2);background:var(--surface2)}
+    .adm-search{background:var(--bg);border:1px solid var(--border);color:var(--ice);padding:.4rem .8rem;border-radius:6px;font-size:.78rem;width:240px;outline:none}
+    .adm-search:focus{border-color:var(--accent)}
+    .adm-filter-select{background:var(--bg);border:1px solid var(--border);color:var(--ice);padding:.4rem .7rem;border-radius:6px;font-size:.78rem;outline:none;cursor:pointer}
+    table{width:100%;border-collapse:collapse}
+    th{font-size:.68rem;letter-spacing:.08em;color:var(--muted);text-transform:uppercase;padding:.65rem 1.2rem;text-align:left;font-weight:500;border-bottom:1px solid var(--border2)}
+    td{padding:.7rem 1.2rem;font-size:.8rem;border-bottom:1px solid var(--border2);color:var(--ice)}
+    tr:last-child td{border-bottom:none}
+    tr:hover td{background:var(--surface2)}
+    .adm-tier-badge{display:inline-flex;padding:.2rem .6rem;border-radius:20px;font-size:.68rem;font-weight:600;font-family:'Space Mono',monospace}
+    .adm-tier-badge.free   {background:rgba(168,216,240,.1);color:var(--accent)}
+    .adm-tier-badge.creator{background:rgba(52,211,153,.12);color:var(--green)}
+    .adm-tier-badge.studio {background:rgba(167,139,250,.12);color:var(--purple)}
+    .adm-tier-badge.pro    {background:rgba(251,146,60,.12);color:var(--orange)}
+    .adm-action-btn{padding:.3rem .7rem;border-radius:5px;font-size:.72rem;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--muted);transition:all .18s}
+    .adm-action-btn:hover{border-color:var(--accent);color:var(--ice)}
+    .adm-action-btn.danger:hover{border-color:var(--red);color:var(--red)}
+    .adm-pagination{display:flex;align-items:center;justify-content:space-between;padding:.75rem 1.2rem;border-top:1px solid var(--border2)}
+    .adm-pagination-info{font-size:.75rem;color:var(--muted)}
+    .adm-pagination-btns{display:flex;gap:.4rem}
+    .adm-page-btn{padding:.3rem .65rem;border-radius:5px;font-size:.75rem;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--muted);transition:all .18s}
+    .adm-page-btn:hover{border-color:var(--accent);color:var(--ice)}
+    .adm-page-btn.active{background:var(--accent);color:#060810;border-color:var(--accent)}
+    /* MODEL BARS */
+    .adm-model-row{display:flex;align-items:center;gap:.75rem;padding:.5rem 0;border-bottom:1px solid var(--border2)}
+    .adm-model-row:last-child{border-bottom:none}
+    .adm-model-name{font-size:.75rem;width:140px;flex-shrink:0;font-family:'Space Mono',monospace;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .adm-model-bar-wrap{flex:1;height:6px;background:rgba(168,216,240,.06);border-radius:3px;overflow:hidden}
+    .adm-model-bar{height:100%;border-radius:3px;background:var(--accent);transition:width .5s}
+    .adm-model-count{font-size:.72rem;color:var(--muted);width:50px;text-align:right;flex-shrink:0}
+    /* ACTIVITY FEED */
+    .adm-activity-item{display:flex;align-items:center;gap:.75rem;padding:.6rem 1.2rem;border-bottom:1px solid var(--border2);font-size:.78rem}
+    .adm-activity-item:last-child{border-bottom:none}
+    .adm-activity-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+    .adm-activity-dot.completed{background:var(--green)}
+    .adm-activity-dot.failed,.adm-activity-dot.nsfw{background:var(--red)}
+    .adm-activity-dot.queued,.adm-activity-dot.in_progress{background:var(--yellow)}
+    .adm-activity-email{color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .adm-activity-model{color:var(--muted2);font-family:'Space Mono',monospace;font-size:.68rem;width:90px;flex-shrink:0}
+    .adm-activity-time{color:var(--muted2);font-size:.68rem;width:80px;text-align:right;flex-shrink:0}
+    /* EDIT MODAL */
+    .adm-modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:1000}
+    .adm-modal-overlay.open{display:flex}
+    .adm-modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.75rem;width:400px}
+    .adm-modal-title{font-size:1rem;font-weight:600;margin-bottom:.25rem}
+    .adm-modal-sub{font-size:.78rem;color:var(--muted);margin-bottom:1.5rem}
+    .adm-field{margin-bottom:1rem}
+    .adm-label{font-size:.72rem;color:var(--muted);letter-spacing:.05em;margin-bottom:.35rem;display:block}
+    .adm-input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--ice);padding:.55rem .8rem;border-radius:6px;font-size:.82rem;outline:none}
+    .adm-input:focus{border-color:var(--accent)}
+    .adm-select{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--ice);padding:.55rem .8rem;border-radius:6px;font-size:.82rem;outline:none;cursor:pointer}
+    .adm-modal-footer{display:flex;gap:.5rem;justify-content:flex-end;margin-top:1.5rem}
+    .adm-btn-ghost{padding:.5rem 1.1rem;border-radius:6px;font-size:.78rem;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--muted);transition:all .18s}
+    .adm-btn-ghost:hover{color:var(--ice);border-color:rgba(168,216,240,.35)}
+    .adm-btn-primary{padding:.5rem 1.2rem;border-radius:6px;font-size:.78rem;font-weight:600;cursor:pointer;border:none;background:var(--accent);color:#060810;transition:opacity .2s}
+    .adm-btn-primary:hover{opacity:.85}
+    .adm-btn-danger{padding:.5rem 1.2rem;border-radius:6px;font-size:.78rem;font-weight:600;cursor:pointer;border:none;background:var(--red);color:#fff;transition:opacity .2s}
+    .adm-btn-danger:hover{opacity:.85}
+    .adm-modal-error{color:var(--red);font-size:.75rem;margin-top:.5rem}
+    /* GROWTH CHART */
+    .adm-growth-svg{width:100%;height:120px}
+    /* TOAST */
+    .adm-toast{position:fixed;bottom:1.5rem;right:1.5rem;background:var(--surface);border:1px solid var(--border);color:var(--ice);padding:.65rem 1.1rem;border-radius:8px;font-size:.78rem;opacity:0;transform:translateY(8px);transition:all .3s;pointer-events:none;z-index:2000;max-width:300px}
+    .adm-toast.show{opacity:1;transform:translateY(0)}
+  </style>
+</head>
+<body>
+
+<nav>
+  <a href="/" class="nav-logo">
+    <span class="nav-mark">S</span>
+    SPECTRA
+  </a>
+  <span class="nav-badge">ADMIN CONSOLE</span>
+  <div class="nav-right">
+    <div class="nav-secret-wrap">
+      <input type="password" class="nav-secret-input" id="adm-secret-input" placeholder="Admin secret…" autocomplete="off"/>
+      <button class="nav-auth-btn" id="adm-auth-btn">Unlock</button>
+    </div>
+  </div>
+</nav>
+
+<!-- GATE -->
+<div id="adm-gate">
+  <div class="adm-gate-card">
+    <div class="adm-gate-icon">🔐</div>
+    <div class="adm-gate-title">Admin Console</div>
+    <div class="adm-gate-sub">Enter your admin secret to access platform controls</div>
+    <input type="password" class="adm-gate-input" id="adm-gate-input" placeholder="Admin secret key…" autocomplete="off"/>
+    <button class="adm-gate-btn" id="adm-gate-btn">Unlock Console</button>
+    <div class="adm-gate-error" id="adm-gate-error" style="display:none"></div>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="adm-app">
+
+  <!-- TABS -->
+  <div class="adm-tabs">
+    <button class="adm-tab active" data-tab="overview">Overview</button>
+    <button class="adm-tab" data-tab="users">Users</button>
+    <button class="adm-tab" data-tab="activity">Activity</button>
+    <button class="adm-tab" data-tab="models">Models</button>
+    <button class="adm-tab" data-tab="growth">Growth</button>
+  </div>
+
+  <!-- ── OVERVIEW ── -->
+  <div class="adm-panel active" id="adm-panel-overview">
+    <div class="adm-panel-title">Platform Overview</div>
+    <div class="adm-stats-grid" id="adm-stats-grid">
+      <div class="adm-stat"><div class="adm-stat-val" id="st-total-users">—</div><div class="adm-stat-label">Total Users</div><div class="adm-stat-sub" id="st-new-7d">— new (7d)</div></div>
+      <div class="adm-stat green"><div class="adm-stat-val" id="st-mrr">—</div><div class="adm-stat-label">MRR</div><div class="adm-stat-sub">paying subscribers</div></div>
+      <div class="adm-stat"><div class="adm-stat-val" id="st-total-shots">—</div><div class="adm-stat-label">Total Shots</div><div class="adm-stat-sub" id="st-shots-24h">— last 24h</div></div>
+      <div class="adm-stat green"><div class="adm-stat-val" id="st-completed">—</div><div class="adm-stat-label">Completed</div><div class="adm-stat-sub" id="st-success-rate">—% success</div></div>
+      <div class="adm-stat red"><div class="adm-stat-val" id="st-failed">—</div><div class="adm-stat-label">Failed / NSFW</div></div>
+      <div class="adm-stat yellow"><div class="adm-stat-val" id="st-active-jobs">—</div><div class="adm-stat-label">Active Jobs</div><div class="adm-stat-sub">queued + rendering</div></div>
+      <div class="adm-stat"><div class="adm-stat-val" id="st-total-seconds">—</div><div class="adm-stat-label">Video Generated</div><div class="adm-stat-sub">total output seconds</div></div>
+      <div class="adm-stat purple"><div class="adm-stat-val" id="st-active-sessions">—</div><div class="adm-stat-label">Active Sessions</div></div>
+    </div>
+
+    <div class="adm-grid-2">
+      <div class="adm-chart-wrap">
+        <div class="adm-chart-header">
+          <span class="adm-chart-title">Users by Tier</span>
+        </div>
+        <div id="adm-tier-bars"></div>
+      </div>
+      <div class="adm-chart-wrap">
+        <div class="adm-chart-header">
+          <span class="adm-chart-title">Shot Status Breakdown</span>
+        </div>
+        <div id="adm-shot-status-bars"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── USERS ── -->
+  <div class="adm-panel" id="adm-panel-users">
+    <div class="adm-table-wrap">
+      <div class="adm-table-header">
+        <span class="adm-table-title">All Users</span>
+        <span id="adm-user-count" style="font-size:.75rem;color:var(--muted)"></span>
+      </div>
+      <div class="adm-search-row">
+        <input type="search" class="adm-search" id="adm-user-search" placeholder="Search email or ID…"/>
+        <select class="adm-filter-select" id="adm-tier-filter">
+          <option value="">All tiers</option>
+          <option value="free">Free</option>
+          <option value="creator">Creator</option>
+          <option value="studio">Studio</option>
+          <option value="pro">Pro</option>
+        </select>
+        <button class="adm-action-btn" id="adm-user-refresh">↻ Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Email</th>
+            <th>Tier</th>
+            <th>Credits</th>
+            <th>Projects</th>
+            <th>Shots</th>
+            <th>Joined</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="adm-user-tbody"></tbody>
+      </table>
+      <div class="adm-pagination">
+        <span class="adm-pagination-info" id="adm-user-pagination-info"></span>
+        <div class="adm-pagination-btns" id="adm-user-pagination-btns"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── ACTIVITY ── -->
+  <div class="adm-panel" id="adm-panel-activity">
+    <div class="adm-table-wrap">
+      <div class="adm-table-header">
+        <span class="adm-table-title">Recent Shot Activity</span>
+        <button class="adm-action-btn" id="adm-activity-refresh">↻ Refresh</button>
+      </div>
+      <div id="adm-activity-feed"></div>
+    </div>
+  </div>
+
+  <!-- ── MODELS ── -->
+  <div class="adm-panel" id="adm-panel-models">
+    <div class="adm-grid-2">
+      <div class="adm-chart-wrap">
+        <div class="adm-chart-header"><span class="adm-chart-title">Shots by Model</span></div>
+        <div id="adm-model-bars"></div>
+      </div>
+      <div class="adm-chart-wrap">
+        <div class="adm-chart-header"><span class="adm-chart-title">Success Rate by Model</span></div>
+        <div id="adm-model-success-bars"></div>
+      </div>
+    </div>
+    <div class="adm-chart-wrap" style="margin-top:0">
+      <div class="adm-chart-header"><span class="adm-chart-title">Avg Generation Time (seconds)</span></div>
+      <div id="adm-model-speed-bars"></div>
+    </div>
+  </div>
+
+  <!-- ── GROWTH ── -->
+  <div class="adm-panel" id="adm-panel-growth">
+    <div class="adm-grid-2">
+      <div class="adm-chart-wrap">
+        <div class="adm-chart-header"><span class="adm-chart-title">Daily Signups (30d)</span></div>
+        <svg class="adm-growth-svg" id="adm-signup-svg" viewBox="0 0 500 120" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="adm-chart-wrap">
+        <div class="adm-chart-header"><span class="adm-chart-title">Daily Shots (30d)</span></div>
+        <svg class="adm-growth-svg" id="adm-shots-svg" viewBox="0 0 500 120" preserveAspectRatio="none"></svg>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /adm-app -->
+
+<!-- EDIT USER MODAL -->
+<div class="adm-modal-overlay" id="adm-edit-overlay">
+  <div class="adm-modal">
+    <div class="adm-modal-title">Edit User</div>
+    <div class="adm-modal-sub" id="adm-edit-email"></div>
+    <input type="hidden" id="adm-edit-user-id"/>
+    <div class="adm-field">
+      <label class="adm-label">Tier</label>
+      <select class="adm-select" id="adm-edit-tier">
+        <option value="free">Free</option>
+        <option value="creator">Creator — $29/mo</option>
+        <option value="studio">Studio — $79/mo</option>
+        <option value="pro">Pro — $149/mo</option>
+      </select>
+    </div>
+    <div class="adm-field">
+      <label class="adm-label">Credits</label>
+      <input type="number" class="adm-input" id="adm-edit-credits" min="0" max="99999"/>
+    </div>
+    <div class="adm-modal-error" id="adm-edit-error" style="display:none"></div>
+    <div class="adm-modal-footer">
+      <button class="adm-btn-ghost" id="adm-edit-cancel">Cancel</button>
+      <button class="adm-btn-danger" id="adm-edit-delete">Delete User</button>
+      <button class="adm-btn-primary" id="adm-edit-save">Save Changes</button>
+    </div>
+  </div>
+</div>
+
+<div class="adm-toast" id="adm-toast"></div>
+
+<script>
+/* ── Admin Console JS ── */
+let ADM_SECRET = '';
+let admUserPage = 1;
+let admUserSearch = '';
+let admUserTier = '';
+
+function admApi(method, path, body) {
+  const url = path + (path.includes('?') ? '&' : '?') + 'secret=' + encodeURIComponent(ADM_SECRET);
+  return fetch(url, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json', 'X-Admin-Secret': ADM_SECRET } : { 'X-Admin-Secret': ADM_SECRET },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+function admToast(msg, isErr) {
+  const t = document.getElementById('adm-toast');
+  t.textContent = msg;
+  t.style.borderColor = isErr ? 'var(--red)' : 'var(--border)';
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+function fmtNum(n) {
+  if (n == null || n === '') return '—';
+  if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
+  if (n >= 1000)    return (n/1000).toFixed(1) + 'K';
+  return String(n);
+}
+function fmtDate(d) {
+  if (!d) return '—';
+  return new Date(d).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'2-digit' });
+}
+function timeAgo(d) {
+  if (!d) return '—';
+  const s = Math.floor((Date.now() - new Date(d).getTime()) / 1000);
+  if (s < 60)   return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400)return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+}
+
+function renderTierBadge(tier) {
+  return '<span class="adm-tier-badge ' + tier + '">' + tier.toUpperCase() + '</span>';
+}
+
+// ── UNLOCK ──
+async function admUnlock(secret) {
+  const res  = await fetch('/api/admin/stats?secret=' + encodeURIComponent(secret));
+  if (res.status === 403) return false;
+  ADM_SECRET = secret;
+  document.getElementById('adm-gate').style.display = 'none';
+  document.getElementById('adm-app').style.display = 'block';
+  loadOverview();
+  return true;
+}
+
+document.getElementById('adm-gate-btn').addEventListener('click', async () => {
+  const secret = document.getElementById('adm-gate-input').value.trim();
+  const errEl  = document.getElementById('adm-gate-error');
+  errEl.style.display = 'none';
+  if (!secret) return;
+  const ok = await admUnlock(secret);
+  if (!ok) { errEl.textContent = 'Invalid secret. Access denied.'; errEl.style.display = 'block'; }
+});
+document.getElementById('adm-gate-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('adm-gate-btn').click();
+});
+document.getElementById('adm-auth-btn').addEventListener('click', async () => {
+  const secret = document.getElementById('adm-secret-input').value.trim();
+  if (!secret) return;
+  const ok = await admUnlock(secret);
+  if (!ok) admToast('Invalid secret', true);
+});
+
+// ── TABS ──
+document.querySelectorAll('.adm-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.adm-tab').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.adm-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    const panelId = 'adm-panel-' + btn.dataset.tab;
+    document.getElementById(panelId).classList.add('active');
+    if (btn.dataset.tab === 'users')    loadUsers();
+    if (btn.dataset.tab === 'activity') loadActivity();
+    if (btn.dataset.tab === 'models')   loadModels();
+    if (btn.dataset.tab === 'growth')   loadGrowth();
+  });
+});
+
+// ── OVERVIEW ──
+async function loadOverview() {
+  const res  = await admApi('GET', '/api/admin/stats');
+  const data = await res.json();
+  const { users, shots, projects, sessions, revenue } = data;
+
+  document.getElementById('st-total-users').textContent    = fmtNum(users.total);
+  document.getElementById('st-new-7d').textContent         = '+' + (users.new_7d||0) + ' new (7d)';
+  document.getElementById('st-mrr').textContent            = '$' + fmtNum(revenue?.mrr || 0);
+  document.getElementById('st-total-shots').textContent    = fmtNum(shots.total);
+  document.getElementById('st-shots-24h').textContent      = (shots.last_24h||0) + ' last 24h';
+  document.getElementById('st-completed').textContent      = fmtNum(shots.completed);
+  const succ = shots.total > 0 ? Math.round((shots.completed/shots.total)*100) : 0;
+  document.getElementById('st-success-rate').textContent   = succ + '% success';
+  document.getElementById('st-failed').textContent         = fmtNum((shots.failed||0) + (shots.nsfw||0));
+  document.getElementById('st-active-jobs').textContent    = fmtNum(shots.active||0);
+  document.getElementById('st-total-seconds').textContent  = fmtNum(shots.total_seconds||0) + 's';
+  document.getElementById('st-active-sessions').textContent= fmtNum(sessions.active||0);
+
+  // Tier bars
+  const tierData = [
+    { label:'Free',    val: users.free_count||0,    color:'var(--accent)' },
+    { label:'Creator', val: users.creator_count||0, color:'var(--green)' },
+    { label:'Studio',  val: users.studio_count||0,  color:'var(--purple)' },
+    { label:'Pro',     val: users.pro_count||0,      color:'var(--orange)' },
+  ];
+  const maxTier = Math.max(...tierData.map(d => d.val), 1);
+  document.getElementById('adm-tier-bars').innerHTML = tierData.map(d => \`
+    <div class="adm-model-row">
+      <div class="adm-model-name">\${d.label}</div>
+      <div class="adm-model-bar-wrap"><div class="adm-model-bar" style="width:\${Math.round(d.val/maxTier*100)}%;background:\${d.color}"></div></div>
+      <div class="adm-model-count">\${d.val}</div>
+    </div>\`).join('');
+
+  // Status bars
+  const statusData = [
+    { label:'Completed', val: shots.completed||0,  color:'var(--green)' },
+    { label:'Failed',    val: shots.failed||0,     color:'var(--red)' },
+    { label:'NSFW',      val: shots.nsfw||0,       color:'var(--orange)' },
+    { label:'Active',    val: shots.active||0,     color:'var(--yellow)' },
+  ];
+  const maxStatus = Math.max(...statusData.map(d => d.val), 1);
+  document.getElementById('adm-shot-status-bars').innerHTML = statusData.map(d => \`
+    <div class="adm-model-row">
+      <div class="adm-model-name">\${d.label}</div>
+      <div class="adm-model-bar-wrap"><div class="adm-model-bar" style="width:\${Math.round(d.val/maxStatus*100)}%;background:\${d.color}"></div></div>
+      <div class="adm-model-count">\${d.val}</div>
+    </div>\`).join('');
+}
+
+// ── USERS ──
+async function loadUsers() {
+  const res  = await admApi('GET', \`/api/admin/users?page=\${admUserPage}&search=\${encodeURIComponent(admUserSearch)}&tier=\${admUserTier}\`);
+  const data = await res.json();
+
+  document.getElementById('adm-user-count').textContent = data.total + ' users';
+
+  const tbody = document.getElementById('adm-user-tbody');
+  tbody.innerHTML = (data.users || []).map(u => \`
+    <tr>
+      <td style="font-family:'Space Mono',monospace;font-size:.73rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${u.email}</td>
+      <td>\${renderTierBadge(u.tier)}</td>
+      <td>\${u.credits}</td>
+      <td>\${u.project_count||0}</td>
+      <td>\${u.shot_count||0} (\${u.completed_shots||0} done)</td>
+      <td>\${fmtDate(u.created_at)}</td>
+      <td>
+        <button class="adm-action-btn" onclick="openEditUser(\${JSON.stringify(u).replace(/"/g,'&quot;')})">Edit</button>
+      </td>
+    </tr>\`).join('');
+
+  // Pagination
+  const info = document.getElementById('adm-user-pagination-info');
+  const btns = document.getElementById('adm-user-pagination-btns');
+  info.textContent = \`Page \${data.page} of \${data.pages || 1} · \${data.total} total\`;
+  btns.innerHTML = '';
+  const totalPages = data.pages || 1;
+  const start = Math.max(1, admUserPage - 2);
+  const end   = Math.min(totalPages, admUserPage + 2);
+  if (admUserPage > 1) {
+    const b = document.createElement('button');
+    b.className = 'adm-page-btn'; b.textContent = '←';
+    b.onclick = () => { admUserPage--; loadUsers(); };
+    btns.appendChild(b);
+  }
+  for (let p = start; p <= end; p++) {
+    const b = document.createElement('button');
+    b.className = 'adm-page-btn' + (p === admUserPage ? ' active' : '');
+    b.textContent = p;
+    b.onclick = (pp => () => { admUserPage = pp; loadUsers(); })(p);
+    btns.appendChild(b);
+  }
+  if (admUserPage < totalPages) {
+    const b = document.createElement('button');
+    b.className = 'adm-page-btn'; b.textContent = '→';
+    b.onclick = () => { admUserPage++; loadUsers(); };
+    btns.appendChild(b);
+  }
+}
+
+let _searchTimer;
+document.getElementById('adm-user-search').addEventListener('input', e => {
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(() => { admUserSearch = e.target.value; admUserPage = 1; loadUsers(); }, 350);
+});
+document.getElementById('adm-tier-filter').addEventListener('change', e => {
+  admUserTier = e.target.value; admUserPage = 1; loadUsers();
+});
+document.getElementById('adm-user-refresh').addEventListener('click', loadUsers);
+
+// ── EDIT USER MODAL ──
+function openEditUser(u) {
+  document.getElementById('adm-edit-user-id').value  = u.id;
+  document.getElementById('adm-edit-email').textContent = u.email;
+  document.getElementById('adm-edit-tier').value     = u.tier;
+  document.getElementById('adm-edit-credits').value  = u.credits;
+  document.getElementById('adm-edit-error').style.display = 'none';
+  document.getElementById('adm-edit-overlay').classList.add('open');
+}
+document.getElementById('adm-edit-cancel').addEventListener('click', () => {
+  document.getElementById('adm-edit-overlay').classList.remove('open');
+});
+document.getElementById('adm-edit-overlay').addEventListener('click', e => {
+  if (e.target === document.getElementById('adm-edit-overlay'))
+    document.getElementById('adm-edit-overlay').classList.remove('open');
+});
+document.getElementById('adm-edit-save').addEventListener('click', async () => {
+  const id      = document.getElementById('adm-edit-user-id').value;
+  const tier    = document.getElementById('adm-edit-tier').value;
+  const credits = parseInt(document.getElementById('adm-edit-credits').value);
+  const errEl   = document.getElementById('adm-edit-error');
+  errEl.style.display = 'none';
+  const res  = await admApi('PATCH', '/api/admin/users/' + id, { tier, credits });
+  const data = await res.json();
+  if (!res.ok) { errEl.textContent = data.error; errEl.style.display = 'block'; return; }
+  document.getElementById('adm-edit-overlay').classList.remove('open');
+  admToast('User updated');
+  loadUsers();
+});
+document.getElementById('adm-edit-delete').addEventListener('click', async () => {
+  const id    = document.getElementById('adm-edit-user-id').value;
+  const email = document.getElementById('adm-edit-email').textContent;
+  if (!confirm('Delete user ' + email + '? This is permanent and deletes all their projects, shots, and data.')) return;
+  const res  = await admApi('DELETE', '/api/admin/users/' + id);
+  const data = await res.json();
+  if (!res.ok) { admToast(data.error, true); return; }
+  document.getElementById('adm-edit-overlay').classList.remove('open');
+  admToast('User deleted: ' + email);
+  loadUsers();
+});
+
+// ── ACTIVITY ──
+async function loadActivity() {
+  const res  = await admApi('GET', '/api/admin/activity?limit=60');
+  const data = await res.json();
+  const feed = document.getElementById('adm-activity-feed');
+  feed.innerHTML = (data.activity || []).map(a => {
+    const model = (a.model || '').split('/').pop() || '';
+    return \`<div class="adm-activity-item">
+      <div class="adm-activity-dot \${a.status}"></div>
+      <div class="adm-activity-email">\${a.email} · <span style="color:var(--muted2)">\${a.project_name}</span></div>
+      <div class="adm-activity-model">\${model}</div>
+      <div style="font-size:.7rem;color:var(--muted2);width:60px;flex-shrink:0">\${a.aspect_ratio||''}</div>
+      <div class="adm-activity-time">\${timeAgo(a.created_at)}</div>
+    </div>\`;
+  }).join('') || '<div style="padding:2rem;text-align:center;color:var(--muted);font-size:.8rem">No activity yet</div>';
+}
+document.getElementById('adm-activity-refresh').addEventListener('click', loadActivity);
+
+// ── MODELS ──
+async function loadModels() {
+  const res  = await admApi('GET', '/api/admin/model-stats');
+  const data = await res.json();
+  const models = data.models || [];
+  const maxTotal = Math.max(...models.map(m => m.total), 1);
+
+  document.getElementById('adm-model-bars').innerHTML = models.map(m => {
+    const label = (m.model||'').split('/').pop() || m.model;
+    return \`<div class="adm-model-row">
+      <div class="adm-model-name" title="\${m.model}">\${label}</div>
+      <div class="adm-model-bar-wrap"><div class="adm-model-bar" style="width:\${Math.round(m.total/maxTotal*100)}%"></div></div>
+      <div class="adm-model-count">\${m.total}</div>
+    </div>\`;
+  }).join('');
+
+  document.getElementById('adm-model-success-bars').innerHTML = models.map(m => {
+    const rate = m.total > 0 ? Math.round((m.completed/m.total)*100) : 0;
+    const col  = rate >= 80 ? 'var(--green)' : rate >= 50 ? 'var(--yellow)' : 'var(--red)';
+    return \`<div class="adm-model-row">
+      <div class="adm-model-name" title="\${m.model}">\${(m.model||'').split('/').pop()}</div>
+      <div class="adm-model-bar-wrap"><div class="adm-model-bar" style="width:\${rate}%;background:\${col}"></div></div>
+      <div class="adm-model-count">\${rate}%</div>
+    </div>\`;
+  }).join('');
+
+  const maxSec = Math.max(...models.map(m => m.avg_sec||0), 1);
+  document.getElementById('adm-model-speed-bars').innerHTML = models.map(m => {
+    const sec = m.avg_sec != null ? Math.round(m.avg_sec) : null;
+    return \`<div class="adm-model-row">
+      <div class="adm-model-name" title="\${m.model}">\${(m.model||'').split('/').pop()}</div>
+      <div class="adm-model-bar-wrap"><div class="adm-model-bar" style="width:\${sec != null ? Math.round(sec/maxSec*100) : 0}%;background:var(--purple)"></div></div>
+      <div class="adm-model-count">\${sec != null ? sec + 's' : '—'}</div>
+    </div>\`;
+  }).join('');
+}
+
+// ── GROWTH ──
+async function loadGrowth() {
+  const res  = await admApi('GET', '/api/admin/growth');
+  const data = await res.json();
+  renderGrowthChart('adm-signup-svg', data.signups||[], 'count', 'var(--green)');
+  renderGrowthChart('adm-shots-svg',  data.shots||[],   'total', 'var(--accent)');
+}
+
+function renderGrowthChart(svgId, rows, key, color) {
+  const svg = document.getElementById(svgId);
+  if (!svg || rows.length === 0) { if (svg) svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="rgba(232,244,253,.25)" font-size="11">No data</text>'; return; }
+  const vals = rows.map(r => r[key] || 0);
+  const maxV = Math.max(...vals, 1);
+  const W = 500, H = 120, pad = 10;
+  const step = (W - pad*2) / Math.max(vals.length - 1, 1);
+  const points = vals.map((v, i) => \`\${pad + i * step},\${H - pad - (v/maxV)*(H-pad*2)}\`).join(' ');
+  svg.innerHTML = \`
+    <polyline points="\${points}" fill="none" stroke="\${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.8"/>
+    \${vals.map((v,i) => v > 0 ? \`<circle cx="\${pad + i * step}" cy="\${H - pad - (v/maxV)*(H-pad*2)}" r="2.5" fill="\${color}" opacity="0.9"/>\` : '').join('')}
+    \${vals.map((v,i) => v > 0 ? \`<text x="\${pad + i * step}" y="\${H - pad - (v/maxV)*(H-pad*2) - 6}" text-anchor="middle" fill="rgba(232,244,253,.4)" font-size="9">\${v}</text>\` : '').join('')}
+  \`;
+}
+</script>
 </body>
 </html>`
 }

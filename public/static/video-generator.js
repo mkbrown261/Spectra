@@ -1135,6 +1135,7 @@ function renderShotGrid(projectId) {
       if (action === 'play')       playShot(shotId, projectId);
       if (action === 'continue')   continueFromShot(el);
       if (action === 'distribute') distributeShot(el);
+      if (action === 'compare')    addShotToCompare(el);
     });
   });
 
@@ -1251,6 +1252,9 @@ function renderShotCard(shot, draggable = false) {
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2L15 22l-4-9-9-4 20-7z"/></svg>
               Distribute
             </button>` : ''}
+            <button class="vg-shot-action-btn vg-shot-compare-btn" data-shot-id="${shot.id}" data-action="compare" data-video-url="${escAttr(videoUrl)}" data-prompt="${escAttr(shot.prompt || '')}" title="Add to Compare — open A/B viewer with this shot">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="9" height="18" rx="1"/><rect x="13" y="3" width="9" height="18" rx="1"/></svg>
+            </button>
             <button class="vg-shot-action-btn" data-shot-id="${shot.id}" data-action="copy" title="Copy prompt">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
             </button>
@@ -3557,26 +3561,55 @@ const MODEL_COLOURS = {
 function initViewSwitcher() {
   const btnStudio    = $('btn-show-studio');
   const btnAnalytics = $('btn-show-analytics');
+  const btnCompare   = $('btn-show-compare');
+  const btnTimeline  = $('btn-show-timeline');
   const studioEl     = $('vg-app');
   const analyticsEl  = $('vg-analytics');
+  const compareEl    = $('vg-compare');
+  const timelineEl   = $('vg-timeline');
 
   if (!btnStudio || !btnAnalytics) return;
 
+  const allBtns  = [btnStudio, btnAnalytics, btnCompare, btnTimeline].filter(Boolean);
+  const allViews = [
+    { el: studioEl,   display: 'flex'  },
+    { el: analyticsEl,display: 'block' },
+    { el: compareEl,  display: 'flex'  },
+    { el: timelineEl, display: 'flex'  },
+  ];
+
+  function showView(activeBtn, activeEl, display, onSwitch) {
+    allBtns.forEach(b  => b.classList.remove('active'));
+    allViews.forEach(v => { if (v.el) v.el.style.display = 'none'; });
+    activeBtn.classList.add('active');
+    if (activeEl) activeEl.style.display = display;
+    if (onSwitch) onSwitch();
+  }
+
   btnStudio.addEventListener('click', () => {
-    btnStudio.classList.add('active');
-    btnAnalytics.classList.remove('active');
-    studioEl.style.display    = 'flex';
-    analyticsEl.style.display = 'none';
+    showView(btnStudio, studioEl, 'flex');
   });
 
   btnAnalytics.addEventListener('click', () => {
     if (!VG.user) { showToast('Sign in to view analytics', true); return; }
-    btnAnalytics.classList.add('active');
-    btnStudio.classList.remove('active');
-    studioEl.style.display    = 'none';
-    analyticsEl.style.display = 'block';
-    if (!AN.data) loadAnalytics();
+    showView(btnAnalytics, analyticsEl, 'block', () => {
+      if (!AN.data) loadAnalytics();
+    });
   });
+
+  if (btnCompare) {
+    btnCompare.addEventListener('click', () => {
+      if (!VG.user) { showToast('Sign in to use Compare', true); return; }
+      showView(btnCompare, compareEl, 'flex', () => initCompareView());
+    });
+  }
+
+  if (btnTimeline) {
+    btnTimeline.addEventListener('click', () => {
+      if (!VG.user) { showToast('Sign in to use Timeline', true); return; }
+      showView(btnTimeline, timelineEl, 'flex', () => initTimelineView());
+    });
+  }
 
   btnStudio.classList.add('active');
 }
@@ -4221,4 +4254,700 @@ function onPromptInputForPrescore() {
       runPrescore();
     }
   }, PRESCORE.DEBOUNCE_MS);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SHOT COMPARISON  —  A/B Viewer
+   ═══════════════════════════════════════════════════════════════ */
+
+const COMPARE = {
+  selected: [],      // array of shot IDs selected for comparison
+  MAX: 4,
+  syncEnabled: true,
+  winner: null,
+};
+
+/* ── Toggle compare-selection on a shot card ─────────────────── */
+function toggleCompareSelect(shotId, projectId) {
+  const idx = COMPARE.selected.indexOf(shotId);
+  if (idx !== -1) {
+    COMPARE.selected.splice(idx, 1);
+  } else {
+    if (COMPARE.selected.length >= COMPARE.MAX) {
+      showToast(`Max ${COMPARE.MAX} shots for comparison`);
+      return;
+    }
+    COMPARE.selected.push(shotId);
+  }
+  refreshCompareUI(projectId);
+}
+
+function refreshCompareUI(projectId) {
+  const n   = COMPARE.selected.length;
+  const btn = $('btn-open-compare');
+  const badge = $('compare-badge');
+  if (btn)   { btn.disabled = n < 2; }
+  if (badge) { badge.textContent = n; }
+
+  // Highlight selected shot cards
+  document.querySelectorAll('.vg-shot-card').forEach(card => {
+    const id = card.dataset.shotId;
+    if (COMPARE.selected.includes(id)) {
+      card.classList.add('compare-selected');
+    } else {
+      card.classList.remove('compare-selected');
+    }
+  });
+}
+
+/* ── Open compare modal ──────────────────────────────────────── */
+function openCompareModal(projectId) {
+  if (COMPARE.selected.length < 2) {
+    showToast('Select at least 2 shots to compare');
+    return;
+  }
+  const shots = (VG.shots[projectId] || []).filter(s => COMPARE.selected.includes(s.id));
+  if (shots.length < 2) {
+    showToast('Could not find selected shots');
+    return;
+  }
+  COMPARE.winner = null;
+  renderCompareModal(shots);
+  $('compare-overlay').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeCompareModal() {
+  $('compare-overlay').classList.remove('open');
+  document.body.style.overflow = '';
+  // Pause all videos
+  document.querySelectorAll('#compare-grid video').forEach(v => v.pause());
+}
+
+/* ── Render compare modal contents ──────────────────────────── */
+function renderCompareModal(shots) {
+  const n   = shots.length;
+  const grid = $('compare-grid');
+  const badge = $('compare-mode-badge');
+  if (badge) badge.textContent = `${n}-UP`;
+  grid.dataset.count = n;
+  grid.style.setProperty('--compare-cols', n);
+
+  const LABELS = ['A', 'B', 'C', 'D'];
+
+  grid.innerHTML = shots.map((shot, i) => {
+    const videoUrl = shot.video_url || shot.hf_video_url || '';
+    const model    = (shot.model || '').split('/').pop() || '—';
+    const dur      = shot.duration ? `${shot.duration}s` : '—';
+    const ar       = shot.aspect_ratio || '16:9';
+
+    const videoHtml = videoUrl
+      ? `<video src="${escAttr(videoUrl)}" muted loop preload="auto"
+           style="width:100%;height:100%;object-fit:contain;display:block;flex:1;min-height:0"></video>
+         <div class="vg-compare-panel-overlay">
+           <button class="vg-compare-panel-play" data-compare-panel="${i}" title="Play / Pause">
+             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+           </button>
+         </div>`
+      : `<div class="vg-compare-no-video">
+           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.35"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M2 12h20"/></svg>
+           No video
+         </div>`;
+
+    return `
+      <div class="vg-compare-panel" data-compare-idx="${i}" data-shot-id="${shot.id}">
+        <div class="vg-compare-panel-label">${LABELS[i]}</div>
+        <div class="vg-compare-winner-badge">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+          Winner
+        </div>
+        <div class="vg-tl-clip-thumb" style="flex:1;min-height:0;position:relative">
+          ${videoHtml}
+        </div>
+        <div class="vg-compare-panel-meta">
+          <div class="vg-compare-panel-prompt">${escHtml(shot.prompt || '')}</div>
+          <div class="vg-compare-panel-stats">
+            <span>${escHtml(model)}</span>
+            <span>${escHtml(ar)} · ${dur}</span>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  // Render metadata diff table
+  renderCompareMetaTable(shots);
+
+  // Render winner buttons
+  const winRow = $('compare-winner-row');
+  winRow.innerHTML = shots.map((shot, i) => `
+    <button class="vg-compare-winner-btn" data-winner-idx="${i}" data-shot-id="${shot.id}">
+      ${LABELS[i]} — ${escHtml((shot.model || '').split('/').pop() || 'Shot ' + (i+1))}
+    </button>`).join('');
+
+  // Wire play/pause buttons
+  grid.querySelectorAll('[data-compare-panel]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const idx = +btn.dataset.comparePanel;
+      toggleCompareVideo(idx);
+    });
+  });
+
+  // Wire winner buttons
+  winRow.querySelectorAll('.vg-compare-winner-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const shotId = btn.dataset.shotId;
+      COMPARE.winner = shotId;
+      winRow.querySelectorAll('.vg-compare-winner-btn').forEach(b => b.classList.remove('selected'));
+      btn.classList.add('selected');
+      // Highlight winner panel
+      grid.querySelectorAll('.vg-compare-panel').forEach(p => {
+        p.classList.toggle('winner', p.dataset.shotId === shotId);
+      });
+      showToast(`Shot ${btn.dataset.winnerIdx === '0' ? 'A' : ['B','C','D'][+btn.dataset.winnerIdx - 1]} selected as winner`);
+    });
+  });
+}
+
+function toggleCompareVideo(idx) {
+  const panels = document.querySelectorAll('#compare-grid .vg-compare-panel');
+  const panel  = panels[idx];
+  if (!panel) return;
+  const video = panel.querySelector('video');
+  if (!video) return;
+
+  if (COMPARE.syncEnabled) {
+    // Sync all videos
+    const allVideos = document.querySelectorAll('#compare-grid video');
+    const playing   = !video.paused;
+    allVideos.forEach(v => {
+      if (playing) v.pause();
+      else { v.currentTime = video.currentTime; v.play().catch(() => {}); }
+    });
+  } else {
+    if (video.paused) video.play().catch(() => {});
+    else video.pause();
+  }
+}
+
+/* ── Play All button ─────────────────────────────────────────── */
+function comparePlayAll() {
+  const allVideos = document.querySelectorAll('#compare-grid video');
+  const anyPlaying = [...allVideos].some(v => !v.paused);
+  allVideos.forEach(v => {
+    if (anyPlaying) v.pause();
+    else { v.currentTime = 0; v.play().catch(() => {}); }
+  });
+  const playAllBtn = $('compare-play-all');
+  if (playAllBtn) {
+    playAllBtn.innerHTML = anyPlaying
+      ? `<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> Play All`
+      : `<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg> Pause All`;
+  }
+}
+
+/* ── Render metadata diff ────────────────────────────────────── */
+function renderCompareMetaTable(shots) {
+  const table = $('compare-meta-table');
+  if (!table) return;
+  table.style.setProperty('--compare-cols', shots.length);
+
+  const FIELDS = [
+    { key: 'model',        label: 'Model',    fmt: v => (v||'').split('/').pop() || '—' },
+    { key: 'aspect_ratio', label: 'Ratio',    fmt: v => v || '—' },
+    { key: 'duration',     label: 'Duration', fmt: v => v != null ? `${v}s` : '—' },
+    { key: 'seed',         label: 'Seed',     fmt: v => v != null ? String(v) : '—' },
+    { key: 'style_preset', label: 'Style',    fmt: v => v || '—' },
+    { key: 'status',       label: 'Status',   fmt: v => v || '—' },
+  ];
+
+  table.innerHTML = FIELDS.map(field => {
+    const vals = shots.map(s => field.fmt(s[field.key]));
+    const allSame = vals.every(v => v === vals[0]);
+    return `
+      <div class="vg-compare-meta-row">
+        <div class="vg-compare-meta-key">${field.label}</div>
+        ${vals.map(v => `<div class="vg-compare-meta-val${!allSame ? ' diff' : ''}">${escHtml(v)}</div>`).join('')}
+      </div>`;
+  }).join('');
+}
+
+/* ── Export diff JSON ────────────────────────────────────────── */
+function exportCompareDiff(projectId) {
+  const shots = (VG.shots[projectId] || []).filter(s => COMPARE.selected.includes(s.id));
+  const payload = {
+    exported_at:  new Date().toISOString(),
+    project_id:   projectId,
+    winner_shot_id: COMPARE.winner || null,
+    shots: shots.map((s, i) => ({
+      label:        ['A','B','C','D'][i],
+      id:           s.id,
+      model:        s.model,
+      aspect_ratio: s.aspect_ratio,
+      duration:     s.duration,
+      seed:         s.seed,
+      style_preset: s.style_preset,
+      prompt:       s.prompt,
+      video_url:    s.video_url || s.hf_video_url || null,
+      status:       s.status,
+      created_at:   s.created_at,
+      is_winner:    s.id === COMPARE.winner,
+    })),
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = `spectra-compare-${Date.now()}.json`; a.click();
+  URL.revokeObjectURL(url);
+  showToast('Diff JSON exported');
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   SEQUENCE TIMELINE EDITOR
+   ═══════════════════════════════════════════════════════════════ */
+
+const TIMELINE = {
+  projectId:    null,
+  clips:        [],   // ordered array of shot objects
+  dragSrcIdx:   null,
+  seqPlaying:   false,
+  seqQueue:     [],
+  seqIndex:     0,
+};
+
+/* ── Open timeline panel ─────────────────────────────────────── */
+function openTimeline(projectId) {
+  const project = VG.projects.find(p => p.id === projectId);
+  const shots   = (VG.shots[projectId] || [])
+    .filter(s => s.status === 'completed' && (s.video_url || s.hf_video_url))
+    .sort((a, b) => {
+      if (a.sort_order != null && b.sort_order != null) return a.sort_order - b.sort_order;
+      return new Date(a.created_at) - new Date(b.created_at);
+    });
+
+  TIMELINE.projectId = projectId;
+  TIMELINE.clips     = [...shots];
+
+  const nameEl = $('timeline-project-name');
+  if (nameEl) nameEl.textContent = project ? project.name : '';
+
+  renderTimeline();
+  $('timeline-overlay').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeTimeline() {
+  stopSeqPlayback();
+  $('timeline-overlay').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+/* ── Render film-strip track ─────────────────────────────────── */
+function renderTimeline() {
+  const track     = $('timeline-track');
+  const durEl     = $('timeline-total-duration');
+  const statsEl   = $('timeline-stats');
+  if (!track) return;
+
+  const clips = TIMELINE.clips;
+
+  if (clips.length === 0) {
+    track.innerHTML = `
+      <div class="vg-tl-empty">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.3"><rect x="2" y="7" width="4" height="10" rx="1"/><rect x="8" y="4" width="4" height="13" rx="1"/><rect x="14" y="9" width="4" height="8" rx="1"/></svg>
+        No completed shots yet
+      </div>`;
+    if (durEl) durEl.textContent = '0:00 total';
+    if (statsEl) statsEl.textContent = '0 shots';
+    return;
+  }
+
+  const totalSec = clips.reduce((acc, s) => acc + (s.duration || 4), 0);
+  if (durEl) durEl.textContent = `${formatTimecodeClient(totalSec)} total`;
+  if (statsEl) statsEl.textContent = `${clips.length} shot${clips.length !== 1 ? 's' : ''}`;
+
+  track.innerHTML = clips.map((shot, i) => {
+    const videoUrl = shot.video_url || shot.hf_video_url || '';
+    const dur      = shot.duration || 4;
+    const model    = (shot.model || '').split('/').pop() || '';
+    const prompt   = (shot.prompt || '').slice(0, 42) + ((shot.prompt || '').length > 42 ? '…' : '');
+    const statusDot = shot.status === 'completed' ? 'done' : shot.status === 'failed' ? 'failed' : 'pending';
+
+    return `
+      <div class="vg-tl-clip" draggable="true" data-tl-idx="${i}" data-shot-id="${shot.id}">
+        <div class="vg-tl-clip-thumb">
+          ${videoUrl
+            ? `<video src="${escAttr(videoUrl)}" muted preload="metadata" style="width:100%;height:100%;object-fit:cover"
+                 onmouseenter="this.play()" onmouseleave="this.pause();this.currentTime=0"></video>`
+            : `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:rgba(232,244,253,0.2)">
+                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
+               </div>`}
+          <div class="vg-tl-clip-index">${i + 1}</div>
+          <div class="vg-tl-clip-status-dot ${statusDot}"></div>
+        </div>
+        <div class="vg-tl-clip-footer">
+          <div class="vg-tl-clip-label" title="${escAttr(shot.prompt || '')}">${escHtml(prompt)}</div>
+          <div class="vg-tl-clip-dur">${escHtml(model)} · ${dur}s</div>
+        </div>
+        <div class="vg-tl-drag-handle" title="Drag to reorder">
+          <svg width="10" height="10" viewBox="0 0 20 20" fill="currentColor" opacity="0.5">
+            <circle cx="7" cy="4" r="1.5"/><circle cx="13" cy="4" r="1.5"/>
+            <circle cx="7" cy="10" r="1.5"/><circle cx="13" cy="10" r="1.5"/>
+            <circle cx="7" cy="16" r="1.5"/><circle cx="13" cy="16" r="1.5"/>
+          </svg>
+        </div>
+      </div>`;
+  }).join('');
+
+  // Render ruler
+  renderTimelineRuler(totalSec);
+
+  // Wire drag-and-drop
+  initTimelineDragDrop();
+}
+
+/* ── Ruler ticks ─────────────────────────────────────────────── */
+function renderTimelineRuler(totalSec) {
+  const ruler = $('timeline-ruler');
+  if (!ruler) return;
+  ruler.innerHTML = '';
+  if (totalSec <= 0) return;
+
+  const clips   = TIMELINE.clips;
+  const clipW   = 146; // 140px + 6px gap
+  const padL    = 24;  // matches 1.5rem padding
+  let cumSec    = 0;
+  clips.forEach((shot, i) => {
+    const x = padL + i * clipW;
+    const tick = document.createElement('div');
+    tick.className = 'vg-timeline-ruler-tick';
+    tick.style.cssText = `left:${x}px;height:8px`;
+    ruler.appendChild(tick);
+
+    const label = document.createElement('div');
+    label.className = 'vg-timeline-ruler-label';
+    label.style.left = `${x}px`;
+    label.textContent = formatTimecodeClient(cumSec);
+    ruler.appendChild(label);
+
+    cumSec += shot.duration || 4;
+  });
+}
+
+/* ── Timeline drag-and-drop (horizontal reorder) ─────────────── */
+function initTimelineDragDrop() {
+  const track = $('timeline-track');
+  if (!track) return;
+
+  track.querySelectorAll('.vg-tl-clip').forEach(clip => {
+    clip.addEventListener('dragstart', e => {
+      TIMELINE.dragSrcIdx = +clip.dataset.tlIdx;
+      clip.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    clip.addEventListener('dragend', () => {
+      clip.classList.remove('dragging');
+      track.querySelectorAll('.vg-tl-clip').forEach(c => c.classList.remove('drag-over'));
+    });
+    clip.addEventListener('dragover', e => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      track.querySelectorAll('.vg-tl-clip').forEach(c => c.classList.remove('drag-over'));
+      clip.classList.add('drag-over');
+    });
+    clip.addEventListener('dragleave', () => clip.classList.remove('drag-over'));
+    clip.addEventListener('drop', e => {
+      e.preventDefault();
+      const targetIdx = +clip.dataset.tlIdx;
+      if (TIMELINE.dragSrcIdx === null || TIMELINE.dragSrcIdx === targetIdx) return;
+      // Reorder
+      const moved = TIMELINE.clips.splice(TIMELINE.dragSrcIdx, 1)[0];
+      TIMELINE.clips.splice(targetIdx, 0, moved);
+      TIMELINE.dragSrcIdx = null;
+      renderTimeline();
+      // Persist new order to storyboard via sort_order save
+      saveTimelineOrder();
+    });
+  });
+}
+
+/* ── Save reordered sort_order to DB (mirrors storyboard reorder) */
+async function saveTimelineOrder() {
+  const projectId = TIMELINE.projectId;
+  if (!projectId) return;
+  try {
+    const order = TIMELINE.clips.map((s, i) => ({ id: s.id, sort_order: i }));
+    await api('PATCH', `/api/projects/${projectId}/shots/reorder`, { order });
+    // Sync VG.shots order
+    if (VG.shots[projectId]) {
+      order.forEach(({ id, sort_order }) => {
+        const s = VG.shots[projectId].find(x => x.id === id);
+        if (s) s.sort_order = sort_order;
+      });
+      renderShotGrid(projectId);
+    }
+    showToast('Timeline order saved');
+  } catch (err) {
+    console.warn('Timeline reorder save failed:', err);
+  }
+}
+
+/* ── Sort by creation date ───────────────────────────────────── */
+function sortTimelineByDate() {
+  TIMELINE.clips.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+  renderTimeline();
+  showToast('Sorted by creation date');
+}
+
+/* ── Export manifest JSON ────────────────────────────────────── */
+async function exportTimelineManifest(projectId) {
+  try {
+    const res  = await api('POST', `/api/projects/${projectId}/timeline/export`, {
+      clip_ids: TIMELINE.clips.map(s => s.id),
+    });
+    const data = await res.json();
+    if (!res.ok) { showToast(data.error || 'Export failed', true); return; }
+
+    // Also build local manifest for immediate download
+    const manifest = {
+      exported_at:   new Date().toISOString(),
+      project_id:    projectId,
+      project_name:  (VG.projects.find(p => p.id === projectId) || {}).name || '',
+      total_duration: TIMELINE.clips.reduce((a, s) => a + (s.duration || 4), 0),
+      clip_count:    TIMELINE.clips.length,
+      clips: TIMELINE.clips.map((shot, i) => ({
+        index:        i + 1,
+        shot_id:      shot.id,
+        timecode_in:  formatTimecodeClient(TIMELINE.clips.slice(0, i).reduce((a, s) => a + (s.duration || 4), 0)),
+        timecode_out: formatTimecodeClient(TIMELINE.clips.slice(0, i + 1).reduce((a, s) => a + (s.duration || 4), 0)),
+        duration_sec: shot.duration || 4,
+        model:        shot.model,
+        aspect_ratio: shot.aspect_ratio,
+        prompt:       shot.prompt,
+        video_url:    shot.video_url || shot.hf_video_url || null,
+        seed:         shot.seed,
+        style_preset: shot.style_preset,
+      })),
+      server_manifest: data,
+    };
+
+    const blob = new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = `spectra-timeline-${projectId}-${Date.now()}.json`; a.click();
+    URL.revokeObjectURL(url);
+    showToast(`Manifest exported — ${manifest.clip_count} clips, ${manifest.total_duration}s total`);
+  } catch (err) {
+    showToast('Export error: ' + err.message, true);
+  }
+}
+
+/* ── Sequence preview (play clips in order) ──────────────────── */
+function startSeqPlayback() {
+  const clips = TIMELINE.clips.filter(s => s.video_url || s.hf_video_url);
+  if (clips.length === 0) { showToast('No playable clips in timeline'); return; }
+
+  TIMELINE.seqPlaying = true;
+  TIMELINE.seqQueue   = clips;
+  TIMELINE.seqIndex   = 0;
+
+  const preview = $('timeline-preview');
+  if (preview) preview.style.display = 'flex';
+
+  playNextSeqClip();
+}
+
+function playNextSeqClip() {
+  if (!TIMELINE.seqPlaying) return;
+  const clips = TIMELINE.seqQueue;
+  if (TIMELINE.seqIndex >= clips.length) {
+    stopSeqPlayback();
+    showToast('Sequence complete');
+    return;
+  }
+  const shot   = clips[TIMELINE.seqIndex];
+  const video  = $('tl-preview-video');
+  const label  = $('tl-preview-label');
+  if (!video) return;
+
+  if (label) label.textContent = `Shot ${TIMELINE.seqIndex + 1} / ${clips.length} — ${escHtml((shot.model || '').split('/').pop())}`;
+
+  video.src = shot.video_url || shot.hf_video_url;
+  video.onended = () => {
+    TIMELINE.seqIndex++;
+    playNextSeqClip();
+  };
+  video.play().catch(() => {});
+}
+
+function stopSeqPlayback() {
+  TIMELINE.seqPlaying = false;
+  const video = $('tl-preview-video');
+  if (video) { video.pause(); video.src = ''; }
+  const preview = $('timeline-preview');
+  if (preview) preview.style.display = 'none';
+}
+
+/* ── Client-side timecode formatter ─────────────────────────── */
+function formatTimecodeClient(totalSeconds) {
+  const s = Math.floor(totalSeconds % 60);
+  const m = Math.floor((totalSeconds / 60) % 60);
+  const h = Math.floor(totalSeconds / 3600);
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   EVENT WIRING  —  Compare + Timeline + board header buttons
+   ═══════════════════════════════════════════════════════════════ */
+
+document.addEventListener('DOMContentLoaded', () => {
+
+  /* ── Compare button in board header ───────────────────────── */
+  const btnOpenCompare = $('btn-open-compare');
+  if (btnOpenCompare) {
+    btnOpenCompare.addEventListener('click', () => {
+      openCompareModal(VG.activeProjectId);
+    });
+  }
+
+  /* ── Compare modal close ───────────────────────────────────── */
+  const compareClose = $('compare-close');
+  if (compareClose) compareClose.addEventListener('click', closeCompareModal);
+
+  const compareOverlay = $('compare-overlay');
+  if (compareOverlay) {
+    compareOverlay.addEventListener('click', e => {
+      if (e.target === compareOverlay) closeCompareModal();
+    });
+  }
+
+  /* ── Compare sync toggle ───────────────────────────────────── */
+  const compareSyncBtn = $('compare-sync-btn');
+  if (compareSyncBtn) {
+    compareSyncBtn.addEventListener('click', () => {
+      COMPARE.syncEnabled = !COMPARE.syncEnabled;
+      compareSyncBtn.classList.toggle('active', COMPARE.syncEnabled);
+    });
+    compareSyncBtn.classList.add('active');
+  }
+
+  /* ── Compare play all ──────────────────────────────────────── */
+  const comparePlayAll = $('compare-play-all');
+  if (comparePlayAll) comparePlayAll.addEventListener('click', comparePlayAll_handler);
+  function comparePlayAll_handler() { comparePlayAll(); }
+  // Override — correct reference
+  if (comparePlayAll) {
+    comparePlayAll.replaceWith(comparePlayAll.cloneNode(true));
+    $('compare-play-all').addEventListener('click', comparePlayAll);
+  }
+
+  /* ── Compare export JSON ───────────────────────────────────── */
+  const compareExportBtn = $('compare-export-json');
+  if (compareExportBtn) {
+    compareExportBtn.addEventListener('click', () => {
+      exportCompareDiff(VG.activeProjectId);
+    });
+  }
+
+  /* ── Timeline open button ──────────────────────────────────── */
+  const btnOpenTimeline = $('btn-open-timeline');
+  if (btnOpenTimeline) {
+    btnOpenTimeline.addEventListener('click', () => {
+      openTimeline(VG.activeProjectId);
+    });
+  }
+
+  /* ── Timeline close button ─────────────────────────────────── */
+  const timelineClose = $('timeline-close');
+  if (timelineClose) timelineClose.addEventListener('click', closeTimeline);
+
+  const timelineOverlay = $('timeline-overlay');
+  if (timelineOverlay) {
+    timelineOverlay.addEventListener('click', e => {
+      if (e.target === timelineOverlay) closeTimeline();
+    });
+  }
+
+  /* ── Timeline shuffle / sort ───────────────────────────────── */
+  const timelineShuffle = $('timeline-shuffle');
+  if (timelineShuffle) timelineShuffle.addEventListener('click', sortTimelineByDate);
+
+  /* ── Timeline export manifest ──────────────────────────────── */
+  const timelineExport = $('timeline-export');
+  if (timelineExport) {
+    timelineExport.addEventListener('click', () => {
+      exportTimelineManifest(TIMELINE.projectId);
+    });
+  }
+
+  /* ── Timeline sequence preview ─────────────────────────────── */
+  const tlPlaySeq = $('tl-play-seq');
+  if (tlPlaySeq) tlPlaySeq.addEventListener('click', () => {
+    if (TIMELINE.seqPlaying) stopSeqPlayback();
+    else startSeqPlayback();
+  });
+
+  const tlStopSeq = $('tl-stop-seq');
+  if (tlStopSeq) tlStopSeq.addEventListener('click', stopSeqPlayback);
+
+  /* ── Keyboard shortcuts ────────────────────────────────────── */
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      if ($('compare-overlay')?.classList.contains('open')) { closeCompareModal(); return; }
+      if ($('timeline-overlay')?.classList.contains('open')) { closeTimeline(); return; }
+    }
+  });
+});
+
+/* ── Patch renderShotGrid to show Compare + Timeline buttons
+      and wire compare-checkbox on each shot card ──────────────── */
+const _origRenderShotGrid = renderShotGrid;
+function renderShotGrid(projectId) {
+  _origRenderShotGrid(projectId);
+
+  // Show board header action buttons when a project is loaded
+  const compareBtn  = $('btn-open-compare');
+  const timelineBtn = $('btn-open-timeline');
+  if (compareBtn)  compareBtn.style.display = '';
+  if (timelineBtn) timelineBtn.style.display = '';
+
+  // Reset compare selection when switching projects
+  if (VG.activeProjectId !== projectId) {
+    COMPARE.selected = [];
+  }
+  refreshCompareUI(projectId);
+
+  // Wire compare checkbox on each shot card
+  const grid = $('vg-shot-grid');
+  if (!grid) return;
+
+  grid.querySelectorAll('.vg-shot-card').forEach(card => {
+    const shotId = card.dataset.shotId;
+    if (!shotId) return;
+
+    // Inject compare check button if not already present
+    if (!card.querySelector('.vg-shot-compare-check')) {
+      const shot = (VG.shots[projectId] || []).find(s => s.id === shotId);
+      // Only add compare checkbox for completed shots with video
+      if (shot && shot.status === 'completed' && (shot.video_url || shot.hf_video_url)) {
+        const checkBtn = document.createElement('button');
+        checkBtn.className = 'vg-shot-compare-check';
+        checkBtn.title = 'Select for comparison';
+        checkBtn.innerHTML = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#7BB8D4" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>`;
+        checkBtn.addEventListener('click', e => {
+          e.stopPropagation();
+          toggleCompareSelect(shotId, projectId);
+        });
+        card.style.position = 'relative';
+        card.appendChild(checkBtn);
+      }
+    }
+
+    // Sync compare-selected class
+    if (COMPARE.selected.includes(shotId)) {
+      card.classList.add('compare-selected');
+    }
+  });
 }
