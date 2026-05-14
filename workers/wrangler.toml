@@ -1,0 +1,12 @@
+name            = "spectra-scheduler"
+main            = "scheduler.ts"
+compatibility_date = "2026-04-13"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding      = "DB"
+database_name = "spectra-production"
+database_id  = "f6f517a3-46eb-4837-bc84-9dbd4b61d66c"
+
+[triggers]
+crons = ["*/5 * * * *"]

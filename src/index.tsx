@@ -2530,6 +2530,124 @@ app.post('/api/distribution/queue/:id/retry', requireAuth, async (c) => {
   } catch (err: any) { return c.json({ error: err.message }, 500) }
 })
 
+// ── PATCH /api/distribution/queue/:id ───────────────────────────
+// Edit a scheduled post: caption, title, scheduled_at, video_url
+app.patch('/api/distribution/queue/:id', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as string
+    const postId = c.req.param('id')
+
+    const post = await c.env.DB.prepare(
+      `SELECT status FROM distribution_posts WHERE id = ? AND user_id = ?`
+    ).bind(postId, userId).first<{ status: string }>()
+
+    if (!post) return c.json({ error: 'Post not found' }, 404)
+    if (post.status !== 'scheduled' && post.status !== 'failed') {
+      return c.json({ error: 'Only scheduled or failed posts can be edited' }, 400)
+    }
+
+    const { caption, title, scheduled_at, video_url } = await c.req.json()
+
+    const fields: string[] = []
+    const values: any[]   = []
+
+    if (caption      !== undefined) { fields.push('caption=?');      values.push(caption || null) }
+    if (title        !== undefined) { fields.push('title=?');        values.push(title   || null) }
+    if (scheduled_at !== undefined) { fields.push('scheduled_at=?'); values.push(scheduled_at || null) }
+    if (video_url    !== undefined) { fields.push('video_url=?');    values.push(video_url || null) }
+
+    if (fields.length === 0) return c.json({ error: 'Nothing to update' }, 400)
+
+    fields.push("updated_at=datetime('now')")
+    values.push(postId, userId)
+
+    await c.env.DB.prepare(
+      `UPDATE distribution_posts SET ${fields.join(', ')} WHERE id=? AND user_id=?`
+    ).bind(...values).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── GET /api/distribution/analytics ─────────────────────────────
+// Aggregated analytics: per-platform stats, best-time analysis, post list with metrics
+app.get('/api/distribution/analytics', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as string
+
+    // Fetch all posted posts with metrics
+    const postsRes = await c.env.DB.prepare(`
+      SELECT dp.id, dp.platform, dp.caption, dp.title, dp.posted_at, dp.scheduled_at,
+             dp.cover_url, dp.video_url,
+             pm24.views as views_24h, pm24.likes as likes_24h,
+             pm24.comments as comments_24h, pm24.shares as shares_24h,
+             pm24.saves as saves_24h, pm24.reach as reach_24h,
+             pm72.views as views_72h, pm72.likes as likes_72h,
+             pm72.comments as comments_72h, pm72.shares as shares_72h,
+             pm72.saves as saves_72h, pm72.reach as reach_72h
+      FROM distribution_posts dp
+      LEFT JOIN post_metrics pm24 ON dp.id = pm24.post_id AND pm24.pull_window = '24h'
+      LEFT JOIN post_metrics pm72 ON dp.id = pm72.post_id AND pm72.pull_window = '72h'
+      WHERE dp.user_id = ? AND dp.status = 'posted'
+      ORDER BY dp.posted_at DESC
+      LIMIT 50
+    `).bind(userId).all<any>()
+
+    const posts = postsRes.results || []
+
+    // Per-platform aggregate
+    const platformStats: Record<string, any> = {}
+    posts.forEach((p: any) => {
+      if (!platformStats[p.platform]) {
+        platformStats[p.platform] = { posts: 0, views: 0, likes: 0, comments: 0, shares: 0, saves: 0 }
+      }
+      const s = platformStats[p.platform]
+      s.posts++
+      s.views    += p.views_24h    || 0
+      s.likes    += p.likes_24h    || 0
+      s.comments += p.comments_24h || 0
+      s.shares   += p.shares_24h   || 0
+      s.saves    += p.saves_24h    || 0
+    })
+
+    // Best-time analysis: group by day-of-week + hour-of-day for posted items with views
+    const bestTimes: Record<string, { views: number; count: number }> = {}
+    posts.forEach((p: any) => {
+      if (!p.posted_at || p.views_24h == null) return
+      const d    = new Date(p.posted_at)
+      const dow  = d.getUTCDay()   // 0=Sun … 6=Sat
+      const hour = d.getUTCHours() // rounded to nearest 2h bucket
+      const bucket = `${dow}:${Math.floor(hour / 2) * 2}`
+      if (!bestTimes[bucket]) bestTimes[bucket] = { views: 0, count: 0 }
+      bestTimes[bucket].views += p.views_24h
+      bestTimes[bucket].count++
+    })
+
+    const DOW_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+    const bestTimesList = Object.entries(bestTimes)
+      .map(([key, val]) => {
+        const [dow, hour] = key.split(':').map(Number)
+        const avgViews = val.count > 0 ? Math.round(val.views / val.count) : 0
+        return {
+          key,
+          dow,
+          hour,
+          label: `${DOW_LABELS[dow]} ${String(hour).padStart(2,'0')}:00 UTC`,
+          avg_views: avgViews,
+          count: val.count,
+        }
+      })
+      .sort((a, b) => b.avg_views - a.avg_views)
+      .slice(0, 8)
+
+    return c.json({
+      posts,
+      platform_stats: platformStats,
+      best_times: bestTimesList,
+    })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
 // ── GET /api/distribution/metrics/:postId ────────────────────────
 app.get('/api/distribution/metrics/:postId', requireAuth, async (c) => {
   try {
@@ -4820,7 +4938,12 @@ function distributionPage(): string {
   <!-- ── QUEUE TAB ── -->
   <div class="dn-panel active" id="dn-panel-queue">
     <div class="dn-panel-header">
-      <div class="dn-panel-title">Distribution Queue</div>
+      <div class="dn-panel-title">
+        Distribution Queue
+        <span class="dn-poll-indicator" id="dn-poll-indicator" title="Auto-refreshing every 30s">
+          <span class="dn-poll-dot"></span>LIVE
+        </span>
+      </div>
       <div class="dn-panel-actions">
         <button class="dn-btn-secondary" id="btn-open-batch" style="margin-right:0.5rem">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
@@ -4854,6 +4977,56 @@ function distributionPage(): string {
     </div>
 
     <div class="dn-queue-list" id="dn-queue-list"></div>
+  </div>
+
+  <!-- ── EDIT DRAWER ── -->
+  <div class="dn-edit-drawer" id="dn-edit-drawer" aria-hidden="true">
+    <div class="dn-edit-drawer-backdrop" id="dn-edit-drawer-backdrop"></div>
+    <div class="dn-edit-drawer-panel">
+      <div class="dn-edit-drawer-header">
+        <div class="dn-edit-drawer-title">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+          Edit Scheduled Post
+        </div>
+        <button class="dn-edit-drawer-close" id="btn-close-edit-drawer" aria-label="Close">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="dn-edit-drawer-body">
+        <input type="hidden" id="edit-post-id"/>
+        <input type="hidden" id="edit-post-platform"/>
+
+        <div class="dn-edit-field">
+          <label class="dn-edit-label">Caption / Description</label>
+          <textarea class="dn-caption-textarea" id="edit-caption" rows="4" placeholder="Caption or description…" spellcheck="true"></textarea>
+        </div>
+
+        <div class="dn-edit-field" id="edit-title-field">
+          <label class="dn-edit-label">YouTube Title</label>
+          <input type="text" class="dn-input" id="edit-title" placeholder="YouTube title (max 100 chars)…" maxlength="100"/>
+          <div class="dn-edit-char-hint" id="edit-title-count">0/100</div>
+        </div>
+
+        <div class="dn-edit-field">
+          <label class="dn-edit-label">Scheduled Time</label>
+          <input type="datetime-local" class="dn-input" id="edit-scheduled-at"/>
+        </div>
+
+        <div class="dn-edit-field">
+          <label class="dn-edit-label">Video URL <span class="dn-edit-label-hint">(swap video)</span></label>
+          <input type="url" class="dn-input" id="edit-video-url" placeholder="https://…"/>
+        </div>
+
+        <div class="dn-edit-actions">
+          <button class="dn-btn-secondary" id="btn-cancel-edit">Cancel</button>
+          <button class="dn-btn-primary" id="btn-save-edit">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+            Save Changes
+          </button>
+        </div>
+        <p class="dn-edit-note" id="dn-edit-note"></p>
+      </div>
+    </div>
   </div>
 
   <!-- ── ACCOUNTS TAB ── -->
@@ -5241,13 +5414,13 @@ function distributionPage(): string {
   <div class="dn-panel" id="dn-panel-metrics">
     <div class="dn-panel-header">
       <div class="dn-panel-title">
-        Live Metrics
+        Analytics &amp; Metrics
         <span class="dn-live-pulse"><span class="dn-live-dot"></span>LIVE</span>
       </div>
-      <div class="dn-panel-sub">Auto-refreshes every 60 seconds · Up to 20 recent posts</div>
+      <div class="dn-panel-sub">Select a post to drill into per-platform performance · Best posting times from your data</div>
     </div>
 
-    <!-- Stats row -->
+    <!-- Stat summary row -->
     <div class="dn-metrics-stats-row" id="dn-metrics-stats-row">
       <div class="dn-metrics-stat-card">
         <div class="dn-metrics-stat-val" id="metric-total-posts">—</div>
@@ -5267,12 +5440,55 @@ function distributionPage(): string {
       </div>
     </div>
 
-    <!-- Chart -->
-    <div class="dn-live-chart-wrap">
-      <canvas id="dn-live-chart"></canvas>
-      <div class="dn-live-chart-empty" id="dn-live-chart-empty">
-        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity=".3"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        <p>No metrics yet — post something and pull metrics to populate the chart</p>
+    <!-- Post picker -->
+    <div class="dn-metrics-section">
+      <div class="dn-metrics-section-title">Post Performance</div>
+      <div class="dn-metrics-picker" id="dn-metrics-picker">
+        <div class="dn-metrics-picker-empty" id="dn-metrics-picker-empty">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".3"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          <p>No posted content yet. Schedule and publish something to see metrics here.</p>
+        </div>
+        <div class="dn-metrics-picker-list" id="dn-metrics-picker-list"></div>
+      </div>
+    </div>
+
+    <!-- Multi-metric chart + metric toggle -->
+    <div class="dn-metrics-section" id="dn-metrics-chart-section" style="display:none">
+      <div class="dn-metrics-section-header">
+        <div class="dn-metrics-section-title" id="dn-metrics-chart-title">Post Metrics</div>
+        <div class="dn-metrics-metric-toggles">
+          <button class="dn-metric-toggle active" data-metric="views">Views</button>
+          <button class="dn-metric-toggle" data-metric="likes">Likes</button>
+          <button class="dn-metric-toggle" data-metric="comments">Comments</button>
+          <button class="dn-metric-toggle" data-metric="shares">Shares</button>
+          <button class="dn-metric-toggle" data-metric="saves">Saves</button>
+        </div>
+      </div>
+      <div class="dn-live-chart-wrap">
+        <canvas id="dn-live-chart"></canvas>
+        <div class="dn-live-chart-empty" id="dn-live-chart-empty" style="display:none">
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity=".3"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          <p>Pull metrics for this post first</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Per-platform breakdown table -->
+    <div class="dn-metrics-section" id="dn-metrics-breakdown-section" style="display:none">
+      <div class="dn-metrics-section-title">Platform Breakdown</div>
+      <div class="dn-metrics-breakdown-table" id="dn-metrics-breakdown-table"></div>
+    </div>
+
+    <!-- Best posting times -->
+    <div class="dn-metrics-section" id="dn-best-times-section">
+      <div class="dn-metrics-section-title">
+        Best Posting Times
+        <span class="dn-best-times-hint">Based on your actual post performance data</span>
+      </div>
+      <div class="dn-best-times-grid" id="dn-best-times-grid">
+        <div class="dn-best-times-empty" id="dn-best-times-empty">
+          <p>Post more content and pull metrics to unlock best-time recommendations.</p>
+        </div>
       </div>
     </div>
 

@@ -85,9 +85,10 @@ const DN = {
   liveChart:    null,
   livePoller:   null,
   countdownTimer: null,
+  queuePoller:  null,   // Task 6: 30s auto-poll timer
   compose: {
     videoUrl:    '',
-    videoKey:    '',      // R2 key if uploaded from device
+    videoKey:    '',
     projectId:   null,
     projectName: '',
     platforms:   [],
@@ -103,7 +104,7 @@ const DN = {
     scheduledAt: null,
   },
   batch: {
-    items:     [],        // [{ videoUrl, videoKey, name, platforms, concept }]
+    items:     [],
     dripHours: 24,
     template:  'daily',
   },
@@ -111,6 +112,11 @@ const DN = {
     active:   false,
     progress: 0,
     name:     '',
+  },
+  metrics: {
+    posts:        [],   // Task 5: analytics posts from /api/distribution/analytics
+    selectedPost: null, // Task 5: currently selected post id
+    activeMetric: 'views', // Task 5: chart metric toggle
   },
 };
 
@@ -170,6 +176,7 @@ async function boot() {
   bindUI();
   await Promise.all([loadAccounts(), loadQueue()]);
   startCountdownTicker();
+  startQueuePoll(); // Task 6: auto-poll since default tab is queue
 
   const params = new URLSearchParams(location.search);
   const preProjectId   = params.get('project_id');
@@ -303,6 +310,12 @@ function bindUI() {
 
   $('btn-fire-post')?.addEventListener('click', firePost);
 
+  // YouTube title — sync to state + show/hide based on platform selection
+  $('dn-yt-title')?.addEventListener('input', e => {
+    DN.compose.ytTitle = e.target.value;
+  });
+  updateYtTitleVisibility();
+
   $('dn-smart-chips')?.addEventListener('click', e => {
     const chip = e.target.closest('.dn-smart-chip');
     if (!chip) return;
@@ -317,9 +330,11 @@ function bindUI() {
     const retry  = e.target.closest('[data-retry-id]');
     const cancel = e.target.closest('[data-cancel-id]');
     const pull   = e.target.closest('[data-pull-id]');
+    const edit   = e.target.closest('[data-edit-id]');
     if (retry)  await retryPost(retry.dataset.retryId);
     if (cancel) await cancelPost(cancel.dataset.cancelId);
     if (pull)   await pullMetrics(pull.dataset.pullId);
+    if (edit)   openEditDrawer(edit.dataset.editId);
   });
 
   // Batch mode
@@ -341,19 +356,50 @@ function bindUI() {
 
   renderSmartTimes();
   selectDripTemplate('daily');
+
+  // Edit drawer wiring
+  $('btn-close-edit-drawer')?.addEventListener('click', closeEditDrawer);
+  $('btn-cancel-edit')?.addEventListener('click', closeEditDrawer);
+  $('dn-edit-drawer-backdrop')?.addEventListener('click', closeEditDrawer);
+  $('btn-save-edit')?.addEventListener('click', saveEdit);
+  $('edit-title')?.addEventListener('input', e => {
+    const count = $('edit-title-count');
+    if (count) count.textContent = `${e.target.value.length}/100`;
+  });
+
+  // Metrics tab metric toggles
+  document.addEventListener('click', e => {
+    const toggle = e.target.closest('.dn-metric-toggle');
+    if (toggle) {
+      $$('.dn-metric-toggle').forEach(b => b.classList.remove('active'));
+      toggle.classList.add('active');
+      DN.metrics.activeMetric = toggle.dataset.metric;
+      renderMetricsChart();
+    }
+    const pickerCard = e.target.closest('.dn-metrics-picker-card');
+    if (pickerCard) selectMetricsPost(pickerCard.dataset.postId);
+  });
 }
 
 /* ════════════════════════════════════════════════════════════════
    TABS
    ════════════════════════════════════════════════════════════════ */
 function switchTab(tab) {
+  // Clear queue auto-poll when leaving queue tab
+  if (DN.activeTab === 'queue' && tab !== 'queue') {
+    stopQueuePoll();
+  }
+
   DN.activeTab = tab;
   $$('.dn-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   $$('.dn-panel').forEach(p => p.classList.toggle('active', p.id === `dn-panel-${tab}`));
-  // Scroll panel into view smoothly
   window.scrollTo({ top: 0, behavior: 'smooth' });
+
+  if (tab === 'queue') {
+    startQueuePoll();
+  }
   if (tab === 'metrics') {
-    initLiveChart();
+    loadAnalytics();
     updateMetricsStats();
   }
 }
@@ -627,6 +673,9 @@ function renderQueueCard(post, inBatch = false) {
   const actions = [];
   if (post.status === 'scheduled' || post.status === 'posting')
     actions.push(`<button class="dn-btn-sm danger" data-cancel-id="${post.id}">Cancel</button>`);
+  if (post.status === 'scheduled' || post.status === 'failed')
+    actions.push(`<button class="dn-btn-sm edit" data-edit-id="${post.id}" title="Edit post">
+      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>Edit</button>`);
   if (post.status === 'failed' && (post.retry_count || 0) < 3)
     actions.push(`<button class="dn-btn-sm retry" data-retry-id="${post.id}">Retry</button>`);
   if (post.status === 'posted' && post.views_24h == null)
@@ -1111,6 +1160,17 @@ function togglePlatform(platform) {
   }
   updateReview();
   renderSmartTimes();
+  updateYtTitleVisibility();
+}
+
+/* ── Task 3: YouTube title show/hide ─────────────────────────── */
+function updateYtTitleVisibility() {
+  const block = $('caption-block-youtube');
+  if (!block) return;
+  // The title input is inside the YT caption block — it's shown/hidden
+  // along with the whole block. Sync state from DOM in case user typed directly.
+  const titleInput = $('dn-yt-title');
+  if (titleInput) DN.compose.ytTitle = titleInput.value;
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -1539,3 +1599,400 @@ async function fireBatch() {
     if (btn) { btn.disabled = false; btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2L15 22l-4-9-9-4 20-7z"/></svg>Schedule Batch`; }
   }
 }
+
+/* ════════════════════════════════════════════════════════════════
+   TASK 6 — AUTO-POLL QUEUE (30s when queue tab active)
+   ════════════════════════════════════════════════════════════════ */
+function startQueuePoll() {
+  const indicator = $('dn-poll-indicator');
+  if (indicator) indicator.classList.add('active');
+  if (DN.queuePoller) return; // already running
+  DN.queuePoller = setInterval(async () => {
+    if (DN.activeTab !== 'queue') { stopQueuePoll(); return; }
+    try { await loadQueue(); } catch {}
+  }, 30000);
+}
+
+function stopQueuePoll() {
+  const indicator = $('dn-poll-indicator');
+  if (indicator) indicator.classList.remove('active');
+  if (DN.queuePoller) { clearInterval(DN.queuePoller); DN.queuePoller = null; }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   TASK 4 — EDIT DRAWER
+   ════════════════════════════════════════════════════════════════ */
+function openEditDrawer(postId) {
+  const post = DN.queue.find(p => p.id === postId);
+  if (!post) return;
+
+  // Populate fields
+  $('edit-post-id').value       = post.id;
+  $('edit-post-platform').value = post.platform;
+
+  const captionEl = $('edit-caption');
+  if (captionEl) captionEl.value = post.caption || '';
+
+  const titleEl = $('edit-title');
+  if (titleEl) {
+    titleEl.value = post.title || '';
+    const countEl = $('edit-title-count');
+    if (countEl) countEl.textContent = `${titleEl.value.length}/100`;
+  }
+
+  // Show/hide title field based on platform
+  const titleField = $('edit-title-field');
+  if (titleField) titleField.style.display = post.platform === 'youtube' ? 'flex' : 'none';
+
+  const schedEl = $('edit-scheduled-at');
+  if (schedEl && post.scheduled_at) {
+    // Convert ISO to datetime-local format
+    const d   = new Date(post.scheduled_at);
+    const pad = n => String(n).padStart(2, '0');
+    schedEl.value = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  } else if (schedEl) {
+    schedEl.value = '';
+  }
+
+  const videoEl = $('edit-video-url');
+  if (videoEl) videoEl.value = post.video_url || '';
+
+  // Clear note
+  const noteEl = $('dn-edit-note');
+  if (noteEl) { noteEl.textContent = ''; noteEl.className = 'dn-edit-note'; }
+
+  // Open drawer
+  const drawer = $('dn-edit-drawer');
+  if (drawer) {
+    drawer.classList.add('open');
+    drawer.setAttribute('aria-hidden', 'false');
+    document.body.style.overflow = 'hidden';
+  }
+}
+
+function closeEditDrawer() {
+  const drawer = $('dn-edit-drawer');
+  if (drawer) {
+    drawer.classList.remove('open');
+    drawer.setAttribute('aria-hidden', 'true');
+    document.body.style.overflow = '';
+  }
+}
+
+async function saveEdit() {
+  const postId    = $('edit-post-id')?.value;
+  const noteEl    = $('dn-edit-note');
+  const btn       = $('btn-save-edit');
+  if (!postId) return;
+
+  const caption      = $('edit-caption')?.value || undefined;
+  const title        = $('edit-title')?.value   || undefined;
+  const videoUrl     = $('edit-video-url')?.value?.trim() || undefined;
+  const schedRaw     = $('edit-scheduled-at')?.value;
+  const scheduled_at = schedRaw ? new Date(schedRaw).toISOString() : undefined;
+
+  if (btn) { btn.disabled = true; btn.innerHTML = `<span class="dn-spin"></span> Saving…`; }
+  if (noteEl) { noteEl.textContent = ''; noteEl.className = 'dn-edit-note'; }
+
+  try {
+    const payload = {};
+    if (caption      !== undefined) payload.caption      = caption;
+    if (title        !== undefined) payload.title        = title;
+    if (scheduled_at !== undefined) payload.scheduled_at = scheduled_at;
+    if (videoUrl     !== undefined) payload.video_url    = videoUrl;
+
+    const res  = await api('PATCH', `/api/distribution/queue/${postId}`, payload);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Save failed');
+
+    showToast('Post updated ✓', 'success');
+    closeEditDrawer();
+    await loadQueue();
+  } catch (err) {
+    if (noteEl) { noteEl.textContent = err.message; noteEl.className = 'dn-edit-note error'; }
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>Save Changes`;
+    }
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   TASK 5 — REBUILT METRICS TAB
+   ════════════════════════════════════════════════════════════════ */
+
+/* ── Load analytics data ────────────────────────────────────── */
+async function loadAnalytics() {
+  try {
+    const res  = await api('GET', '/api/distribution/analytics');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Failed to load analytics');
+
+    DN.metrics.posts = data.posts || [];
+    updateMetricsStats();
+    renderMetricsPicker();
+    renderBreakdownTable(data.platform_stats || {});
+    renderBestTimes(data.best_times || []);
+  } catch (err) {
+    showToast('Could not load analytics: ' + err.message, 'error');
+  }
+}
+
+/* ── Stats summary row ──────────────────────────────────────── */
+function updateMetricsStats() {
+  // Use DN.metrics.posts if available, fallback to DN.queue
+  const source  = DN.metrics.posts.length ? DN.metrics.posts : DN.queue.filter(p => p.status === 'posted');
+  const withM   = source.filter(p => p.views_24h != null);
+
+  const totalPosts = source.length;
+  const totalViews = withM.reduce((s, p) => s + (p.views_24h || 0), 0);
+  const avgViews   = withM.length ? Math.round(totalViews / withM.length) : null;
+
+  const byPlatform = {};
+  withM.forEach(p => {
+    byPlatform[p.platform] = (byPlatform[p.platform] || 0) + (p.views_24h || 0);
+  });
+  const topPlatform = Object.entries(byPlatform).sort((a,b) => b[1]-a[1])[0]?.[0] || null;
+
+  function setStatVal(id, val) {
+    const el = $(id);
+    if (!el) return;
+    const prev = el.textContent;
+    const next = val != null ? fmtNum(val) : '—';
+    if (prev !== next) {
+      el.textContent = next;
+      el.classList.remove('updated');
+      void el.offsetWidth;
+      el.classList.add('updated');
+    }
+  }
+
+  setStatVal('metric-total-posts',  totalPosts);
+  setStatVal('metric-total-views',  totalViews || null);
+  setStatVal('metric-top-platform', topPlatform ? topPlatform.slice(0,2).toUpperCase() : null);
+  setStatVal('metric-avg-views',    avgViews);
+}
+
+/* ── Post picker ────────────────────────────────────────────── */
+function renderMetricsPicker() {
+  const listEl  = $('dn-metrics-picker-list');
+  const emptyEl = $('dn-metrics-picker-empty');
+  if (!listEl) return;
+
+  const posts = DN.metrics.posts.slice(0, 20);
+
+  if (!posts.length) {
+    listEl.innerHTML = '';
+    if (emptyEl) emptyEl.style.display = 'flex';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  const platformIcon = p => p === 'instagram'
+    ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="12" height="12"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1.2" fill="currentColor" stroke="none"/></svg>`
+    : `<svg viewBox="0 0 24 24" fill="currentColor" width="12" height="12"><path d="M23 7s-.3-2-1.2-2.8c-1.1-1.2-2.4-1.2-3-1.3C16.6 2.8 12 2.8 12 2.8s-4.6 0-6.8.1c-.6.1-1.9.1-3 1.3C1.3 5 1 7 1 7S.7 9.1.7 11.3v2c0 2.1.3 4.2.3 4.2s.3 2 1.2 2.8c1.1 1.2 2.6 1.1 3.3 1.2C7.6 21.7 12 21.7 12 21.7s4.6 0 6.8-.2c.6-.1 1.9-.1 3-1.3.9-.8 1.2-2.8 1.2-2.8s.3-2.1.3-4.2v-2C23.3 9.1 23 7 23 7zM9.7 15.5V8.4l8.1 3.6-8.1 3.5z"/></svg>`;
+
+  listEl.innerHTML = posts.map(post => {
+    const label  = post.title || post.caption || '(no caption)';
+    const views  = post.views_24h != null ? `${fmtNum(post.views_24h)} views` : 'No metrics';
+    const isSelected = DN.metrics.selectedPost === post.id;
+    return `<div class="dn-metrics-picker-card${isSelected ? ' selected' : ''}" data-post-id="${escHtml(post.id)}">
+      <div class="dn-metrics-picker-thumb">
+        ${post.video_url ? `<video src="${escHtml(post.video_url)}" muted preload="metadata"></video>` : `<div class="dn-metrics-picker-no-thumb"></div>`}
+      </div>
+      <div class="dn-metrics-picker-info">
+        <div class="dn-metrics-picker-label">${escHtml(label.slice(0, 60))}${label.length > 60 ? '…' : ''}</div>
+        <div class="dn-metrics-picker-meta">
+          <span class="dn-qcard-platform-badge ${post.platform}" style="font-size:0.6rem;padding:.15rem .4rem">
+            ${platformIcon(post.platform)} ${post.platform}
+          </span>
+          <span class="dn-metrics-picker-date">${formatDateTime(post.posted_at)}</span>
+          <span class="dn-metrics-picker-views ${post.views_24h != null ? '' : 'muted'}">${views}</span>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+/* ── Select a post and render its chart ─────────────────────── */
+function selectMetricsPost(postId) {
+  DN.metrics.selectedPost = postId;
+
+  // Update picker selection highlight
+  $$('.dn-metrics-picker-card').forEach(c => c.classList.toggle('selected', c.dataset.postId === postId));
+
+  const post = DN.metrics.posts.find(p => p.id === postId);
+  if (!post) return;
+
+  // Show chart + breakdown sections
+  const chartSection  = $('dn-metrics-chart-section');
+  const brkSection    = $('dn-metrics-breakdown-section');
+  if (chartSection) chartSection.style.display = '';
+  if (brkSection)   brkSection.style.display   = '';
+
+  // Update chart title
+  const titleEl = $('dn-metrics-chart-title');
+  if (titleEl) {
+    const lbl = post.title || post.caption || 'Post';
+    titleEl.textContent = lbl.slice(0, 50) + (lbl.length > 50 ? '…' : '');
+  }
+
+  renderMetricsChart();
+  renderPostBreakdown(post);
+}
+
+/* ── Multi-metric bar chart for selected post ───────────────── */
+function renderMetricsChart() {
+  const postId = DN.metrics.selectedPost;
+  const post   = DN.metrics.posts.find(p => p.id === postId);
+  const canvas = $('dn-live-chart');
+  const empty  = $('dn-live-chart-empty');
+  if (!canvas) return;
+
+  const metric = DN.metrics.activeMetric;
+  const val24  = post ? (post[`${metric}_24h`] ?? 0) : 0;
+  const val72  = post ? (post[`${metric}_72h`] ?? 0) : 0;
+  const hasData = val24 > 0 || val72 > 0;
+
+  if (!hasData) {
+    if (empty) empty.style.display = 'flex';
+    canvas.style.display = 'none';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  canvas.style.display = 'block';
+
+  const COLORS = {
+    views:    { bar: '#A78BFA', bg: 'rgba(167,139,250,0.25)' },
+    likes:    { bar: '#34D399', bg: 'rgba(52,211,153,0.20)'  },
+    comments: { bar: '#FBBF24', bg: 'rgba(251,191,36,0.20)'  },
+    shares:   { bar: '#7BB8D4', bg: 'rgba(123,184,212,0.20)' },
+    saves:    { bar: '#FB923C', bg: 'rgba(251,146,60,0.20)'  },
+  };
+  const c = COLORS[metric] || COLORS.views;
+  const labels  = ['24h Window', '72h Window'];
+  const values  = [val24, val72];
+
+  if (DN.liveChart) {
+    DN.liveChart.data.labels              = labels;
+    DN.liveChart.data.datasets[0].data   = values;
+    DN.liveChart.data.datasets[0].label  = `${metric.charAt(0).toUpperCase() + metric.slice(1)}`;
+    DN.liveChart.data.datasets[0].backgroundColor = [c.bg, c.bg];
+    DN.liveChart.data.datasets[0].borderColor      = [c.bar, c.bar];
+    DN.liveChart.update('active');
+    return;
+  }
+
+  DN.liveChart = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label:           `${metric.charAt(0).toUpperCase() + metric.slice(1)}`,
+        data:            values,
+        backgroundColor: [c.bg, c.bg],
+        borderColor:     [c.bar, c.bar],
+        borderWidth:     2,
+        borderRadius:    6,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { labels: { color: 'rgba(232,244,253,0.55)', font: { family: 'Space Grotesk', size: 12 } } },
+        tooltip: {
+          backgroundColor: '#0b0f1a',
+          borderColor:     'rgba(168,216,240,0.15)',
+          borderWidth:     1,
+          titleColor:      '#E8F4FD',
+          bodyColor:       'rgba(232,244,253,0.7)',
+        },
+      },
+      scales: {
+        x: { ticks: { color: 'rgba(232,244,253,0.45)', font: { size: 12 } }, grid: { color: 'rgba(168,216,240,0.05)' } },
+        y: { ticks: { color: 'rgba(232,244,253,0.35)', font: { size: 11 } }, grid: { color: 'rgba(168,216,240,0.05)' } },
+      },
+    },
+  });
+}
+
+/* ── Per-platform breakdown for selected post ───────────────── */
+function renderPostBreakdown(post) {
+  const el = $('dn-metrics-breakdown-table');
+  if (!el) return;
+
+  const rows = [
+    { label: 'Views',    k: 'views'    },
+    { label: 'Likes',    k: 'likes'    },
+    { label: 'Comments', k: 'comments' },
+    { label: 'Shares',   k: 'shares'   },
+    { label: 'Saves',    k: 'saves'    },
+    { label: 'Reach',    k: 'reach'    },
+  ];
+
+  el.innerHTML = `
+    <div class="dn-breakdown-header">
+      <span>Metric</span>
+      <span>24h</span>
+      <span>72h</span>
+      <span>Growth</span>
+    </div>
+    ${rows.map(row => {
+      const v24 = post[`${row.k}_24h`] ?? null;
+      const v72 = post[`${row.k}_72h`] ?? null;
+      const growth = (v24 != null && v72 != null && v24 > 0)
+        ? `+${Math.round(((v72 - v24) / v24) * 100)}%`
+        : '—';
+      const growthCls = (v72 != null && v24 != null && v72 > v24) ? 'positive' : '';
+      return `<div class="dn-breakdown-row">
+        <span class="dn-breakdown-label">${row.label}</span>
+        <span class="dn-breakdown-val">${v24 != null ? fmtNum(v24) : '—'}</span>
+        <span class="dn-breakdown-val">${v72 != null ? fmtNum(v72) : '—'}</span>
+        <span class="dn-breakdown-growth ${growthCls}">${growth}</span>
+      </div>`;
+    }).join('')}
+  `;
+}
+
+/* ── Aggregated per-platform breakdown across all posts ─────── */
+function renderBreakdownTable(platformStats) {
+  // This is shown in the breakdown section when no post is selected
+  // It will be overwritten by renderPostBreakdown when a post is selected
+}
+
+/* ── Best posting times ─────────────────────────────────────── */
+function renderBestTimes(bestTimes) {
+  const grid    = $('dn-best-times-grid');
+  const emptyEl = $('dn-best-times-empty');
+  if (!grid) return;
+
+  if (!bestTimes.length) {
+    if (emptyEl) emptyEl.style.display = 'block';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  const maxViews = Math.max(...bestTimes.map(t => t.avg_views), 1);
+
+  grid.innerHTML = bestTimes.map((t, idx) => {
+    const pct  = Math.round((t.avg_views / maxViews) * 100);
+    const rank = idx === 0 ? '🏆' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `#${idx+1}`;
+    return `<div class="dn-best-time-card ${idx === 0 ? 'best' : ''}">
+      <div class="dn-best-time-rank">${rank}</div>
+      <div class="dn-best-time-label">${escHtml(t.label)}</div>
+      <div class="dn-best-time-bar-wrap">
+        <div class="dn-best-time-bar" style="width:${pct}%"></div>
+      </div>
+      <div class="dn-best-time-stats">
+        <span>${fmtNum(t.avg_views)} avg views</span>
+        <span>${t.count} post${t.count !== 1 ? 's' : ''}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+/* ── Legacy initLiveChart / pollLiveMetrics kept for compat ─── */
+function initLiveChart() { /* replaced by renderMetricsChart */ }
+
