@@ -4951,3 +4951,608 @@ function renderShotGrid(projectId) {
     }
   });
 }
+
+/* ════════════════════════════════════════════════════════════════
+   COMPARE NAV-TAB VIEW — bridges to COMPARE overlay system
+   The #vg-compare section acts as a full-page wrapper that hosts
+   the same compare grid; clicking nav tab just switches the view
+   and opens the compare flow inline rather than as a floating overlay.
+   ════════════════════════════════════════════════════════════════ */
+
+/* Called by initViewSwitcher when Compare tab is clicked */
+function initCompareView() {
+  const pid = VG.activeProjectId;
+
+  // Populate the picker scroll with completed shots for this project
+  const scroll = document.getElementById('vg-cmp-picker-scroll');
+  const hint   = document.getElementById('vg-cmp-picker-hint');
+  if (!scroll) return;
+
+  const shots = (VG.shots[pid] || []).filter(s =>
+    s.status === 'completed' && (s.video_url || s.hf_video_url)
+  );
+
+  if (!shots.length) {
+    scroll.innerHTML = `<span class="vg-cmp-picker-empty">No completed shots in this project yet</span>`;
+    if (hint) hint.textContent = '0 / 4 selected';
+    renderCmpGrid([]);
+    return;
+  }
+
+  // Sync COMPARE.selected state into picker UI
+  scroll.innerHTML = shots.map((s, i) => {
+    const vUrl = escAttr(s.video_url || s.hf_video_url);
+    const sel  = COMPARE.selected.includes(s.id) ? 'selected' : '';
+    return `
+      <div class="vg-cmp-thumb ${sel}" data-shot-id="${s.id}" title="${escAttr(s.prompt || '')}">
+        <video src="${vUrl}" muted preload="metadata" onmouseenter="this.play()" onmouseleave="this.pause();this.currentTime=0"></video>
+        <span class="vg-cmp-thumb-num">${i + 1}</span>
+      </div>`;
+  }).join('');
+
+  scroll.querySelectorAll('.vg-cmp-thumb').forEach(el => {
+    el.addEventListener('click', () => {
+      const id  = el.dataset.shotId;
+      const idx = COMPARE.selected.indexOf(id);
+      if (idx >= 0) {
+        COMPARE.selected.splice(idx, 1);
+      } else {
+        if (COMPARE.selected.length >= COMPARE.MAX) {
+          showToast(`Max ${COMPARE.MAX} shots for comparison`);
+          return;
+        }
+        COMPARE.selected.push(id);
+      }
+      // Sync selection UI
+      scroll.querySelectorAll('.vg-cmp-thumb').forEach(t =>
+        t.classList.toggle('selected', COMPARE.selected.includes(t.dataset.shotId))
+      );
+      if (hint) hint.textContent = `${COMPARE.selected.length} / 4 selected`;
+      // Re-render inline grid
+      const selectedShots = shots.filter(s => COMPARE.selected.includes(s.id));
+      renderCmpGrid(selectedShots);
+    });
+  });
+
+  if (hint) hint.textContent = `${COMPARE.selected.length} / 4 selected`;
+
+  // Initial render with any already-selected shots
+  const selectedShots = shots.filter(s => COMPARE.selected.includes(s.id));
+  renderCmpGrid(selectedShots);
+}
+
+/* Render the inline compare grid inside #vg-compare section */
+function renderCmpGrid(shots) {
+  const grid    = document.getElementById('vg-cmp-grid');
+  const winBar  = document.getElementById('vg-cmp-winner-bar');
+  const winBtns = document.getElementById('vg-cmp-winner-btns');
+  const winNote = document.getElementById('vg-cmp-winner-note');
+  const syncBtn = document.getElementById('btn-cmp-sync-toggle');
+  const clearBtn = document.getElementById('btn-cmp-clear');
+  if (!grid) return;
+
+  const LABELS = ['A', 'B', 'C', 'D'];
+
+  if (!shots.length) {
+    grid.removeAttribute('data-count');
+    grid.innerHTML = `
+      <div class="vg-cmp-empty-state">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><rect x="2" y="3" width="9" height="18" rx="1"/><rect x="13" y="3" width="9" height="18" rx="1"/></svg>
+        <p>Select 2–4 shots from the picker above to compare them side-by-side</p>
+      </div>`;
+    if (winBar) winBar.style.display = 'none';
+    return;
+  }
+
+  grid.setAttribute('data-count', String(shots.length));
+
+  grid.innerHTML = shots.map((shot, i) => {
+    const vUrl   = escAttr(shot.video_url || shot.hf_video_url || '');
+    const model  = (shot.model || '').split('/').pop() || '—';
+    const dur    = shot.duration ? `${shot.duration}s` : '';
+    const aspect = shot.aspect_ratio || '16:9';
+    const isWin  = COMPARE.winner === shot.id;
+
+    return `
+      <div class="vg-cmp-cell${isWin ? ' winner' : ''}" data-cell-id="${shot.id}">
+        <div class="vg-cmp-cell-header">
+          <span class="vg-cmp-cell-label">Shot ${LABELS[i]}</span>
+          <button class="vg-cmp-cell-remove" data-remove-id="${shot.id}" title="Remove from compare">
+            <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        ${vUrl ? `<video class="vg-cmp-cell-video" src="${vUrl}" muted loop preload="auto"
+                   data-cell-vid="${shot.id}" style="width:100%;flex:1;object-fit:contain;min-height:0;display:block"></video>` : ''}
+        <div class="vg-cmp-play-overlay">
+          <button class="vg-cmp-play-btn" data-play-id="${shot.id}">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          </button>
+        </div>
+        <div class="vg-cmp-cell-footer">
+          <p class="vg-cmp-cell-prompt">${escHtml(shot.prompt || '')}</p>
+          <div class="vg-cmp-cell-meta">
+            <span class="vg-cmp-cell-tag">${escHtml(model)}</span>
+            ${dur ? `<span class="vg-cmp-cell-tag">${escHtml(dur)}</span>` : ''}
+            <span class="vg-cmp-cell-tag">${escHtml(aspect)}</span>
+          </div>
+        </div>
+        <div class="vg-cmp-cell-winner-ring"></div>
+      </div>`;
+  }).join('');
+
+  // Remove buttons
+  grid.querySelectorAll('[data-remove-id]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const id  = btn.dataset.removeId;
+      const idx = COMPARE.selected.indexOf(id);
+      if (idx >= 0) COMPARE.selected.splice(idx, 1);
+      if (COMPARE.winner === id) COMPARE.winner = null;
+      // Re-run initCompareView to refresh everything
+      initCompareView();
+    });
+  });
+
+  // Play/pause buttons
+  const cmpSyncEnabled = { on: true };
+
+  grid.querySelectorAll('[data-play-id]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      toggleCmpPlayback(btn.dataset.playId, cmpSyncEnabled);
+    });
+  });
+  grid.querySelectorAll('.vg-cmp-cell').forEach(cell => {
+    cell.addEventListener('click', () => toggleCmpPlayback(cell.dataset.cellId, cmpSyncEnabled));
+  });
+
+  // Winner bar
+  if (winBar) {
+    winBar.style.display = shots.length >= 2 ? 'flex' : 'none';
+    if (winBtns) {
+      winBtns.innerHTML = shots.map((s, i) => `
+        <button class="vg-cmp-winner-btn${COMPARE.winner === s.id ? ' active' : ''}" data-win-id="${s.id}">
+          Shot ${LABELS[i]}
+        </button>`).join('');
+      winBtns.querySelectorAll('.vg-cmp-winner-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const id = btn.dataset.winId;
+          COMPARE.winner = COMPARE.winner === id ? null : id;
+          grid.querySelectorAll('.vg-cmp-cell').forEach(c =>
+            c.classList.toggle('winner', c.dataset.cellId === COMPARE.winner)
+          );
+          winBtns.querySelectorAll('.vg-cmp-winner-btn').forEach(b =>
+            b.classList.toggle('active', b.dataset.winId === COMPARE.winner)
+          );
+          if (winNote) {
+            winNote.textContent = COMPARE.winner
+              ? `Shot ${LABELS[shots.findIndex(s => s.id === COMPARE.winner)]} marked as winner`
+              : '';
+          }
+        });
+      });
+    }
+  }
+
+  // Sync toggle (one-time bind)
+  if (syncBtn && !syncBtn._cmpBound) {
+    syncBtn._cmpBound = true;
+    syncBtn.addEventListener('click', () => {
+      cmpSyncEnabled.on = !cmpSyncEnabled.on;
+      syncBtn.textContent   = cmpSyncEnabled.on ? 'Sync ON' : 'Sync OFF';
+      syncBtn.classList.toggle('active', cmpSyncEnabled.on);
+    });
+  }
+
+  // Clear button
+  if (clearBtn && !clearBtn._cmpBound) {
+    clearBtn._cmpBound = true;
+    clearBtn.addEventListener('click', () => {
+      COMPARE.selected = [];
+      COMPARE.winner   = null;
+      document.querySelectorAll('.vg-cmp-cell-video').forEach(v => v.pause());
+      initCompareView();
+    });
+  }
+}
+
+function toggleCmpPlayback(shotId, syncState) {
+  const vid = document.querySelector(`[data-cell-vid="${shotId}"]`);
+  if (!vid) return;
+
+  if (syncState.on) {
+    const all      = document.querySelectorAll('.vg-cmp-cell-video');
+    const anyPlay  = [...all].some(v => !v.paused);
+    all.forEach(v => anyPlay ? v.pause() : v.play().catch(() => {}));
+  } else {
+    vid.paused ? vid.play().catch(() => {}) : vid.pause();
+  }
+}
+
+/* Called from renderShotGrid compare action button */
+function addShotToCompare(btn) {
+  const shotId   = btn.dataset.shotId;
+  const videoUrl = btn.dataset.videoUrl;
+  if (!shotId || !videoUrl) return;
+
+  if (COMPARE.selected.includes(shotId)) {
+    showToast('Shot already in Compare', true);
+    return;
+  }
+  if (COMPARE.selected.length >= COMPARE.MAX) {
+    showToast(`Max ${COMPARE.MAX} shots — open Compare tab to remove one first`, true);
+    return;
+  }
+  COMPARE.selected.push(shotId);
+  showToast('Added to Compare — click the Compare tab to view');
+
+  // Also refresh compare-badge on board header if visible
+  const badge = document.getElementById('compare-badge');
+  if (badge) badge.textContent = COMPARE.selected.length;
+  const openBtn = document.getElementById('btn-open-compare');
+  if (openBtn) openBtn.disabled = COMPARE.selected.length < 2;
+
+  // If compare view is already visible, refresh it
+  const cmpEl = document.getElementById('vg-compare');
+  if (cmpEl && cmpEl.style.display !== 'none') initCompareView();
+}
+
+/* ════════════════════════════════════════════════════════════════
+   TIMELINE NAV-TAB VIEW — bridges to TIMELINE overlay system
+   ════════════════════════════════════════════════════════════════ */
+
+/* Called by initViewSwitcher when Timeline tab is clicked */
+function initTimelineView() {
+  const pid = VG.activeProjectId;
+  if (!pid) {
+    renderTlBank([]);
+    return;
+  }
+
+  // Load completed shots via the timeline API endpoint
+  api('GET', `/api/projects/${pid}/timeline`)
+    .then(r => r.json())
+    .then(data => {
+      const shots = data.shots || [];
+      shots.forEach(s => { TIMELINE._shotsMap = TIMELINE._shotsMap || {}; TIMELINE._shotsMap[s.id] = s; });
+
+      // Use existing TIMELINE.clips if already loaded for this project, else populate
+      if (TIMELINE.projectId !== pid || !TIMELINE.clips.length) {
+        TIMELINE.projectId = pid;
+        TIMELINE.clips     = [...shots];
+      }
+
+      renderTlStrip();
+      renderTlBank(shots);
+      renderTlRuler();
+      updateTlDuration();
+      enableTlButtons();
+    })
+    .catch(err => {
+      console.error('[TL] init', err);
+      renderTlBank([]);
+    });
+
+  bindTlControls();
+}
+
+function enableTlButtons() {
+  const has = TIMELINE.clips.length > 0;
+  const pl  = document.getElementById('btn-tl-play-all');
+  const ex  = document.getElementById('btn-tl-export');
+  if (pl) pl.disabled = !has;
+  if (ex) ex.disabled = !has;
+}
+
+/* ── Ruler ───────────────────────────────────────────────────── */
+function renderTlRuler() {
+  const inner = document.getElementById('vg-tl-ruler-inner');
+  if (!inner) return;
+  const PPS     = 40; // pixels per second
+  const total   = TIMELINE.clips.reduce((a, s) => a + (s.duration || 5), 0);
+  const maxSecs = Math.max(total, 30);
+  let   html    = '';
+  for (let t = 0; t <= maxSecs; t++) {
+    const maj = t % 5 === 0;
+    const m   = Math.floor(t / 60);
+    const s   = t % 60;
+    const tc  = `${m}:${String(s).padStart(2,'0')}`;
+    html += `<div style="width:${PPS}px;position:relative;flex-shrink:0">
+      <div style="width:1px;height:${maj ? 12 : 6}px;background:${maj ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.07)'}"></div>
+      ${maj ? `<span style="position:absolute;bottom:3px;left:3px;font-size:0.55rem;color:var(--text-muted);font-family:var(--font-mono)">${tc}</span>` : ''}
+    </div>`;
+  }
+  inner.innerHTML = html;
+}
+
+/* ── Strip ───────────────────────────────────────────────────── */
+function renderTlStrip() {
+  const strip = document.getElementById('vg-tl-strip');
+  if (!strip) return;
+  const PPS = 40;
+
+  if (!TIMELINE.clips.length) {
+    strip.innerHTML = `
+      <div class="vg-tl-empty">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"><rect x="2" y="7" width="20" height="10" rx="1"/></svg>
+        <p>Drag shots from the Shot Bank below to add them to the sequence</p>
+      </div>`;
+    enableTlButtons();
+    return;
+  }
+
+  let cur = 0;
+  strip.innerHTML = TIMELINE.clips.map((shot, i) => {
+    const dur   = shot.duration || 5;
+    const start = cur; cur += dur;
+    const vUrl  = escAttr(shot.video_url || shot.hf_video_url || '');
+    const model = (shot.model || '').split('/').pop() || '—';
+    const clipW = Math.max(80, dur * PPS);
+    const tcIn  = tlFmt(start);
+    const tcOut = tlFmt(start + dur);
+    return `
+      <div class="vg-tl-clip" data-tl-idx="${i}" data-shot-id="${shot.id}" draggable="true"
+           style="width:${clipW}px" title="${escAttr(shot.prompt || '')}">
+        ${vUrl ? `<video src="${vUrl}" muted preload="metadata"></video>` : ''}
+        <div class="vg-tl-clip-overlay"></div>
+        <div class="vg-tl-clip-info">
+          <div class="vg-tl-clip-timecode">${tcIn} → ${tcOut}</div>
+          <div class="vg-tl-clip-model">${escHtml(model)} · ${dur}s</div>
+        </div>
+        <div class="vg-tl-clip-handle">
+          <svg width="10" height="10" viewBox="0 0 20 20" fill="currentColor" opacity="0.5">
+            <circle cx="7" cy="4" r="1.5"/><circle cx="13" cy="4" r="1.5"/>
+            <circle cx="7" cy="10" r="1.5"/><circle cx="13" cy="10" r="1.5"/>
+            <circle cx="7" cy="16" r="1.5"/><circle cx="13" cy="16" r="1.5"/>
+          </svg>
+        </div>
+        <button class="vg-tl-clip-remove" data-tl-remove="${i}" title="Remove from timeline">
+          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>`;
+  }).join('');
+
+  // Bind drag-reorder within strip
+  strip.querySelectorAll('.vg-tl-clip').forEach(clip => {
+    const idx = +clip.dataset.tlIdx;
+
+    clip.addEventListener('click', e => {
+      if (e.target.closest('[data-tl-remove]')) return;
+      showTlClipDetails(TIMELINE.clips[idx]);
+    });
+    clip.addEventListener('dragstart', e => {
+      TIMELINE.dragSrcIdx = idx;
+      e.dataTransfer.effectAllowed = 'move';
+      clip.classList.add('dragging');
+    });
+    clip.addEventListener('dragend', () => {
+      clip.classList.remove('dragging');
+      strip.querySelectorAll('.vg-tl-clip').forEach(c => c.classList.remove('drag-over'));
+    });
+    clip.addEventListener('dragover', e => {
+      e.preventDefault();
+      strip.querySelectorAll('.vg-tl-clip').forEach(c => c.classList.remove('drag-over'));
+      clip.classList.add('drag-over');
+    });
+    clip.addEventListener('drop', e => {
+      e.preventDefault();
+      const from = TIMELINE.dragSrcIdx;
+      const to   = +clip.dataset.tlIdx;
+      if (from === null || from === to) return;
+      const [moved] = TIMELINE.clips.splice(from, 1);
+      TIMELINE.clips.splice(to, 0, moved);
+      TIMELINE.dragSrcIdx = null;
+      renderTlStrip(); renderTlRuler(); updateTlDuration();
+    });
+  });
+
+  // Remove buttons
+  strip.querySelectorAll('[data-tl-remove]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      TIMELINE.clips.splice(+btn.dataset.tlRemove, 1);
+      renderTlStrip(); renderTlRuler(); updateTlDuration();
+      // Un-dim bank card
+      const id = btn.closest('.vg-tl-clip')?.dataset.shotId;
+      if (id) {
+        const bc = document.querySelector(`.vg-tl-bank-clip[data-bank-id="${id}"]`);
+        if (bc) bc.classList.remove('in-timeline');
+      }
+    });
+  });
+
+  // Strip accepts drops from bank
+  strip.addEventListener('dragover', e => e.preventDefault());
+  strip.addEventListener('drop', e => {
+    e.preventDefault();
+    const bankId = e.dataTransfer.getData('tl-bank-id');
+    if (!bankId) return;
+    addTlClip(bankId);
+  });
+
+  enableTlButtons();
+}
+
+function addTlClip(shotId) {
+  const map    = TIMELINE._shotsMap || {};
+  const shot   = map[shotId];
+  if (!shot) return;
+  if (TIMELINE.clips.find(s => s.id === shotId)) return;
+  TIMELINE.clips.push(shot);
+  renderTlStrip(); renderTlRuler(); updateTlDuration();
+  const bc = document.querySelector(`.vg-tl-bank-clip[data-bank-id="${shotId}"]`);
+  if (bc) bc.classList.add('in-timeline');
+}
+
+function showTlClipDetails(shot) {
+  const det  = document.getElementById('vg-tl-details');
+  const body = document.getElementById('vg-tl-details-body');
+  if (!det || !body || !shot) return;
+  det.style.display = 'flex';
+  const idx   = TIMELINE.clips.indexOf(shot);
+  const start = TIMELINE.clips.slice(0, idx).reduce((a, s) => a + (s.duration || 5), 0);
+  const vUrl  = shot.video_url || shot.hf_video_url || '';
+  const model = (shot.model || '').split('/').pop() || '—';
+  body.innerHTML = `
+    ${vUrl ? `<video class="vg-tl-details-video" src="${escAttr(vUrl)}" controls muted></video>` : ''}
+    <div class="vg-tl-details-row">
+      <span class="vg-tl-details-key">Timecode</span>
+      <span class="vg-tl-details-val mono">${tlFmt(start)} → ${tlFmt(start + (shot.duration || 5))}</span>
+    </div>
+    <div class="vg-tl-details-row">
+      <span class="vg-tl-details-key">Model</span>
+      <span class="vg-tl-details-val mono">${escHtml(model)}</span>
+    </div>
+    <div class="vg-tl-details-row">
+      <span class="vg-tl-details-key">Duration</span>
+      <span class="vg-tl-details-val mono">${shot.duration || 5}s</span>
+    </div>
+    <div class="vg-tl-details-row">
+      <span class="vg-tl-details-key">Aspect</span>
+      <span class="vg-tl-details-val mono">${escHtml(shot.aspect_ratio || '16:9')}</span>
+    </div>
+    <div class="vg-tl-details-row">
+      <span class="vg-tl-details-key">Prompt</span>
+      <span class="vg-tl-details-val">${escHtml(shot.prompt || '—')}</span>
+    </div>`;
+}
+
+/* ── Shot Bank ───────────────────────────────────────────────── */
+function renderTlBank(shots) {
+  const grid = document.getElementById('vg-tl-bank-grid');
+  const hint = document.getElementById('vg-tl-bank-hint');
+  if (!grid) return;
+
+  if (!shots.length) {
+    grid.innerHTML = `<span class="vg-tl-bank-empty">No completed shots yet — generate some shots first</span>`;
+    return;
+  }
+
+  grid.innerHTML = shots.map(shot => {
+    const vUrl  = escAttr(shot.video_url || shot.hf_video_url || '');
+    const inTl  = TIMELINE.clips.find(s => s.id === shot.id) ? 'in-timeline' : '';
+    const model = (shot.model || '').split('/').pop() || '—';
+    return `
+      <div class="vg-tl-bank-clip ${inTl}" data-bank-id="${shot.id}"
+           draggable="true" title="${escAttr(shot.prompt || '')}">
+        ${vUrl ? `<video src="${vUrl}" muted preload="metadata" onmouseenter="this.play()" onmouseleave="this.pause();this.currentTime=0"></video>` : ''}
+        <div class="vg-tl-bank-clip-label">${escHtml(model)} · ${shot.duration || 5}s</div>
+      </div>`;
+  }).join('');
+
+  grid.querySelectorAll('.vg-tl-bank-clip').forEach(clip => {
+    const id = clip.dataset.bankId;
+    clip.addEventListener('dblclick', () => addTlClip(id));
+    clip.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('tl-bank-id', id);
+      e.dataTransfer.effectAllowed = 'copy';
+    });
+  });
+
+  if (hint) hint.textContent = `drag or double-click to add · ${shots.length} shot${shots.length !== 1 ? 's' : ''} available`;
+}
+
+function updateTlDuration() {
+  const badge = document.getElementById('vg-tl-total-duration');
+  if (!badge) return;
+  const total = TIMELINE.clips.reduce((a, s) => a + (s.duration || 5), 0);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  badge.textContent = `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+function tlFmt(secs) {
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+/* ── Preview sequence ────────────────────────────────────────── */
+function startTlPreview() {
+  if (!TIMELINE.clips.length) return;
+  const preview = document.getElementById('vg-tl-preview');
+  const vidEl   = document.getElementById('vg-tl-preview-video');
+  const counter = document.getElementById('vg-tl-preview-counter');
+  if (!preview || !vidEl) return;
+
+  preview.style.display = 'flex';
+  let idx = 0;
+
+  function playNext() {
+    if (idx >= TIMELINE.clips.length) { preview.style.display = 'none'; return; }
+    const shot = TIMELINE.clips[idx];
+    const url  = shot.video_url || shot.hf_video_url;
+    if (!url) { idx++; playNext(); return; }
+    if (counter) counter.textContent = `Shot ${idx + 1} / ${TIMELINE.clips.length}`;
+    vidEl.src    = url;
+    vidEl.onended = () => { idx++; playNext(); };
+    vidEl.play().catch(() => {});
+  }
+  playNext();
+}
+
+/* ── Export manifest ─────────────────────────────────────────── */
+async function exportTlManifest() {
+  const pid = VG.activeProjectId;
+  if (!pid || !TIMELINE.clips.length) return;
+
+  const btn = document.getElementById('btn-tl-export');
+  if (btn) { btn.disabled = true; btn.textContent = 'Exporting…'; }
+
+  try {
+    const res  = await api('POST', `/api/projects/${pid}/timeline/export`, {
+      shot_ids: TIMELINE.clips.map(s => s.id),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Export failed');
+
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `spectra-sequence-${pid.slice(0,8)}-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    const clips = data.manifest?.clips?.length || 0;
+    const dur   = data.manifest?.total_duration || '0:00:00';
+    showTlExportToast(`Manifest exported — ${clips} clips · ${dur} total`);
+  } catch (err) {
+    showToast(`Export failed: ${err.message}`, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Export Manifest`;
+    }
+  }
+}
+
+function showTlExportToast(msg) {
+  document.querySelector('.vg-tl-export-toast')?.remove();
+  const el = document.createElement('div');
+  el.className   = 'vg-tl-export-toast';
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 4500);
+}
+
+/* ── Bind timeline controls (idempotent) ─────────────────────── */
+function bindTlControls() {
+  const bind = (id, fn) => {
+    const el = document.getElementById(id);
+    if (el && !el._tlBound) { el._tlBound = true; el.addEventListener('click', fn); }
+  };
+  bind('btn-tl-play-all',       startTlPreview);
+  bind('btn-tl-export',         exportTlManifest);
+  bind('btn-tl-preview-close', () => {
+    const v = document.getElementById('vg-tl-preview-video');
+    if (v) { v.pause(); v.src = ''; }
+    document.getElementById('vg-tl-preview').style.display = 'none';
+  });
+  bind('btn-tl-details-close', () => {
+    document.querySelectorAll('.vg-tl-clip').forEach(c => c.classList.remove('selected'));
+    document.getElementById('vg-tl-details').style.display = 'none';
+  });
+}
+
