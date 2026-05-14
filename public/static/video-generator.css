@@ -2046,6 +2046,21 @@ body {
 }
 .vg-shot-continue-btn svg { flex-shrink: 0; }
 
+/* Distribute button */
+.vg-shot-distribute-btn {
+  display: inline-flex; align-items: center; gap: 0.3rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 5px; border: 1px solid rgba(167,139,250,0.30);
+  background: rgba(167,139,250,0.10);
+  color: #A78BFA;
+  font-family: inherit; font-size: 0.70rem; font-weight: 600;
+  cursor: pointer; transition: background 0.15s, border-color 0.15s;
+}
+.vg-shot-distribute-btn:hover {
+  background: rgba(167,139,250,0.22); border-color: rgba(167,139,250,0.55);
+}
+.vg-shot-distribute-btn svg { flex-shrink: 0; }
+
 /* ══════════════════════════════════════════════════════════════
    #10 AI CREATIVE DIRECTOR
    ══════════════════════════════════════════════════════════════ */

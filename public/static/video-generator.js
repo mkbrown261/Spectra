@@ -1129,11 +1129,12 @@ function renderShotGrid(projectId) {
     if (!action) return;
     el.addEventListener('click', (e) => {
       e.stopPropagation();
-      if (action === 'delete')   deleteShot(shotId, projectId);
-      if (action === 'copy')     copyPrompt(shotId, projectId);
-      if (action === 'download') downloadShot(shotId, projectId);
-      if (action === 'play')     playShot(shotId, projectId);
-      if (action === 'continue') continueFromShot(el);
+      if (action === 'delete')     deleteShot(shotId, projectId);
+      if (action === 'copy')       copyPrompt(shotId, projectId);
+      if (action === 'download')   downloadShot(shotId, projectId);
+      if (action === 'play')       playShot(shotId, projectId);
+      if (action === 'continue')   continueFromShot(el);
+      if (action === 'distribute') distributeShot(el);
     });
   });
 
@@ -1244,6 +1245,11 @@ function renderShotCard(shot, draggable = false) {
             <button class="vg-shot-action-btn vg-shot-continue-btn" data-shot-id="${shot.id}" data-action="continue" data-video-url="${escAttr(videoUrl)}" data-prompt="${escAttr(shot.prompt || '')}" title="Continue from last frame — use final frame as next reference">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="5 9 2 12 5 15"/><path d="M22 4v7a4 4 0 01-4 4H2"/></svg>
               Continue
+            </button>` : ''}
+            ${videoUrl ? `
+            <button class="vg-shot-action-btn vg-shot-distribute-btn" data-shot-id="${shot.id}" data-action="distribute" data-video-url="${escAttr(videoUrl)}" data-project-id="${escAttr(VG.activeProjectId || '')}" data-project-name="${escAttr(VG.projects.find(p=>p.id===VG.activeProjectId)?.name || '')}" title="Distribute — publish to Instagram or YouTube">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2L15 22l-4-9-9-4 20-7z"/></svg>
+              Distribute
             </button>` : ''}
             <button class="vg-shot-action-btn" data-shot-id="${shot.id}" data-action="copy" title="Copy prompt">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
@@ -2957,6 +2963,23 @@ async function continueFromShot(btn) {
     btn.disabled  = false;
     btn.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="5 9 2 12 5 15"/><path d="M22 4v7a4 4 0 01-4 4H2"/></svg> Continue`;
   }
+}
+
+/* ── Distribute shot → open Distribution Engine ──────────────── */
+function distributeShot(btn) {
+  const videoUrl   = btn.dataset.videoUrl    || '';
+  const projectId  = btn.dataset.projectId   || '';
+  const projectName= btn.dataset.projectName || '';
+
+  if (!videoUrl) { showToast('No video URL on this shot', true); return; }
+
+  const params = new URLSearchParams({
+    video_url:    videoUrl,
+    project_id:   projectId,
+    project_name: projectName,
+  });
+
+  window.open(`/tools/distribution/?${params.toString()}`, '_blank');
 }
 
 function extractLastFrame(videoUrl) {

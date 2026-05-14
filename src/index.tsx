@@ -2011,6 +2011,662 @@ function buildSegments(duration_sec: number, dropoff_points: number[]): any[] {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+   DISTRIBUTION ENGINE ROUTES
+══════════════════════════════════════════════════════════════════ */
+
+// ── OAuth config ─────────────────────────────────────────────────
+const OAUTH_CONFIG = {
+  instagram: {
+    authUrl:      'https://api.instagram.com/oauth/authorize',
+    tokenUrl:     'https://api.instagram.com/oauth/access_token',
+    longLivedUrl: 'https://graph.instagram.com/access_token',
+    scopes:       'instagram_basic,instagram_content_publish,instagram_manage_insights',
+    apiBase:      'https://graph.instagram.com',
+  },
+  youtube: {
+    authUrl:   'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl:  'https://oauth2.googleapis.com/token',
+    scopes:    'https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly',
+    apiBase:   'https://www.googleapis.com/youtube/v3',
+  },
+}
+
+// ── GET /api/distribution/accounts ───────────────────────────────
+// List all connected social accounts for the authenticated user
+app.get('/api/distribution/accounts', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as string
+    const rows = await c.env.DB.prepare(
+      `SELECT id, platform, handle, avatar_url, scopes, created_at, token_expiry
+       FROM social_accounts WHERE user_id = ? ORDER BY created_at DESC`
+    ).bind(userId).all()
+    return c.json({ accounts: rows.results || [] })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── POST /api/distribution/accounts/connect ──────────────────────
+// Initiate OAuth flow — returns the authorization URL to redirect to
+app.post('/api/distribution/accounts/connect', requireAuth, async (c) => {
+  try {
+    const { platform, client_id, redirect_uri } = await c.req.json()
+    if (!platform || !client_id || !redirect_uri) {
+      return c.json({ error: 'platform, client_id, redirect_uri required' }, 400)
+    }
+    if (!['instagram','youtube'].includes(platform)) {
+      return c.json({ error: 'Unsupported platform' }, 400)
+    }
+
+    const userId  = c.get('userId') as string
+    const state   = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)))
+    const cfg     = OAUTH_CONFIG[platform as keyof typeof OAUTH_CONFIG]
+
+    // Store state + userId + client_id + redirect_uri in KV-style temp row
+    // We reuse D1 with a short-lived nonce approach stored in sessions table comment col
+    // (simple: encode all needed info in state JWT-style as base64 JSON)
+    const statePayload = btoa(JSON.stringify({
+      userId, platform, client_id, redirect_uri,
+      nonce: state, exp: Date.now() + 10 * 60 * 1000, // 10 min
+    }))
+
+    const params = new URLSearchParams({
+      client_id,
+      redirect_uri,
+      scope:         cfg.scopes,
+      response_type: 'code',
+      state:         statePayload,
+      ...(platform === 'youtube' ? { access_type: 'offline', prompt: 'consent' } : {}),
+    })
+
+    return c.json({ auth_url: `${cfg.authUrl}?${params.toString()}` })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── GET /api/distribution/oauth/callback ─────────────────────────
+// OAuth redirect handler — exchanges code for tokens, saves account
+app.get('/api/distribution/oauth/callback', async (c) => {
+  try {
+    const code        = c.req.query('code')
+    const stateParam  = c.req.query('state')
+    const error       = c.req.query('error')
+
+    if (error) {
+      return c.html(`<html><body><script>window.opener?.postMessage({type:'oauth_error',error:'${error}'},'*');window.close();</script><p>Authorization failed: ${error}. You can close this window.</p></body></html>`)
+    }
+    if (!code || !stateParam) {
+      return c.html(`<html><body><script>window.opener?.postMessage({type:'oauth_error',error:'missing_params'},'*');window.close();</script><p>Missing parameters. Close this window.</p></body></html>`)
+    }
+
+    let stateData: any
+    try {
+      stateData = JSON.parse(atob(stateParam))
+    } catch {
+      return c.html(`<html><body><script>window.opener?.postMessage({type:'oauth_error',error:'invalid_state'},'*');window.close();</script></body></html>`)
+    }
+
+    if (Date.now() > stateData.exp) {
+      return c.html(`<html><body><script>window.opener?.postMessage({type:'oauth_error',error:'state_expired'},'*');window.close();</script><p>Authorization expired. Please try again.</p></body></html>`)
+    }
+
+    const { userId, platform, client_id, redirect_uri } = stateData
+    const cfg = OAUTH_CONFIG[platform as keyof typeof OAUTH_CONFIG]
+
+    // Exchange code for tokens — client_secret must be sent from frontend or stored
+    // For MVP: client_secret stored as env var INSTAGRAM_CLIENT_SECRET / YOUTUBE_CLIENT_SECRET
+    const clientSecret = platform === 'instagram'
+      ? (c.env as any).INSTAGRAM_CLIENT_SECRET
+      : (c.env as any).YOUTUBE_CLIENT_SECRET
+
+    const tokenBody = new URLSearchParams({
+      client_id,
+      client_secret: clientSecret || '',
+      redirect_uri,
+      code,
+      grant_type: 'authorization_code',
+    })
+
+    const tokenRes  = await fetch(cfg.tokenUrl, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    tokenBody.toString(),
+    })
+    const tokenData: any = await tokenRes.json()
+
+    if (!tokenData.access_token) {
+      const errMsg = tokenData.error_description || tokenData.error || 'token_exchange_failed'
+      return c.html(`<html><body><script>window.opener?.postMessage({type:'oauth_error',error:'${errMsg}'},'*');window.close();</script><p>Token exchange failed. Close window and try again.</p></body></html>`)
+    }
+
+    let accessToken   = tokenData.access_token
+    let refreshToken  = tokenData.refresh_token || null
+    let expiresIn     = tokenData.expires_in    || null
+    let accountId     = ''
+    let handle        = ''
+    let avatarUrl     = ''
+
+    if (platform === 'instagram') {
+      // Exchange short-lived for long-lived token
+      const llRes = await fetch(
+        `${cfg.longLivedUrl}?grant_type=ig_exchange_token&client_secret=${clientSecret}&access_token=${accessToken}`
+      )
+      const llData: any = await llRes.json()
+      if (llData.access_token) {
+        accessToken = llData.access_token
+        expiresIn   = llData.expires_in || null
+      }
+      // Get account info
+      const meRes  = await fetch(`${cfg.apiBase}/me?fields=id,username,profile_picture_url&access_token=${accessToken}`)
+      const meData: any = await meRes.json()
+      accountId = meData.id       || ''
+      handle    = meData.username || ''
+      avatarUrl = meData.profile_picture_url || ''
+    }
+
+    if (platform === 'youtube') {
+      // Get channel info
+      const chRes = await fetch(
+        `${cfg.apiBase}/channels?part=snippet&mine=true&access_token=${accessToken}`
+      )
+      const chData: any = await chRes.json()
+      const channel     = chData.items?.[0]
+      accountId = channel?.id || ''
+      handle    = channel?.snippet?.title || ''
+      avatarUrl = channel?.snippet?.thumbnails?.default?.url || ''
+    }
+
+    // Encrypt tokens
+    const encKey     = c.env.ENCRYPTION_KEY
+    const encAccess  = await encryptKey(accessToken,          encKey)
+    const encRefresh = refreshToken ? await encryptKey(refreshToken, encKey) : null
+
+    const tokenExpiry = expiresIn
+      ? new Date(Date.now() + expiresIn * 1000).toISOString()
+      : null
+
+    // Upsert account (one per platform per user)
+    const accountRow = await c.env.DB.prepare(
+      `SELECT id FROM social_accounts WHERE user_id = ? AND platform = ?`
+    ).bind(userId, platform).first<{ id: string }>()
+
+    const accountRowId = accountRow?.id || uuid()
+
+    await c.env.DB.prepare(`
+      INSERT INTO social_accounts
+        (id, user_id, platform, account_id, handle, avatar_url,
+         access_token, refresh_token, token_expiry, scopes, updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))
+      ON CONFLICT(user_id, platform) DO UPDATE SET
+        account_id    = excluded.account_id,
+        handle        = excluded.handle,
+        avatar_url    = excluded.avatar_url,
+        access_token  = excluded.access_token,
+        refresh_token = excluded.refresh_token,
+        token_expiry  = excluded.token_expiry,
+        scopes        = excluded.scopes,
+        updated_at    = datetime('now')
+    `).bind(
+      accountRowId, userId, platform, accountId, handle, avatarUrl,
+      JSON.stringify(encAccess),
+      encRefresh ? JSON.stringify(encRefresh) : null,
+      tokenExpiry,
+      cfg.scopes,
+    ).run()
+
+    return c.html(`<html><body><script>window.opener?.postMessage({type:'oauth_success',platform:'${platform}',handle:'${handle}'},'*');window.close();</script><p>Connected! You can close this window.</p></body></html>`)
+  } catch (err: any) {
+    return c.html(`<html><body><script>window.opener?.postMessage({type:'oauth_error',error:'${err.message}'},'*');window.close();</script><p>Error: ${err.message}</p></body></html>`)
+  }
+})
+
+// ── DELETE /api/distribution/accounts/:id ────────────────────────
+app.delete('/api/distribution/accounts/:id', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId') as string
+    const accountId = c.req.param('id')
+    await c.env.DB.prepare(
+      `DELETE FROM social_accounts WHERE id = ? AND user_id = ?`
+    ).bind(accountId, userId).run()
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── POST /api/distribution/caption ───────────────────────────────
+// Generate platform-native captions for a video
+app.post('/api/distribution/caption', requireAuth, async (c) => {
+  try {
+    const { platform, prompt, title, style_preset, duration_sec } = await c.req.json()
+    if (!platform || !prompt) return c.json({ error: 'platform and prompt required' }, 400)
+
+    const ai = getAIClient(c.env)
+
+    const platformGuide = {
+      instagram: `Instagram Reels caption. Rules:
+- Hook in first line (no emoji lead — text-first hook)
+- 150-220 chars before "more" fold
+- 3-5 punchy lines, line breaks for readability
+- 20-25 hashtags: mix of niche (10k-500k), mid (500k-5M), broad (5M+)
+- End with a soft CTA ("Save this." / "Drop a 🔥 if you agree")
+- Hashtags on their own line at the bottom
+Return JSON: { "caption": "...", "hashtags": ["tag1","tag2",...], "first_comment": "optional extra hashtag block" }`,
+      youtube: `YouTube Shorts description + title. Rules:
+- Title: 60 chars max, front-loaded keyword, click-worthy but not clickbait
+- Description: 200-300 chars, natural keyword density, include relevant links placeholder
+- Tags: 15-20 tags, mix of broad and long-tail
+- Add chapter markers if duration > 60s
+Return JSON: { "title": "...", "description": "...", "tags": ["tag1","tag2",...] }`,
+    }
+
+    const guide = platformGuide[platform as keyof typeof platformGuide]
+    if (!guide) return c.json({ error: 'Unsupported platform for caption generation' }, 400)
+
+    const resp = await ai.chat.completions.create({
+      model:       'openai/gpt-4o',
+      messages: [
+        { role: 'system', content: `You are Spectra's Distribution Caption Engine. You write platform-native copy that drives engagement. ${guide}` },
+        { role: 'user',   content: `Video prompt/concept: "${prompt}"\n${title ? `Working title: "${title}"\n` : ''}${style_preset ? `Style: ${style_preset}\n` : ''}${duration_sec ? `Duration: ~${duration_sec}s\n` : ''}\nGenerate the caption. Return JSON only.` },
+      ],
+      temperature: 0.7,
+      max_tokens:  800,
+    })
+
+    const raw = resp.choices[0]?.message?.content?.trim() || '{}'
+    let result: any = {}
+    try {
+      const m = raw.match(/\{[\s\S]*\}/)
+      if (m) result = JSON.parse(m[0])
+    } catch { result = {} }
+
+    return c.json({ platform, ...result })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── POST /api/distribution/schedule ──────────────────────────────
+// Create a new scheduled (or immediate) distribution post
+app.post('/api/distribution/schedule', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as string
+    const {
+      project_id, account_id, platform, video_url,
+      caption, title, tags, hashtags, cover_url,
+      scheduled_at,
+    } = await c.req.json()
+
+    if (!account_id || !platform || !video_url) {
+      return c.json({ error: 'account_id, platform, video_url required' }, 400)
+    }
+
+    // Verify account belongs to user
+    const acct = await c.env.DB.prepare(
+      `SELECT id FROM social_accounts WHERE id = ? AND user_id = ?`
+    ).bind(account_id, userId).first()
+    if (!acct) return c.json({ error: 'Account not found' }, 404)
+
+    const postId = uuid()
+    const status = scheduled_at ? 'scheduled' : 'posting'
+
+    await c.env.DB.prepare(`
+      INSERT INTO distribution_posts
+        (id, user_id, project_id, account_id, platform, video_url,
+         caption, title, tags, hashtags, cover_url, scheduled_at, status, created_at, updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))
+    `).bind(
+      postId, userId, project_id || null, account_id, platform, video_url,
+      caption || null,
+      title   || null,
+      tags    ? JSON.stringify(tags)     : null,
+      hashtags? JSON.stringify(hashtags) : null,
+      cover_url || null,
+      scheduled_at || null,
+      status,
+    ).run()
+
+    // If immediate, fire the publish job now
+    if (!scheduled_at) {
+      // Don't await — fire and update status async via the publish helper
+      publishPost(c.env, postId).catch(() => {})
+    }
+
+    return c.json({ ok: true, post_id: postId, status })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── GET /api/distribution/queue ───────────────────────────────────
+// List all posts in the user's distribution queue
+app.get('/api/distribution/queue', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as string
+    const status = c.req.query('status') || 'all'
+
+    const whereStatus = status !== 'all' ? `AND dp.status = '${status}'` : ''
+
+    const rows = await c.env.DB.prepare(`
+      SELECT dp.id, dp.platform, dp.status, dp.scheduled_at, dp.posted_at,
+             dp.caption, dp.title, dp.video_url, dp.cover_url, dp.error_message,
+             dp.platform_post_id, dp.retry_count, dp.created_at,
+             dp.project_id, p.name as project_name,
+             sa.handle as account_handle, sa.avatar_url as account_avatar,
+             pm24.views as views_24h, pm24.likes as likes_24h,
+             pm72.views as views_72h, pm72.likes as likes_72h
+      FROM distribution_posts dp
+      LEFT JOIN projects       p    ON dp.project_id  = p.id
+      LEFT JOIN social_accounts sa  ON dp.account_id  = sa.id
+      LEFT JOIN post_metrics    pm24 ON dp.id = pm24.post_id AND pm24.pull_window = '24h'
+      LEFT JOIN post_metrics    pm72 ON dp.id = pm72.post_id AND pm72.pull_window = '72h'
+      WHERE dp.user_id = ? ${whereStatus}
+      ORDER BY dp.created_at DESC
+      LIMIT 100
+    `).bind(userId).all()
+
+    return c.json({ posts: rows.results || [] })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── DELETE /api/distribution/queue/:id ───────────────────────────
+app.delete('/api/distribution/queue/:id', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as string
+    const postId = c.req.param('id')
+
+    const post = await c.env.DB.prepare(
+      `SELECT status FROM distribution_posts WHERE id = ? AND user_id = ?`
+    ).bind(postId, userId).first<{ status: string }>()
+
+    if (!post) return c.json({ error: 'Post not found' }, 404)
+    if (post.status === 'posted') return c.json({ error: 'Cannot cancel an already-posted item' }, 400)
+
+    await c.env.DB.prepare(
+      `UPDATE distribution_posts SET status = 'cancelled', updated_at = datetime('now') WHERE id = ? AND user_id = ?`
+    ).bind(postId, userId).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── POST /api/distribution/queue/:id/retry ───────────────────────
+app.post('/api/distribution/queue/:id/retry', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as string
+    const postId = c.req.param('id')
+
+    const post = await c.env.DB.prepare(
+      `SELECT status, retry_count FROM distribution_posts WHERE id = ? AND user_id = ?`
+    ).bind(postId, userId).first<{ status: string; retry_count: number }>()
+
+    if (!post) return c.json({ error: 'Post not found' }, 404)
+    if (post.status !== 'failed') return c.json({ error: 'Only failed posts can be retried' }, 400)
+    if (post.retry_count >= 3) return c.json({ error: 'Max retries reached' }, 400)
+
+    await c.env.DB.prepare(
+      `UPDATE distribution_posts SET status='posting', error_message=NULL, updated_at=datetime('now') WHERE id=?`
+    ).bind(postId).run()
+
+    publishPost(c.env, postId).catch(() => {})
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── GET /api/distribution/metrics/:postId ────────────────────────
+app.get('/api/distribution/metrics/:postId', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as string
+    const postId = c.req.param('postId')
+
+    const post = await c.env.DB.prepare(
+      `SELECT id, platform, platform_post_id, account_id, posted_at, status
+       FROM distribution_posts WHERE id = ? AND user_id = ?`
+    ).bind(postId, userId).first<any>()
+
+    if (!post) return c.json({ error: 'Post not found' }, 404)
+    if (post.status !== 'posted') return c.json({ error: 'Post not yet published' }, 400)
+
+    const metrics = await c.env.DB.prepare(
+      `SELECT * FROM post_metrics WHERE post_id = ? ORDER BY pull_window`
+    ).bind(postId).all()
+
+    return c.json({ post_id: postId, metrics: metrics.results || [] })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── POST /api/distribution/metrics/:postId/pull ───────────────────
+// Manually trigger a metrics pull for a posted item
+app.post('/api/distribution/metrics/:postId/pull', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as string
+    const postId = c.req.param('postId')
+
+    const post = await c.env.DB.prepare(
+      `SELECT dp.platform, dp.platform_post_id, dp.account_id, dp.posted_at,
+              sa.access_token as enc_access
+       FROM distribution_posts dp
+       LEFT JOIN social_accounts sa ON dp.account_id = sa.id
+       WHERE dp.id = ? AND dp.user_id = ?`
+    ).bind(postId, userId).first<any>()
+
+    if (!post || !post.platform_post_id) return c.json({ error: 'Post not published yet' }, 400)
+
+    const metrics = await pullMetrics(c.env, post)
+    if (!metrics) return c.json({ error: 'Could not fetch metrics from platform' }, 500)
+
+    // Calculate pull_window based on posted_at
+    const postedAt   = new Date(post.posted_at).getTime()
+    const hoursLater = (Date.now() - postedAt) / (1000 * 60 * 60)
+    const window     = hoursLater < 48 ? '24h' : '72h'
+
+    await c.env.DB.prepare(`
+      INSERT OR REPLACE INTO post_metrics
+        (id, post_id, pull_window, pulled_at, views, likes, comments, shares, reach, saves)
+      VALUES (?,?,?,datetime('now'),?,?,?,?,?,?)
+    `).bind(uuid(), postId, window,
+      metrics.views, metrics.likes, metrics.comments,
+      metrics.shares, metrics.reach, metrics.saves
+    ).run()
+
+    return c.json({ ok: true, window, metrics })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── PUBLISH HELPER ────────────────────────────────────────────────
+async function publishPost(env: Bindings, postId: string): Promise<void> {
+  const post = await env.DB.prepare(`
+    SELECT dp.*, sa.access_token as enc_access, sa.refresh_token as enc_refresh,
+           sa.platform as sa_platform, sa.account_id as sa_account_id
+    FROM distribution_posts dp
+    LEFT JOIN social_accounts sa ON dp.account_id = sa.id
+    WHERE dp.id = ?
+  `).bind(postId).first<any>()
+
+  if (!post) return
+
+  await env.DB.prepare(
+    `UPDATE distribution_posts SET status='posting', updated_at=datetime('now') WHERE id=?`
+  ).bind(postId).run()
+
+  try {
+    let platformPostId: string | null = null
+    const encAccessObj = JSON.parse(post.enc_access || '{}')
+    const accessToken  = await decryptKey(encAccessObj.encrypted, encAccessObj.iv, env.ENCRYPTION_KEY)
+
+    if (post.platform === 'instagram') {
+      platformPostId = await publishToInstagram(accessToken, post)
+    } else if (post.platform === 'youtube') {
+      platformPostId = await publishToYouTube(accessToken, post)
+    }
+
+    await env.DB.prepare(`
+      UPDATE distribution_posts
+      SET status='posted', platform_post_id=?, posted_at=datetime('now'), updated_at=datetime('now')
+      WHERE id=?
+    `).bind(platformPostId, postId).run()
+  } catch (err: any) {
+    const retryCount = (post.retry_count || 0) + 1
+    await env.DB.prepare(`
+      UPDATE distribution_posts
+      SET status='failed', error_message=?, retry_count=?, updated_at=datetime('now')
+      WHERE id=?
+    `).bind(err.message || 'Unknown publish error', retryCount, postId).run()
+  }
+}
+
+// ── INSTAGRAM PUBLISH ─────────────────────────────────────────────
+async function publishToInstagram(accessToken: string, post: any): Promise<string> {
+  const igBase = 'https://graph.instagram.com/v21.0'
+
+  // Step 1: Create media container
+  const caption = [
+    post.caption || '',
+    post.hashtags ? JSON.parse(post.hashtags).map((h: string) => `#${h}`).join(' ') : '',
+  ].filter(Boolean).join('\n\n')
+
+  const createParams = new URLSearchParams({
+    media_type:  'REELS',
+    video_url:   post.video_url,
+    caption:     caption,
+    access_token: accessToken,
+  })
+  if (post.cover_url) createParams.set('cover_url', post.cover_url)
+
+  const createRes  = await fetch(`${igBase}/me/media`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body:    createParams.toString(),
+  })
+  const createData: any = await createRes.json()
+  if (!createData.id) {
+    throw new Error(createData.error?.message || 'Instagram container creation failed')
+  }
+
+  // Step 2: Poll until container is FINISHED
+  const containerId = createData.id
+  let ready = false
+  for (let attempt = 0; attempt < 20; attempt++) {
+    await new Promise(r => setTimeout(r, 5000))
+    const statusRes  = await fetch(
+      `${igBase}/${containerId}?fields=status_code&access_token=${accessToken}`
+    )
+    const statusData: any = await statusRes.json()
+    if (statusData.status_code === 'FINISHED') { ready = true; break }
+    if (statusData.status_code === 'ERROR') throw new Error('Instagram media processing failed')
+  }
+  if (!ready) throw new Error('Instagram media processing timed out')
+
+  // Step 3: Publish
+  const publishRes  = await fetch(`${igBase}/me/media_publish`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body:    new URLSearchParams({ creation_id: containerId, access_token: accessToken }).toString(),
+  })
+  const publishData: any = await publishRes.json()
+  if (!publishData.id) {
+    throw new Error(publishData.error?.message || 'Instagram publish failed')
+  }
+  return publishData.id
+}
+
+// ── YOUTUBE PUBLISH ───────────────────────────────────────────────
+async function publishToYouTube(accessToken: string, post: any): Promise<string> {
+  const tags  = post.tags ? JSON.parse(post.tags) : []
+  const title = post.title || post.caption?.slice(0, 60) || 'Spectra Video'
+
+  // Fetch the video as a buffer for multipart upload
+  const videoRes = await fetch(post.video_url)
+  if (!videoRes.ok) throw new Error('Could not fetch video for YouTube upload')
+  const videoBuffer = await videoRes.arrayBuffer()
+
+  // Build multipart/related body
+  const boundary = '---spectra_yt_boundary'
+  const metadata = JSON.stringify({
+    snippet: {
+      title:       title.slice(0, 100),
+      description: post.caption || '',
+      tags:        tags.slice(0, 500),
+      categoryId:  '22', // People & Blogs — most common for Shorts
+    },
+    status: {
+      privacyStatus:           'public',
+      selfDeclaredMadeForKids: false,
+    },
+  })
+
+  const metaPart = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n`
+  const videoPart = `--${boundary}\r\nContent-Type: video/mp4\r\n\r\n`
+  const closing   = `\r\n--${boundary}--`
+
+  const enc        = new TextEncoder()
+  const metaBytes  = enc.encode(metaPart)
+  const videoBytes = enc.encode(videoPart)
+  const videoData  = new Uint8Array(videoBuffer)
+  const closeBytes = enc.encode(closing)
+
+  const body = new Uint8Array(metaBytes.length + videoBytes.length + videoData.length + closeBytes.length)
+  let offset = 0
+  body.set(metaBytes,  offset); offset += metaBytes.length
+  body.set(videoBytes, offset); offset += videoBytes.length
+  body.set(videoData,  offset); offset += videoData.length
+  body.set(closeBytes, offset)
+
+  const uploadRes = await fetch(
+    'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=multipart&part=snippet,status',
+    {
+      method:  'POST',
+      headers: {
+        'Authorization':  `Bearer ${accessToken}`,
+        'Content-Type':   `multipart/related; boundary=${boundary}`,
+        'Content-Length': body.length.toString(),
+      },
+      body,
+    }
+  )
+  const uploadData: any = await uploadRes.json()
+  if (!uploadData.id) {
+    throw new Error(uploadData.error?.message || 'YouTube upload failed')
+  }
+  return uploadData.id
+}
+
+// ── METRICS PULL HELPER ────────────────────────────────────────────
+async function pullMetrics(env: Bindings, post: any): Promise<any> {
+  try {
+    const encAccessObj = JSON.parse(post.enc_access || '{}')
+    const accessToken  = await decryptKey(encAccessObj.encrypted, encAccessObj.iv, env.ENCRYPTION_KEY)
+
+    if (post.platform === 'instagram') {
+      const res  = await fetch(
+        `https://graph.instagram.com/v21.0/${post.platform_post_id}/insights?metric=reach,likes,comments,shares,saved&access_token=${accessToken}`
+      )
+      const data: any = await res.json()
+      const m: Record<string, number> = {}
+      data.data?.forEach((item: any) => { m[item.name] = item.values?.[0]?.value || 0 })
+      return { views: m.reach||0, likes: m.likes||0, comments: m.comments||0, shares: m.shares||0, reach: m.reach||0, saves: m.saved||0 }
+    }
+
+    if (post.platform === 'youtube') {
+      const res  = await fetch(
+        `https://www.googleapis.com/youtube/v3/videos?id=${post.platform_post_id}&part=statistics&access_token=${accessToken}`
+      )
+      const data: any = await res.json()
+      const stats = data.items?.[0]?.statistics || {}
+      return {
+        views:    parseInt(stats.viewCount    || '0'),
+        likes:    parseInt(stats.likeCount    || '0'),
+        comments: parseInt(stats.commentCount || '0'),
+        shares:   0,
+        reach:    parseInt(stats.viewCount    || '0'),
+        saves:    parseInt(stats.favoriteCount|| '0'),
+      }
+    }
+  } catch { return null }
+  return null
+}
+
+// ── GET /tools/distribution/ ──────────────────────────────────────
+app.get('/tools/distribution/', async (c) => {
+  return c.html(distributionPage())
+})
+app.get('/tools/distribution', async (c) => {
+  return c.redirect('/tools/distribution/')
+})
+
+/* ══════════════════════════════════════════════════════════════════
    ATTENTION ENGINE ROUTES (preserved)
 ══════════════════════════════════════════════════════════════════ */
 app.post('/api/attention/analyze', requireAuth, async (c) => {
@@ -3312,6 +3968,393 @@ function attentionEnginePage(): string {
 </main>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="/static/attention-engine.js"></script>
+</body>
+</html>`
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   DISTRIBUTION ENGINE PAGE
+══════════════════════════════════════════════════════════════════ */
+function distributionPage(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Distribution Engine — Spectra</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/distribution.css"/>
+</head>
+<body>
+
+<!-- NAV -->
+<nav class="dn-nav">
+  <a href="/" class="dn-nav-logo">
+    <span class="dn-nav-mark">S</span>
+    <span class="dn-nav-wordmark">SPECTRA</span>
+  </a>
+  <div class="dn-nav-center">
+    <span class="dn-nav-tool-badge">
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2L15 22l-4-9-9-4 20-7z"/></svg>
+      Distribution Engine
+    </span>
+  </div>
+  <div class="dn-nav-right">
+    <a href="/video-generator/" class="dn-nav-back">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+      Back to Generator
+    </a>
+  </div>
+</nav>
+
+<!-- AUTH GATE -->
+<div id="dn-auth-gate" class="dn-auth-gate" style="display:none">
+  <div class="dn-auth-card">
+    <div class="dn-auth-logo">
+      <span class="dn-nav-mark" style="width:40px;height:40px;font-size:1rem">S</span>
+    </div>
+    <h2 class="dn-auth-title">Sign in to Spectra</h2>
+    <p class="dn-auth-sub">Access your Distribution Engine</p>
+    <form id="dn-auth-form" class="dn-auth-form" autocomplete="off">
+      <input type="email"    id="dn-auth-email" class="dn-input" placeholder="Email" required autocomplete="email"/>
+      <input type="password" id="dn-auth-pass"  class="dn-input" placeholder="Password" required/>
+      <button type="submit"  class="dn-btn-primary" id="dn-auth-submit">Sign In</button>
+    </form>
+    <p class="dn-auth-err" id="dn-auth-err"></p>
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="dn-app" style="display:none">
+
+  <!-- TOP BAR -->
+  <div class="dn-topbar">
+    <div class="dn-topbar-tabs">
+      <button class="dn-tab active" data-tab="queue">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+        Queue
+        <span class="dn-tab-badge" id="dn-queue-count">0</span>
+      </button>
+      <button class="dn-tab" data-tab="accounts">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        Accounts
+        <span class="dn-tab-badge" id="dn-accounts-count">0</span>
+      </button>
+      <button class="dn-tab" data-tab="new">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+        New Post
+      </button>
+    </div>
+    <div class="dn-topbar-right">
+      <div class="dn-user-chip" id="dn-user-chip">
+        <span class="dn-user-dot"></span>
+        <span id="dn-user-email">—</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── QUEUE TAB ── -->
+  <div class="dn-panel active" id="dn-panel-queue">
+    <div class="dn-panel-header">
+      <div class="dn-panel-title">Distribution Queue</div>
+      <div class="dn-panel-actions">
+        <div class="dn-filter-row">
+          <button class="dn-filter-btn active" data-filter="all">All</button>
+          <button class="dn-filter-btn" data-filter="scheduled">Scheduled</button>
+          <button class="dn-filter-btn" data-filter="posted">Posted</button>
+          <button class="dn-filter-btn" data-filter="failed">Failed</button>
+        </div>
+        <button class="dn-btn-icon" id="btn-refresh-queue" title="Refresh queue">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="dn-queue-empty" id="dn-queue-empty" style="display:none">
+      <div class="dn-empty-icon">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><path d="M22 2L11 13"/><path d="M22 2L15 22l-4-9-9-4 20-7z"/></svg>
+      </div>
+      <div class="dn-empty-title">Queue is empty</div>
+      <div class="dn-empty-sub">Schedule your first post to get started</div>
+      <button class="dn-btn-primary" onclick="switchTab('new')">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        New Post
+      </button>
+    </div>
+
+    <div class="dn-queue-list" id="dn-queue-list"></div>
+  </div>
+
+  <!-- ── ACCOUNTS TAB ── -->
+  <div class="dn-panel" id="dn-panel-accounts">
+    <div class="dn-panel-header">
+      <div class="dn-panel-title">Connected Accounts</div>
+      <div class="dn-panel-sub">OAuth tokens encrypted at rest · Disconnect any time</div>
+    </div>
+
+    <div class="dn-accounts-grid">
+
+      <!-- Instagram -->
+      <div class="dn-account-card" id="card-instagram">
+        <div class="dn-account-header">
+          <div class="dn-account-platform-icon instagram">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1.2" fill="currentColor" stroke="none"/></svg>
+          </div>
+          <div class="dn-account-info">
+            <div class="dn-account-name">Instagram</div>
+            <div class="dn-account-desc">Reels · Direct publish via Instagram Graph API</div>
+          </div>
+          <div class="dn-account-status" id="status-instagram">
+            <span class="dn-status-dot disconnected"></span>
+            <span class="dn-status-text">Not connected</span>
+          </div>
+        </div>
+        <div class="dn-account-connected-row" id="connected-instagram" style="display:none">
+          <img class="dn-account-avatar" id="avatar-instagram" src="" alt=""/>
+          <div class="dn-account-handle" id="handle-instagram">@—</div>
+          <button class="dn-btn-disconnect" data-platform="instagram">Disconnect</button>
+        </div>
+        <div class="dn-oauth-form" id="oauth-form-instagram">
+          <div class="dn-oauth-fields">
+            <input type="text"     class="dn-input dn-input-sm" id="ig-client-id"     placeholder="App ID (from Meta Developer Console)"/>
+            <input type="password" class="dn-input dn-input-sm" id="ig-client-secret" placeholder="App Secret"/>
+            <input type="text"     class="dn-input dn-input-sm" id="ig-redirect-uri"  placeholder="Redirect URI (must match Meta app settings)"/>
+          </div>
+          <div class="dn-oauth-note">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            Requires a Meta Developer app with <code>instagram_basic</code> + <code>instagram_content_publish</code> permissions.
+            <a href="https://developers.facebook.com/apps/" target="_blank" rel="noopener">Open Meta Console ↗</a>
+          </div>
+          <button class="dn-btn-connect instagram" data-platform="instagram">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+            Connect Instagram
+          </button>
+        </div>
+      </div>
+
+      <!-- YouTube -->
+      <div class="dn-account-card" id="card-youtube">
+        <div class="dn-account-header">
+          <div class="dn-account-platform-icon youtube">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M23 7s-.3-2-1.2-2.8c-1.1-1.2-2.4-1.2-3-1.3C16.6 2.8 12 2.8 12 2.8s-4.6 0-6.8.1c-.6.1-1.9.1-3 1.3C1.3 5 1 7 1 7S.7 9.1.7 11.3v2c0 2.1.3 4.2.3 4.2s.3 2 1.2 2.8c1.1 1.2 2.6 1.1 3.3 1.2C7.6 21.7 12 21.7 12 21.7s4.6 0 6.8-.2c.6-.1 1.9-.1 3-1.3.9-.8 1.2-2.8 1.2-2.8s.3-2.1.3-4.2v-2C23.3 9.1 23 7 23 7zM9.7 15.5V8.4l8.1 3.6-8.1 3.5z"/></svg>
+          </div>
+          <div class="dn-account-info">
+            <div class="dn-account-name">YouTube</div>
+            <div class="dn-account-desc">Shorts · Direct upload via YouTube Data API v3</div>
+          </div>
+          <div class="dn-account-status" id="status-youtube">
+            <span class="dn-status-dot disconnected"></span>
+            <span class="dn-status-text">Not connected</span>
+          </div>
+        </div>
+        <div class="dn-account-connected-row" id="connected-youtube" style="display:none">
+          <img class="dn-account-avatar" id="avatar-youtube" src="" alt=""/>
+          <div class="dn-account-handle" id="handle-youtube">—</div>
+          <button class="dn-btn-disconnect" data-platform="youtube">Disconnect</button>
+        </div>
+        <div class="dn-oauth-form" id="oauth-form-youtube">
+          <div class="dn-oauth-fields">
+            <input type="text"     class="dn-input dn-input-sm" id="yt-client-id"     placeholder="Client ID (from Google Cloud Console)"/>
+            <input type="password" class="dn-input dn-input-sm" id="yt-client-secret" placeholder="Client Secret"/>
+            <input type="text"     class="dn-input dn-input-sm" id="yt-redirect-uri"  placeholder="Redirect URI (must match GCP OAuth settings)"/>
+          </div>
+          <div class="dn-oauth-note">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            Requires a Google Cloud project with YouTube Data API v3 enabled and OAuth 2.0 credentials.
+            <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">Open GCP Console ↗</a>
+          </div>
+          <button class="dn-btn-connect youtube" data-platform="youtube">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+            Connect YouTube
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── NEW POST TAB ── -->
+  <div class="dn-panel" id="dn-panel-new">
+    <div class="dn-panel-header">
+      <div class="dn-panel-title">Schedule a Post</div>
+      <div class="dn-panel-sub">Generate captions, choose platforms, set timing — then fire.</div>
+    </div>
+
+    <div class="dn-compose">
+
+      <!-- Step 1: Video -->
+      <div class="dn-compose-step">
+        <div class="dn-step-label">
+          <span class="dn-step-num">1</span>
+          Video
+        </div>
+        <div class="dn-compose-body">
+          <div class="dn-video-input-row">
+            <input type="url" class="dn-input" id="dn-video-url" placeholder="Paste R2 / CDN video URL…" autocomplete="off"/>
+            <button class="dn-btn-secondary" id="btn-load-from-project">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>
+              From Project
+            </button>
+          </div>
+          <div class="dn-video-preview" id="dn-video-preview" style="display:none">
+            <video id="dn-video-player" controls muted playsinline></video>
+            <button class="dn-video-clear" id="btn-clear-video">✕</button>
+          </div>
+
+          <!-- Project picker modal trigger -->
+          <div class="dn-project-picker" id="dn-project-picker" style="display:none">
+            <div class="dn-project-picker-inner">
+              <div class="dn-picker-header">
+                <div class="dn-picker-title">Select a completed shot</div>
+                <button class="dn-picker-close" id="btn-close-picker">✕</button>
+              </div>
+              <div class="dn-picker-list" id="dn-picker-list">
+                <div class="dn-picker-loading">Loading projects…</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Step 2: Platforms -->
+      <div class="dn-compose-step">
+        <div class="dn-step-label">
+          <span class="dn-step-num">2</span>
+          Platforms
+        </div>
+        <div class="dn-compose-body">
+          <div class="dn-platform-row" id="dn-platform-row">
+            <button class="dn-platform-toggle" data-platform="instagram" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1.2" fill="currentColor" stroke="none"/></svg>
+              Instagram
+              <span class="dn-platform-toggle-sub">Not connected</span>
+            </button>
+            <button class="dn-platform-toggle" data-platform="youtube" disabled>
+              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M23 7s-.3-2-1.2-2.8c-1.1-1.2-2.4-1.2-3-1.3C16.6 2.8 12 2.8 12 2.8s-4.6 0-6.8.1c-.6.1-1.9.1-3 1.3C1.3 5 1 7 1 7S.7 9.1.7 11.3v2c0 2.1.3 4.2.3 4.2s.3 2 1.2 2.8c1.1 1.2 2.6 1.1 3.3 1.2C7.6 21.7 12 21.7 12 21.7s4.6 0 6.8-.2c.6-.1 1.9-.1 3-1.3.9-.8 1.2-2.8 1.2-2.8s.3-2.1.3-4.2v-2C23.3 9.1 23 7 23 7zM9.7 15.5V8.4l8.1 3.6-8.1 3.5z"/></svg>
+              YouTube
+              <span class="dn-platform-toggle-sub">Not connected</span>
+            </button>
+          </div>
+          <a href="#" class="dn-connect-prompt" id="dn-connect-prompt" onclick="switchTab('accounts');return false">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+            Connect accounts first →
+          </a>
+        </div>
+      </div>
+
+      <!-- Step 3: Caption -->
+      <div class="dn-compose-step">
+        <div class="dn-step-label">
+          <span class="dn-step-num">3</span>
+          Caption
+        </div>
+        <div class="dn-compose-body">
+          <div class="dn-caption-gen-row">
+            <input type="text" class="dn-input" id="dn-concept-input" placeholder="Describe the video concept for caption generation…"/>
+            <button class="dn-btn-generate" id="btn-gen-caption" title="Generate platform-native captions with AI">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+              Generate
+            </button>
+          </div>
+
+          <!-- Instagram caption block -->
+          <div class="dn-caption-block" id="caption-block-instagram" style="display:none">
+            <div class="dn-caption-block-header">
+              <div class="dn-caption-platform-label instagram">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="11" height="11"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1.2" fill="currentColor" stroke="none"/></svg>
+                Instagram
+              </div>
+              <span class="dn-caption-char-count" id="ig-char-count">0</span>
+            </div>
+            <textarea class="dn-caption-textarea" id="dn-ig-caption" rows="5" placeholder="Instagram caption will appear here…" spellcheck="true"></textarea>
+            <div class="dn-hashtag-row" id="ig-hashtag-row"></div>
+          </div>
+
+          <!-- YouTube caption block -->
+          <div class="dn-caption-block" id="caption-block-youtube" style="display:none">
+            <div class="dn-caption-block-header">
+              <div class="dn-caption-platform-label youtube">
+                <svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11"><path d="M23 7s-.3-2-1.2-2.8c-1.1-1.2-2.4-1.2-3-1.3C16.6 2.8 12 2.8 12 2.8s-4.6 0-6.8.1c-.6.1-1.9.1-3 1.3C1.3 5 1 7 1 7S.7 9.1.7 11.3v2c0 2.1.3 4.2.3 4.2s.3 2 1.2 2.8c1.1 1.2 2.6 1.1 3.3 1.2C7.6 21.7 12 21.7 12 21.7s4.6 0 6.8-.2c.6-.1 1.9-.1 3-1.3.9-.8 1.2-2.8 1.2-2.8s.3-2.1.3-4.2v-2C23.3 9.1 23 7 23 7zM9.7 15.5V8.4l8.1 3.6-8.1 3.5z"/></svg>
+                YouTube
+              </div>
+            </div>
+            <input type="text" class="dn-input" id="dn-yt-title" placeholder="YouTube title (max 100 chars)…"/>
+            <textarea class="dn-caption-textarea" id="dn-yt-description" rows="4" placeholder="YouTube description…" spellcheck="true" style="margin-top:0.5rem"></textarea>
+            <div class="dn-hashtag-row" id="yt-tag-row"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Step 4: Schedule -->
+      <div class="dn-compose-step">
+        <div class="dn-step-label">
+          <span class="dn-step-num">4</span>
+          Timing
+        </div>
+        <div class="dn-compose-body">
+          <div class="dn-timing-row">
+            <button class="dn-timing-btn active" data-timing="now">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              Post Now
+            </button>
+            <button class="dn-timing-btn" data-timing="schedule">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+              Schedule
+            </button>
+          </div>
+          <div class="dn-schedule-picker" id="dn-schedule-picker" style="display:none">
+            <input type="datetime-local" class="dn-input" id="dn-scheduled-at"/>
+          </div>
+          <div class="dn-smart-times" id="dn-smart-times">
+            <div class="dn-smart-label">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+              Optimal times (based on platform best practices)
+            </div>
+            <div class="dn-smart-chips" id="dn-smart-chips"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Step 5: Review & Fire -->
+      <div class="dn-compose-step">
+        <div class="dn-step-label">
+          <span class="dn-step-num">5</span>
+          Review
+        </div>
+        <div class="dn-compose-body">
+          <div class="dn-review-card" id="dn-review-card">
+            <div class="dn-review-row">
+              <span class="dn-review-label">Video</span>
+              <span class="dn-review-val" id="rv-video">—</span>
+            </div>
+            <div class="dn-review-row">
+              <span class="dn-review-label">Platforms</span>
+              <span class="dn-review-val" id="rv-platforms">—</span>
+            </div>
+            <div class="dn-review-row">
+              <span class="dn-review-label">Timing</span>
+              <span class="dn-review-val" id="rv-timing">Post Now</span>
+            </div>
+          </div>
+          <button class="dn-btn-fire" id="btn-fire-post">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2L15 22l-4-9-9-4 20-7z"/></svg>
+            <span id="btn-fire-label">Schedule Post</span>
+          </button>
+          <p class="dn-fire-note" id="dn-fire-note"></p>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+</div><!-- /dn-app -->
+
+<!-- TOAST -->
+<div class="dn-toast" id="dn-toast"></div>
+
+<script src="/static/distribution.js"></script>
 </body>
 </html>`
 }
