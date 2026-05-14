@@ -2279,6 +2279,37 @@ Return JSON: { "title": "...", "description": "...", "tags": ["tag1","tag2",...]
   } catch (err: any) { return c.json({ error: err.message }, 500) }
 })
 
+// ── POST /api/distribution/upload ────────────────────────────────
+// Upload a local video file to R2, return a public URL for distribution
+app.post('/api/distribution/upload', requireAuth, async (c) => {
+  try {
+    const formData = await c.req.formData()
+    const file = formData.get('file') as File | null
+    if (!file) return c.json({ error: 'No file provided' }, 400)
+
+    const maxBytes = 500 * 1024 * 1024 // 500MB
+    if (file.size > maxBytes) return c.json({ error: 'File too large (max 500MB)' }, 400)
+
+    const ext      = file.name.split('.').pop()?.toLowerCase() || 'mp4'
+    const allowed  = ['mp4','mov','webm','m4v','avi']
+    if (!allowed.includes(ext)) return c.json({ error: 'Invalid file type. Allowed: mp4, mov, webm, m4v' }, 400)
+
+    const userId = c.get('userId') as string
+    const key    = `dist/${userId}/${uuid()}.${ext}`
+    const buf    = await file.arrayBuffer()
+
+    await c.env.STORAGE.put(key, buf, {
+      httpMetadata: { contentType: file.type || 'video/mp4' },
+    })
+
+    const publicUrl = `https://pub-${c.env.STORAGE.toString().split(':')[0]}.r2.dev/${key}`
+    // Serve through our own proxy route
+    const serveUrl = `/api/media/${key}`
+
+    return c.json({ ok: true, key, url: serveUrl, size: file.size, name: file.name })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
 // ── POST /api/distribution/schedule ──────────────────────────────
 // Create a new scheduled (or immediate) distribution post
 app.post('/api/distribution/schedule', requireAuth, async (c) => {
@@ -2287,14 +2318,13 @@ app.post('/api/distribution/schedule', requireAuth, async (c) => {
     const {
       project_id, account_id, platform, video_url,
       caption, title, tags, hashtags, cover_url,
-      scheduled_at,
+      scheduled_at, batch_id, batch_position,
     } = await c.req.json()
 
     if (!account_id || !platform || !video_url) {
       return c.json({ error: 'account_id, platform, video_url required' }, 400)
     }
 
-    // Verify account belongs to user
     const acct = await c.env.DB.prepare(
       `SELECT id FROM social_accounts WHERE id = ? AND user_id = ?`
     ).bind(account_id, userId).first()
@@ -2306,28 +2336,123 @@ app.post('/api/distribution/schedule', requireAuth, async (c) => {
     await c.env.DB.prepare(`
       INSERT INTO distribution_posts
         (id, user_id, project_id, account_id, platform, video_url,
-         caption, title, tags, hashtags, cover_url, scheduled_at, status, created_at, updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))
+         caption, title, tags, hashtags, cover_url, scheduled_at, status,
+         batch_id, batch_position, created_at, updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))
     `).bind(
       postId, userId, project_id || null, account_id, platform, video_url,
-      caption || null,
-      title   || null,
-      tags    ? JSON.stringify(tags)     : null,
-      hashtags? JSON.stringify(hashtags) : null,
-      cover_url || null,
-      scheduled_at || null,
-      status,
+      caption || null, title || null,
+      tags     ? JSON.stringify(tags)     : null,
+      hashtags ? JSON.stringify(hashtags) : null,
+      cover_url || null, scheduled_at || null, status,
+      batch_id || null, batch_position || 0,
     ).run()
 
-    // If immediate, fire the publish job now
     if (!scheduled_at) {
-      // Don't await — fire and update status async via the publish helper
       publishPost(c.env, postId).catch(() => {})
     }
 
     return c.json({ ok: true, post_id: postId, status })
   } catch (err: any) { return c.json({ error: err.message }, 500) }
 })
+
+// ── POST /api/distribution/batch ─────────────────────────────────
+// Schedule a batch of posts (multiple videos × platforms × drip timing)
+app.post('/api/distribution/batch', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId') as string
+    const { items, drip_hours = 24 } = await c.req.json()
+    // items: [{ account_id, platform, video_url, caption, title, tags, hashtags, project_id, caption_b }]
+    if (!Array.isArray(items) || items.length === 0) {
+      return c.json({ error: 'items array required' }, 400)
+    }
+    if (items.length > 50) return c.json({ error: 'Max 50 items per batch' }, 400)
+
+    const batchId  = uuid()
+    const postIds: string[] = []
+    const now      = Date.now()
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      const acct = await c.env.DB.prepare(
+        `SELECT id FROM social_accounts WHERE id = ? AND user_id = ?`
+      ).bind(item.account_id, userId).first()
+      if (!acct) continue
+
+      const postId      = uuid()
+      const scheduledAt = new Date(now + i * drip_hours * 3600 * 1000).toISOString()
+      const status      = 'scheduled'
+
+      await c.env.DB.prepare(`
+        INSERT INTO distribution_posts
+          (id, user_id, project_id, account_id, platform, video_url,
+           caption, title, tags, hashtags, scheduled_at, status,
+           batch_id, batch_position, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))
+      `).bind(
+        postId, userId, item.project_id || null, item.account_id,
+        item.platform, item.video_url,
+        item.caption || null, item.title || null,
+        item.tags     ? JSON.stringify(item.tags)     : null,
+        item.hashtags ? JSON.stringify(item.hashtags) : null,
+        scheduledAt, status, batchId, i,
+      ).run()
+
+      postIds.push(postId)
+    }
+
+    return c.json({ ok: true, batch_id: batchId, post_ids: postIds, count: postIds.length })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── GET /api/distribution/metrics/live ───────────────────────────
+// Poll live metrics for multiple posted items — used for real-time chart
+app.get('/api/distribution/metrics/live', requireAuth, async (c) => {
+  try {
+    const userId  = c.get('userId') as string
+    const postIds = (c.req.query('ids') || '').split(',').filter(Boolean).slice(0, 20)
+    if (postIds.length === 0) return c.json({ metrics: [] })
+
+    const placeholders = postIds.map(() => '?').join(',')
+    const posts = await c.env.DB.prepare(`
+      SELECT dp.id, dp.platform, dp.platform_post_id, dp.posted_at, dp.status,
+             sa.access_token as enc_access
+      FROM distribution_posts dp
+      LEFT JOIN social_accounts sa ON dp.account_id = sa.id
+      WHERE dp.id IN (${placeholders}) AND dp.user_id = ? AND dp.status = 'posted'
+    `).bind(...postIds, userId).all()
+
+    const results = await Promise.all(
+      (posts.results || []).map(async (post: any) => {
+        try {
+          const m = await pullMetrics(c.env, post)
+          if (m) {
+            // Upsert into post_metrics
+            const window = (() => {
+              const h = (Date.now() - new Date(post.posted_at).getTime()) / 3600000
+              return h < 48 ? '24h' : '72h'
+            })()
+            await c.env.DB.prepare(`
+              INSERT OR REPLACE INTO post_metrics
+                (id, post_id, pull_window, pulled_at, views, likes, comments, shares, reach, saves)
+              VALUES (?,?,?,datetime('now'),?,?,?,?,?,?)
+            `).bind(uuid(), post.id, window,
+              m.views, m.likes, m.comments, m.shares, m.reach, m.saves
+            ).run()
+          }
+          return { id: post.id, platform: post.platform, posted_at: post.posted_at, metrics: m, pulled_at: new Date().toISOString() }
+        } catch {
+          return { id: post.id, platform: post.platform, metrics: null }
+        }
+      })
+    )
+
+    return c.json({ metrics: results, pulled_at: new Date().toISOString() })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// ── GET /api/distribution/queue updated to include batch_id ───────
+
 
 // ── GET /api/distribution/queue ───────────────────────────────────
 // List all posts in the user's distribution queue
@@ -3986,6 +4111,7 @@ function distributionPage(): string {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/distribution.css"/>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
 
@@ -4046,6 +4172,14 @@ function distributionPage(): string {
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
         New Post
       </button>
+      <button class="dn-tab" data-tab="batch">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        Batch
+      </button>
+      <button class="dn-tab" data-tab="metrics">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        Metrics
+      </button>
     </div>
     <div class="dn-topbar-right">
       <div class="dn-user-chip" id="dn-user-chip">
@@ -4060,6 +4194,10 @@ function distributionPage(): string {
     <div class="dn-panel-header">
       <div class="dn-panel-title">Distribution Queue</div>
       <div class="dn-panel-actions">
+        <button class="dn-btn-secondary" id="btn-open-batch" style="margin-right:0.5rem">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          Batch Mode
+        </button>
         <div class="dn-filter-row">
           <button class="dn-filter-btn active" data-filter="all">All</button>
           <button class="dn-filter-btn" data-filter="scheduled">Scheduled</button>
@@ -4071,6 +4209,9 @@ function distributionPage(): string {
         </button>
       </div>
     </div>
+
+    <!-- Platform Health Bar -->
+    <div class="dn-health-bar" id="dn-health-bar"></div>
 
     <div class="dn-queue-empty" id="dn-queue-empty" style="display:none">
       <div class="dn-empty-icon">
@@ -4191,19 +4332,40 @@ function distributionPage(): string {
           Video
         </div>
         <div class="dn-compose-body">
-          <div class="dn-video-input-row">
-            <input type="url" class="dn-input" id="dn-video-url" placeholder="Paste R2 / CDN video URL…" autocomplete="off"/>
+
+          <!-- Input mode tabs -->
+          <div class="dn-video-input-tabs">
+            <button class="dn-video-input-tab active" id="btn-upload-tab-url">URL</button>
+            <button class="dn-video-input-tab" id="btn-upload-tab-file">Upload File</button>
+          </div>
+
+          <!-- URL panel -->
+          <div id="video-input-url-panel" style="display:flex;gap:0.5rem;align-items:center">
+            <input type="url" class="dn-input" id="dn-video-url" placeholder="Paste R2 / CDN video URL…" autocomplete="off" style="flex:1"/>
             <button class="dn-btn-secondary" id="btn-load-from-project">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>
               From Project
             </button>
           </div>
+
+          <!-- File upload panel -->
+          <div id="video-input-file-panel" style="display:none">
+            <div class="dn-drop-zone" id="dn-drop-zone">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".45"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              <p class="dn-drop-zone-label">Drop video here or click to browse</p>
+              <p class="dn-drop-zone-sub">MP4, MOV, WEBM — max 500 MB</p>
+            </div>
+            <input type="file" id="dn-file-input" accept="video/mp4,video/quicktime,video/webm,video/x-m4v,.mp4,.mov,.webm,.m4v" style="display:none"/>
+            <div class="dn-upload-progress" id="dn-upload-progress" style="display:none"></div>
+            <div class="dn-video-filename" id="dn-video-filename"></div>
+          </div>
+
           <div class="dn-video-preview" id="dn-video-preview" style="display:none">
             <video id="dn-video-player" controls muted playsinline></video>
             <button class="dn-video-clear" id="btn-clear-video">✕</button>
           </div>
 
-          <!-- Project picker modal trigger -->
+          <!-- Project picker modal -->
           <div class="dn-project-picker" id="dn-project-picker" style="display:none">
             <div class="dn-project-picker-inner">
               <div class="dn-picker-header">
@@ -4259,16 +4421,43 @@ function distributionPage(): string {
             </button>
           </div>
 
-          <!-- Instagram caption block -->
+          <!-- Instagram caption block with A/B -->
           <div class="dn-caption-block" id="caption-block-instagram" style="display:none">
             <div class="dn-caption-block-header">
               <div class="dn-caption-platform-label instagram">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="11" height="11"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1.2" fill="currentColor" stroke="none"/></svg>
                 Instagram
               </div>
-              <span class="dn-caption-char-count" id="ig-char-count">0</span>
             </div>
-            <textarea class="dn-caption-textarea" id="dn-ig-caption" rows="5" placeholder="Instagram caption will appear here…" spellcheck="true"></textarea>
+
+            <!-- A/B tab switcher -->
+            <div class="dn-ab-tabs" id="dn-ab-tabs" style="display:none">
+              <button class="dn-ab-tab active" id="btn-ab-a">
+                <span class="dn-ab-tag">A</span> Variant A
+              </button>
+              <button class="dn-ab-tab" id="btn-ab-b">
+                <span class="dn-ab-tag">B</span> Variant B
+              </button>
+            </div>
+
+            <!-- Variant A -->
+            <div id="panel-ab-a">
+              <div class="dn-caption-block-header" style="margin-top:0.5rem">
+                <span style="font-size:0.7rem;opacity:.5">Variant A</span>
+                <span class="dn-caption-char-count" id="ig-char-count-a">0/2200</span>
+              </div>
+              <textarea class="dn-caption-textarea" id="dn-ig-caption-a" rows="5" placeholder="Instagram caption variant A will appear here…" spellcheck="true"></textarea>
+            </div>
+
+            <!-- Variant B -->
+            <div id="panel-ab-b" style="display:none">
+              <div class="dn-caption-block-header" style="margin-top:0.5rem">
+                <span style="font-size:0.7rem;opacity:.5">Variant B</span>
+                <span class="dn-caption-char-count" id="ig-char-count-b">0/2200</span>
+              </div>
+              <textarea class="dn-caption-textarea" id="dn-ig-caption-b" rows="5" placeholder="Instagram caption variant B will appear here…" spellcheck="true"></textarea>
+            </div>
+
             <div class="dn-hashtag-row" id="ig-hashtag-row"></div>
           </div>
 
@@ -4347,6 +4536,118 @@ function distributionPage(): string {
       </div>
 
     </div>
+  </div>
+
+  <!-- ── BATCH TAB ── -->
+  <div class="dn-panel" id="dn-panel-batch">
+    <div class="dn-panel-header">
+      <div class="dn-panel-title">Batch Mode</div>
+      <div class="dn-panel-sub">Schedule multiple videos with a drip cadence</div>
+    </div>
+
+    <div class="dn-batch-panel-grid">
+
+      <!-- Left: video list -->
+      <div class="dn-batch-left">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem">
+          <span style="font-size:0.75rem;opacity:.55;letter-spacing:.06em">VIDEOS</span>
+          <button class="dn-btn-secondary" id="btn-batch-add-file">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Add Videos
+          </button>
+        </div>
+        <div class="dn-batch-list" id="dn-batch-list"></div>
+      </div>
+
+      <!-- Right: drip schedule -->
+      <div class="dn-batch-right">
+        <div style="font-size:0.75rem;opacity:.55;letter-spacing:.06em;margin-bottom:0.75rem">DRIP SCHEDULE</div>
+
+        <!-- Template buttons -->
+        <div class="dn-drip-templates">
+          <button class="dn-drip-template-btn active" data-template="daily">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            3-Day Daily
+          </button>
+          <button class="dn-drip-template-btn" data-template="weekly">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+            Weekly
+          </button>
+          <button class="dn-drip-template-btn" data-template="launch">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2L15 22l-4-9-9-4 20-7z"/></svg>
+            Launch Week
+          </button>
+          <button class="dn-drip-template-btn" data-template="blitz">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            6h Blitz
+          </button>
+          <button class="dn-drip-template-btn" data-template="custom">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 010 14.14"/><path d="M4.93 4.93a10 10 0 000 14.14"/></svg>
+            Custom
+          </button>
+        </div>
+
+        <p class="dn-drip-desc" id="dn-drip-desc">Posts every 24h — consistent daily cadence</p>
+
+        <!-- Custom interval input -->
+        <div class="dn-batch-custom-row" id="dn-batch-custom-row" style="display:none">
+          <label style="font-size:0.75rem;opacity:.6">Hours between posts</label>
+          <input type="number" class="dn-input dn-input-sm" id="dn-batch-drip-custom" value="24" min="1" max="720" style="width:80px"/>
+        </div>
+
+        <!-- Schedule preview -->
+        <div style="font-size:0.75rem;opacity:.55;letter-spacing:.06em;margin:1rem 0 0.5rem">SCHEDULE PREVIEW</div>
+        <div class="dn-batch-preview" id="dn-batch-preview"></div>
+
+        <!-- Fire button -->
+        <button class="dn-btn-batch-fire" id="btn-batch-fire">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2L15 22l-4-9-9-4 20-7z"/></svg>
+          Schedule Batch
+        </button>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── METRICS TAB ── -->
+  <div class="dn-panel" id="dn-panel-metrics">
+    <div class="dn-panel-header">
+      <div class="dn-panel-title">
+        Live Metrics
+        <span class="dn-live-pulse"><span class="dn-live-dot"></span>LIVE</span>
+      </div>
+      <div class="dn-panel-sub">Auto-refreshes every 60 seconds · Up to 20 recent posts</div>
+    </div>
+
+    <!-- Stats row -->
+    <div class="dn-metrics-stats-row" id="dn-metrics-stats-row">
+      <div class="dn-metrics-stat-card">
+        <div class="dn-metrics-stat-val" id="metric-total-posts">—</div>
+        <div class="dn-metrics-stat-label">Total Posts</div>
+      </div>
+      <div class="dn-metrics-stat-card">
+        <div class="dn-metrics-stat-val" id="metric-total-views">—</div>
+        <div class="dn-metrics-stat-label">Total Views (24h)</div>
+      </div>
+      <div class="dn-metrics-stat-card">
+        <div class="dn-metrics-stat-val" id="metric-top-platform">—</div>
+        <div class="dn-metrics-stat-label">Top Platform</div>
+      </div>
+      <div class="dn-metrics-stat-card">
+        <div class="dn-metrics-stat-val" id="metric-avg-views">—</div>
+        <div class="dn-metrics-stat-label">Avg Views/Post</div>
+      </div>
+    </div>
+
+    <!-- Chart -->
+    <div class="dn-live-chart-wrap">
+      <canvas id="dn-live-chart"></canvas>
+      <div class="dn-live-chart-empty" id="dn-live-chart-empty">
+        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity=".3"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        <p>No metrics yet — post something and pull metrics to populate the chart</p>
+      </div>
+    </div>
+
   </div>
 
 </div><!-- /dn-app -->
