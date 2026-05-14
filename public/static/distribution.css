@@ -1944,3 +1944,260 @@ html, body {
 }
 .dn-metrics-stat-delta.up   { color: var(--green); }
 .dn-metrics-stat-delta.down { color: var(--red); }
+
+/* ════════════════════════════════════════════════════════════════
+   DISTRIBUTION ENGINE v2.1 — POLISH + BUG FIXES
+   ════════════════════════════════════════════════════════════════ */
+
+/* ── FIX: dn-drop-zone-label (was .dn-drop-zone-title in CSS) ─── */
+.dn-drop-zone-label {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--ice-dim);
+}
+
+/* ── FIX: dn-batch-left / dn-batch-right layout ──────────────── */
+.dn-batch-left {
+  min-width: 0;
+}
+
+.dn-batch-right {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  position: sticky;
+  top: 72px;           /* stick below nav */
+}
+
+/* ── FIX: dn-schedule-picker wrapper ────────────────────────────*/
+.dn-schedule-picker {
+  display: none;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.dn-schedule-picker.visible { display: flex; }
+
+/* ── FIX: dn-smart-times wrapper ────────────────────────────────*/
+.dn-smart-times {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-top: 0.25rem;
+}
+
+/* ── PANEL FADE-IN ───────────────────────────────────────────── */
+@keyframes dn-panel-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.dn-panel.active {
+  display: block;
+  animation: dn-panel-in 0.18s ease-out forwards;
+}
+
+/* ── QUEUE CARD ENTRANCE ─────────────────────────────────────── */
+@keyframes dn-card-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.dn-queue-card {
+  animation: dn-card-in 0.16s ease-out both;
+}
+/* stagger first 8 cards */
+.dn-queue-card:nth-child(1) { animation-delay: 0.00s; }
+.dn-queue-card:nth-child(2) { animation-delay: 0.04s; }
+.dn-queue-card:nth-child(3) { animation-delay: 0.08s; }
+.dn-queue-card:nth-child(4) { animation-delay: 0.12s; }
+.dn-queue-card:nth-child(5) { animation-delay: 0.16s; }
+.dn-queue-card:nth-child(6) { animation-delay: 0.20s; }
+.dn-queue-card:nth-child(7) { animation-delay: 0.22s; }
+.dn-queue-card:nth-child(8) { animation-delay: 0.24s; }
+
+/* hover lift */
+.dn-queue-card:hover {
+  border-color: var(--border-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  transition: border-color 0.15s, transform 0.15s, box-shadow 0.15s;
+}
+/* in-batch cards don't lift (grouped) */
+.dn-queue-card.in-batch:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+/* ── BUTTON :ACTIVE PRESS STATES ─────────────────────────────── */
+.dn-btn-secondary:active  { transform: scale(0.97); }
+.dn-btn-generate:active   { transform: scale(0.97); }
+.dn-btn-icon:active       { transform: scale(0.93); }
+.dn-btn-sm:active         { transform: scale(0.95); }
+.dn-btn-connect:active    { opacity: 0.75; }
+.dn-drip-template-btn:active { transform: scale(0.96); }
+.dn-timing-btn:active     { transform: scale(0.97); }
+.dn-filter-btn:active     { transform: scale(0.95); }
+.dn-tab:active            { transform: scale(0.97); }
+
+/* ── TOAST: left-stripe accent ───────────────────────────────── */
+.dn-toast {
+  border-left-width: 3px;
+}
+.dn-toast.success { border-left-color: var(--green); }
+.dn-toast.error   { border-left-color: var(--red); }
+.dn-toast.info    { border-left-color: var(--accent); }
+
+/* ── TOPBAR TABS: overflow scroll on mobile ──────────────────── */
+.dn-topbar-tabs {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.dn-topbar-tabs::-webkit-scrollbar { display: none; }
+
+/* tab active indicator underline (adds a bottom pip) */
+.dn-tab.active {
+  position: relative;
+}
+.dn-tab.active::after {
+  content: '';
+  position: absolute;
+  bottom: 3px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 18px;
+  height: 2px;
+  background: var(--purple);
+  border-radius: 99px;
+}
+
+/* ── DRIP TEMPLATE BTN: fix icon+text inline layout ─────────── */
+.dn-drip-template-btn {
+  flex-direction: row;    /* override column → put icon left of text */
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.74rem;
+  padding: 0.55rem 0.7rem;
+}
+.dn-drip-template-btn svg { flex-shrink: 0; }
+
+/* ── BATCH FIRE BTN: full width in sidebar ───────────────────── */
+.dn-btn-batch-fire {
+  width: 100%;
+  justify-content: center;
+  margin-top: 0.5rem;
+}
+
+/* ── LIVE CHART WRAP: fix height accounting ──────────────────── */
+.dn-live-chart-wrap {
+  height: 320px;         /* taller → more breathing room */
+}
+#dn-live-chart {
+  height: 100% !important;   /* fill the whole card, no offset needed */
+}
+.dn-live-chart-empty {
+  height: 100%;
+}
+
+/* ── METRICS STATS ROW: entrance animation ───────────────────── */
+@keyframes dn-stat-in {
+  from { opacity: 0; transform: scale(0.94) translateY(4px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+.dn-metrics-stat-card {
+  animation: dn-stat-in 0.2s ease-out both;
+}
+.dn-metrics-stat-card:nth-child(1) { animation-delay: 0.00s; }
+.dn-metrics-stat-card:nth-child(2) { animation-delay: 0.06s; }
+.dn-metrics-stat-card:nth-child(3) { animation-delay: 0.12s; }
+.dn-metrics-stat-card:nth-child(4) { animation-delay: 0.18s; }
+
+/* number count-up flash */
+@keyframes dn-val-flash {
+  0%   { color: var(--purple); }
+  100% { color: var(--ice); }
+}
+.dn-metrics-stat-val.updated {
+  animation: dn-val-flash 0.6s ease-out forwards;
+}
+
+/* ── INPUT: focus glow ring ──────────────────────────────────── */
+.dn-input:focus {
+  border-color: rgba(167,139,250,0.45);
+  box-shadow: 0 0 0 3px rgba(167,139,250,0.09);
+}
+.dn-caption-textarea:focus {
+  border-color: rgba(167,139,250,0.45);
+  box-shadow: 0 0 0 3px rgba(167,139,250,0.09);
+}
+
+/* ── ACCOUNT CARD: connected pulse ──────────────────────────── */
+.dn-account-card.connected .dn-status-dot.connected {
+  animation: dn-pulse 2.5s infinite;
+}
+
+/* ── BATCH ITEM: entrance animation ──────────────────────────── */
+@keyframes dn-batch-item-in {
+  from { opacity: 0; transform: translateX(-6px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.dn-batch-item {
+  animation: dn-batch-item-in 0.15s ease-out both;
+}
+
+/* ── HEALTH BAR: divider between platform items ──────────────── */
+.dn-health-bar > .dn-health-item + .dn-health-item {
+  padding-left: 1rem;
+  border-left: 1px solid var(--border);
+  margin-left: 0;
+}
+
+/* ── PICKER: backdrop blur ───────────────────────────────────── */
+.dn-project-picker {
+  backdrop-filter: blur(6px);
+}
+@keyframes dn-picker-in {
+  from { opacity: 0; transform: scale(0.96) translateY(8px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+.dn-project-picker-inner {
+  animation: dn-picker-in 0.18s ease-out forwards;
+}
+
+/* ── COMPOSE STEP: active highlight ──────────────────────────── */
+.dn-compose-step:focus-within .dn-step-num {
+  background: rgba(167,139,250,0.22);
+  border-color: rgba(167,139,250,0.6);
+  box-shadow: 0 0 0 3px rgba(167,139,250,0.10);
+}
+.dn-compose-step:focus-within .dn-step-label {
+  color: var(--ice);
+}
+
+/* ── REFRESH BUTTON: spin on click ───────────────────────────── */
+.dn-btn-icon.spinning svg {
+  animation: dn-spin 0.7s linear infinite;
+}
+
+/* ── RESPONSIVE: 700px+ tweaks ───────────────────────────────── */
+@media (max-width: 700px) {
+  .dn-batch-right {
+    position: static;    /* don't sticky on mobile */
+  }
+  .dn-topbar {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding-bottom: 0.5rem;
+  }
+  .dn-topbar-tabs {
+    width: 100%;
+  }
+  .dn-panel-header {
+    flex-direction: column;
+  }
+  .dn-batch-panel-grid {
+    grid-template-columns: 1fr;
+  }
+}

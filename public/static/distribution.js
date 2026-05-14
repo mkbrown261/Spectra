@@ -234,7 +234,11 @@ function bindUI() {
     });
   });
 
-  $('btn-refresh-queue')?.addEventListener('click', () => loadQueue());
+  $('btn-refresh-queue')?.addEventListener('click', () => {
+    const btn = $('btn-refresh-queue');
+    btn?.classList.add('spinning');
+    loadQueue().finally(() => btn?.classList.remove('spinning'));
+  });
 
   $$('.dn-btn-connect').forEach(btn => {
     btn.addEventListener('click', () => startOAuth(btn.dataset.platform));
@@ -346,7 +350,12 @@ function switchTab(tab) {
   DN.activeTab = tab;
   $$('.dn-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   $$('.dn-panel').forEach(p => p.classList.toggle('active', p.id === `dn-panel-${tab}`));
-  if (tab === 'metrics') initLiveChart();
+  // Scroll panel into view smoothly
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+  if (tab === 'metrics') {
+    initLiveChart();
+    updateMetricsStats();
+  }
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -703,6 +712,43 @@ async function pullMetrics(postId) {
 /* ════════════════════════════════════════════════════════════════
    LIVE METRICS CHART
    ════════════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════════
+   METRICS STATS
+   ════════════════════════════════════════════════════════════════ */
+function updateMetricsStats() {
+  const posted = DN.queue.filter(p => p.status === 'posted');
+  const withMetrics = posted.filter(p => p.views_24h != null);
+
+  const totalPosts = posted.length;
+  const totalViews = withMetrics.reduce((s, p) => s + (p.views_24h || 0), 0);
+  const avgViews   = withMetrics.length ? Math.round(totalViews / withMetrics.length) : null;
+
+  // Top platform by views
+  const byPlatform = {};
+  withMetrics.forEach(p => {
+    byPlatform[p.platform] = (byPlatform[p.platform] || 0) + (p.views_24h || 0);
+  });
+  const topPlatform = Object.entries(byPlatform).sort((a,b) => b[1]-a[1])[0]?.[0] || null;
+
+  function setStatVal(id, val) {
+    const el = $(id);
+    if (!el) return;
+    const prev = el.textContent;
+    const next = val != null ? fmtNum(val) : '—';
+    if (prev !== next) {
+      el.textContent = next;
+      el.classList.remove('updated');
+      void el.offsetWidth; // reflow to restart animation
+      el.classList.add('updated');
+    }
+  }
+
+  setStatVal('metric-total-posts',  totalPosts);
+  setStatVal('metric-total-views',  totalViews || null);
+  setStatVal('metric-top-platform', topPlatform ? topPlatform.slice(0,2).toUpperCase() : null);
+  setStatVal('metric-avg-views',    avgViews);
+}
+
 function initLiveChart() {
   const canvas = $('dn-live-chart');
   if (!canvas) return;
