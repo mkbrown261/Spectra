@@ -2077,6 +2077,70 @@ app.post('/api/attention/rewrite', requireAuth, async (c) => {
   } catch (err: any) { return c.json({ error: err.message }, 500) }
 })
 
+// POST /api/attention/prescore — pre-publish script scorer (Video Generator lite panel)
+// Takes a prompt/script + platform, returns hook score 0-100, verdict, single fix, and
+// an improved version of the prompt ready to drop back into the generator.
+app.post('/api/attention/prescore', requireAuth, async (c) => {
+  try {
+    const body = await c.req.json()
+    const { prompt = '', platform = 'ads', model = '', style_preset = '' } = body
+    if (!prompt?.trim()) return c.json({ error: 'prompt required' }, 400)
+
+    const ai = getAIClient(c.env)
+
+    const systemPrompt = `You are Spectra's Pre-Publish Script Scorer — an elite AI content strategist embedded inside a video generation tool.
+A user is about to generate a video shot. You receive their shot prompt and must evaluate it BEFORE they waste a generation credit on something that won't perform.
+
+You must return a single valid JSON object — no markdown, no explanation, just JSON:
+{
+  "hook_score": <0-100 integer>,
+  "verdict": "<one punchy sentence — what works or what's broken>",
+  "biggest_issue": "<the single most important thing killing performance — be specific and brutal>",
+  "fix": "<one concrete, actionable fix — rewrite the weak part>",
+  "improved_prompt": "<the full improved prompt, ready to paste directly into the generator — same intent, stronger execution>",
+  "platform_fit": <0-100 integer — how well this prompt fits the selected platform>,
+  "flags": ["<any red flags: vague subject, no motion, no emotion, no hook, weak CTA, etc.>"]
+}
+
+Scoring rubric for hook_score:
+- 90-100: Immediately arresting — clear subject, strong motion, emotional pull, cinematic specificity
+- 70-89: Solid — good concept, minor gaps in specificity or motion language
+- 50-69: Mediocre — vague subject, generic action, or missing visual tension
+- 30-49: Weak — no hook, no motion, nothing to stop a scroll
+- 0-29: Dead on arrival — too abstract, no visual, no emotion
+
+Platform context: ${platform === 'ads' ? 'Paid ad — must grab attention in first 1-2 seconds, strong visual hook required' : platform === 'tiktok' ? 'TikTok — pattern interrupt essential, kinetic energy, relatable or surprising' : platform === 'instagram' ? 'Instagram Reel — aesthetic quality, aspirational or emotional resonance' : platform === 'youtube' ? 'YouTube — can build slower but needs strong opening image' : 'General social — hook-first thinking'}.
+${model ? `Generation model: ${model} — optimize prompt language for this model's strengths.` : ''}
+${style_preset ? `Style preset active: ${style_preset} — keep improved prompt consistent with this style.` : ''}`
+
+    const userPrompt = `Score this shot prompt:\n\n"${prompt.trim()}"\n\nReturn JSON only.`
+
+    const resp = await ai.chat.completions.create({
+      model:       'openai/gpt-4o',
+      messages:    [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+      temperature: 0.3,
+      max_tokens:  600,
+    })
+
+    const raw = resp.choices[0]?.message?.content?.trim() || '{}'
+    let result: any = {}
+    try {
+      const m = raw.match(/\{[\s\S]*\}/)
+      if (m) result = JSON.parse(m[0])
+    } catch { result = { hook_score: 50, verdict: 'Could not parse score', biggest_issue: 'Unknown', fix: 'Try a more specific prompt', improved_prompt: prompt, platform_fit: 50, flags: [] } }
+
+    return c.json({
+      hook_score:      Math.min(100, Math.max(0, result.hook_score ?? 50)),
+      verdict:         result.verdict         ?? 'Analysis incomplete',
+      biggest_issue:   result.biggest_issue   ?? '',
+      fix:             result.fix             ?? '',
+      improved_prompt: result.improved_prompt ?? prompt,
+      platform_fit:    Math.min(100, Math.max(0, result.platform_fit ?? 50)),
+      flags:           Array.isArray(result.flags) ? result.flags : [],
+    })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
 app.post('/api/attention/score', requireAuth, async (c) => {
   try {
     const body = await c.req.json()
@@ -2529,11 +2593,90 @@ function videoGeneratorPage(): string {
           </button>
           <span class="vg-enhance-mode-label" id="enhance-mode-label">cinematic mode</span>
           <div class="vg-enhance-divider"></div>
+          <button class="vg-btn-prescore" id="btn-prescore" title="Score this script before generating — catch weak hooks before you waste a credit">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+            Score Script
+          </button>
+          <div class="vg-enhance-divider"></div>
           <span class="vg-enhance-note">GPT-4o rewrite</span>
           <span class="vg-bible-active-badge" id="vg-bible-dot" style="display:none" title="Style bible injected into every enhance">
             <svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="4" fill="#34D399"/></svg>
             <span id="vg-bible-tip">bible active</span>
           </span>
+        </div>
+      </div>
+
+      <!-- Pre-Publish Script Score Panel -->
+      <div class="vg-prescore-panel" id="vg-prescore-panel" style="display:none">
+        <div class="vg-prescore-header">
+          <div class="vg-prescore-title">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+            Script Score
+          </div>
+          <div class="vg-prescore-header-right">
+            <a href="/tools/attention-engine/" target="_blank" class="vg-prescore-fulllink" title="Open full Attention Engine">
+              Full Analysis
+              <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+            </a>
+            <button class="vg-prescore-close" id="btn-prescore-close" title="Close">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Loading state -->
+        <div class="vg-prescore-loading" id="vg-prescore-loading" style="display:none">
+          <svg class="vg-prescore-spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" opacity="0.25"/><path d="M21 12a9 9 0 00-9-9" stroke-linecap="round"/></svg>
+          Analyzing your script…
+        </div>
+
+        <!-- Results state -->
+        <div class="vg-prescore-results" id="vg-prescore-results" style="display:none">
+          <!-- Score ring + verdict -->
+          <div class="vg-prescore-top">
+            <div class="vg-prescore-ring-wrap">
+              <svg class="vg-prescore-ring" width="56" height="56" viewBox="0 0 56 56">
+                <circle cx="28" cy="28" r="22" fill="none" stroke="rgba(255,255,255,0.07)" stroke-width="5"/>
+                <circle id="vg-prescore-ring-fill" cx="28" cy="28" r="22" fill="none" stroke="#A78BFA" stroke-width="5"
+                  stroke-linecap="round" stroke-dasharray="138.2" stroke-dashoffset="138.2"
+                  transform="rotate(-90 28 28)" style="transition:stroke-dashoffset 0.7s ease,stroke 0.4s"/>
+              </svg>
+              <span class="vg-prescore-ring-num" id="vg-prescore-num">—</span>
+            </div>
+            <div class="vg-prescore-verdict-wrap">
+              <div class="vg-prescore-verdict" id="vg-prescore-verdict">—</div>
+              <div class="vg-prescore-flags" id="vg-prescore-flags"></div>
+            </div>
+          </div>
+
+          <!-- Issue + Fix -->
+          <div class="vg-prescore-issue-row" id="vg-prescore-issue-row">
+            <div class="vg-prescore-issue-label">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#f87171" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+              Issue
+            </div>
+            <div class="vg-prescore-issue-text" id="vg-prescore-issue"></div>
+            <div class="vg-prescore-fix-label">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#34D399" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+              Fix
+            </div>
+            <div class="vg-prescore-fix-text" id="vg-prescore-fix"></div>
+          </div>
+
+          <!-- Improved prompt -->
+          <div class="vg-prescore-improved-wrap" id="vg-prescore-improved-wrap">
+            <div class="vg-prescore-improved-label">Improved Prompt</div>
+            <div class="vg-prescore-improved-text" id="vg-prescore-improved"></div>
+            <button class="vg-btn-prescore-apply" id="btn-prescore-apply">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="20 6 9 17 4 12"/></svg>
+              Use This Prompt
+            </button>
+          </div>
+        </div>
+
+        <!-- Empty state -->
+        <div class="vg-prescore-empty" id="vg-prescore-empty">
+          Write your shot prompt above, then click <strong>Score Script</strong> to catch weak hooks before you generate.
         </div>
       </div>
 

@@ -3499,6 +3499,9 @@ function bindUI() {
 
   // Init model type badge
   updateImageRequirement(VG.selectedModel);
+
+  // Init pre-publish script scorer
+  initPrescore();
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -3987,4 +3990,212 @@ function renderDeepDive(modelId, models) {
 function setText(id, val) {
   const el = $(id);
   if (el) el.textContent = val;
+}
+
+/* ════════════════════════════════════════════════════════════════
+   PRE-PUBLISH SCRIPT SCORER
+   Lite panel embedded in Video Generator — scores prompts before
+   the user spends a generation credit.
+   ════════════════════════════════════════════════════════════════ */
+
+/* ── State ───────────────────────────────────────────────────── */
+const PRESCORE = {
+  open:           false,
+  loading:        false,
+  lastPrompt:     '',
+  debounceTimer:  null,
+  DEBOUNCE_MS:    1400,          // ms idle before auto-rescore
+  MIN_AUTO_LEN:   30,            // minimum prompt length for auto-score
+};
+
+/* ── Init — called from bindUI() ─────────────────────────────── */
+function initPrescore() {
+  // Open / close toggle on Score Script button
+  $('btn-prescore')?.addEventListener('click', togglePrescorePanel);
+
+  // Close button inside panel
+  $('btn-prescore-close')?.addEventListener('click', closePrescorePanel);
+
+  // Apply improved prompt
+  $('btn-prescore-apply')?.addEventListener('click', applyImprovedPrompt);
+
+  // Auto-rescore: debounced on prompt input
+  $('vg-prompt')?.addEventListener('input', onPromptInputForPrescore);
+}
+
+/* ── Open / Close ────────────────────────────────────────────── */
+function togglePrescorePanel() {
+  if (PRESCORE.open) {
+    closePrescorePanel();
+  } else {
+    openPrescorePanel();
+  }
+}
+
+function openPrescorePanel() {
+  const panel = $('vg-prescore-panel');
+  if (!panel) return;
+  PRESCORE.open = true;
+  panel.style.display = 'flex';
+  // Show empty state if no results yet, else keep existing results
+  const results  = $('vg-prescore-results');
+  const loading  = $('vg-prescore-loading');
+  const empty    = $('vg-prescore-empty');
+  if (!results || results.style.display === 'none') {
+    showPrescoreState('empty');
+  }
+  // Auto-run if there is already a prompt
+  const prompt = ($('vg-prompt')?.value || '').trim();
+  if (prompt.length >= PRESCORE.MIN_AUTO_LEN && (!PRESCORE.lastPrompt || PRESCORE.lastPrompt !== prompt)) {
+    runPrescore();
+  }
+}
+
+function closePrescorePanel() {
+  const panel = $('vg-prescore-panel');
+  if (!panel) return;
+  PRESCORE.open = false;
+  panel.style.display = 'none';
+}
+
+/* ── State helpers ───────────────────────────────────────────── */
+function showPrescoreState(state) {
+  // state: 'loading' | 'results' | 'empty'
+  const loading = $('vg-prescore-loading');
+  const results = $('vg-prescore-results');
+  const empty   = $('vg-prescore-empty');
+  if (loading) loading.style.display = state === 'loading' ? 'flex' : 'none';
+  if (results) results.style.display = state === 'results' ? 'block' : 'none';
+  if (empty)   empty.style.display   = state === 'empty'   ? 'flex'  : 'none';
+}
+
+/* ── Core scoring function ───────────────────────────────────── */
+async function runPrescore() {
+  if (PRESCORE.loading) return;
+
+  const prompt       = ($('vg-prompt')?.value || '').trim();
+  const platform     = VG.platform || 'instagram';
+  const model        = VG.selectedModel || '';
+  const style_preset = VG.selectedPreset || '';
+
+  if (!prompt) {
+    if (PRESCORE.open) showPrescoreState('empty');
+    return;
+  }
+
+  PRESCORE.loading    = true;
+  PRESCORE.lastPrompt = prompt;
+
+  // Open panel automatically if not already open
+  if (!PRESCORE.open) openPrescorePanel();
+  showPrescoreState('loading');
+
+  try {
+    const res  = await api('POST', '/api/attention/prescore', { prompt, platform, model, style_preset });
+    const data = await res.json();
+
+    if (!res.ok) throw new Error(data.error || 'Scoring failed');
+
+    renderPrescoreResults(data);
+    showPrescoreState('results');
+  } catch (err) {
+    showToast('Script scoring failed: ' + err.message, true);
+    showPrescoreState('empty');
+  } finally {
+    PRESCORE.loading = false;
+  }
+}
+
+/* ── Render results ──────────────────────────────────────────── */
+function renderPrescoreResults(data) {
+  const score   = Math.max(0, Math.min(100, Math.round(data.hook_score || 0)));
+  const verdict = data.verdict        || '';
+  const issue   = data.biggest_issue  || '';
+  const fix     = data.fix            || '';
+  const improved= data.improved_prompt|| '';
+  const flags   = Array.isArray(data.flags) ? data.flags : [];
+
+  /* ── Score ring ── */
+  const ring = $('vg-prescore-ring-fill');
+  if (ring) {
+    const radius      = parseFloat(ring.getAttribute('r') || '28');
+    const circumf     = 2 * Math.PI * radius;
+    const dashOffset  = circumf - (circumf * score / 100);
+    ring.style.strokeDasharray  = `${circumf}`;
+    ring.style.strokeDashoffset = `${dashOffset}`;
+    // Remove old colour classes
+    ring.classList.remove('vg-prescore-ring-great','vg-prescore-ring-good','vg-prescore-ring-ok','vg-prescore-ring-weak','vg-prescore-ring-dead');
+    if      (score >= 85) ring.classList.add('vg-prescore-ring-great');
+    else if (score >= 70) ring.classList.add('vg-prescore-ring-good');
+    else if (score >= 50) ring.classList.add('vg-prescore-ring-ok');
+    else if (score >= 30) ring.classList.add('vg-prescore-ring-weak');
+    else                  ring.classList.add('vg-prescore-ring-dead');
+  }
+
+  const numEl = $('vg-prescore-num');
+  if (numEl) numEl.textContent = score;
+
+  /* ── Verdict ── */
+  const verdictEl = $('vg-prescore-verdict');
+  if (verdictEl) verdictEl.textContent = verdict;
+
+  /* ── Flags ── */
+  const flagsEl = $('vg-prescore-flags');
+  if (flagsEl) {
+    if (flags.length > 0) {
+      flagsEl.style.display = 'flex';
+      flagsEl.innerHTML = flags.map(f =>
+        `<span class="vg-prescore-flag">${escHtml(f)}</span>`
+      ).join('');
+    } else {
+      flagsEl.style.display = 'none';
+      flagsEl.innerHTML = '';
+    }
+  }
+
+  /* ── Biggest issue ── */
+  const issueEl = $('vg-prescore-issue');
+  if (issueEl) issueEl.textContent = issue || '—';
+
+  /* ── Fix ── */
+  const fixEl = $('vg-prescore-fix');
+  if (fixEl) fixEl.textContent = fix || '—';
+
+  /* ── Improved prompt ── */
+  const improvedEl = $('vg-prescore-improved');
+  if (improvedEl) {
+    improvedEl.textContent = improved;
+    improvedEl.dataset.improved = improved;
+  }
+
+  /* ── Improved wrap — hide if no suggestion ── */
+  const improvedWrap = $('vg-prescore-improved-wrap');
+  if (improvedWrap) improvedWrap.style.display = improved ? 'block' : 'none';
+}
+
+/* ── Apply improved prompt to textarea ──────────────────────── */
+function applyImprovedPrompt() {
+  const improvedEl = $('vg-prescore-improved');
+  const textarea   = $('vg-prompt');
+  if (!improvedEl || !textarea) return;
+
+  const improved = improvedEl.dataset.improved || improvedEl.textContent || '';
+  if (!improved) return;
+
+  textarea.value = improved;
+  updateCharCount();
+  PRESCORE.lastPrompt = improved;
+  showToast('Improved prompt applied ✓');
+}
+
+/* ── Debounced auto-rescore on prompt input ──────────────────── */
+function onPromptInputForPrescore() {
+  if (!PRESCORE.open) return;               // only auto-score if panel is open
+  clearTimeout(PRESCORE.debounceTimer);
+  PRESCORE.debounceTimer = setTimeout(() => {
+    const prompt = ($('vg-prompt')?.value || '').trim();
+    if (prompt.length >= PRESCORE.MIN_AUTO_LEN && prompt !== PRESCORE.lastPrompt) {
+      runPrescore();
+    }
+  }, PRESCORE.DEBOUNCE_MS);
 }
