@@ -29,9 +29,9 @@
     bindActions();
     bindResultsButtons();
     injectToast();
-    initKeysDrawer();
+    initConnectionsDrawer();
     initURLFetch();
-    loadStoredKeys();
+    loadConnectionStatus();
   });
 
   /* ══════════════════════════════════════════════════════════════════
@@ -52,6 +52,7 @@
             youtube: 'https://www.youtube.com/watch?v=...',
             twitter: 'https://twitter.com/user/status/...',
             facebook: 'https://www.facebook.com/watch/?v=...',
+            bluesky: 'https://bsky.app/profile/yourhandle/post/...',
             ads: 'Paste ad URL or leave blank...',
           };
           urlInput.placeholder = placeholders[state.platform] || 'Paste your content URL...';
@@ -1014,84 +1015,24 @@ METRICS ENTERED
   }
 
   /* ══════════════════════════════════════════════════════════════════
-     API KEYS DRAWER
+     CONNECTIONS DRAWER — YouTube OAuth + Bluesky App Password
   ══════════════════════════════════════════════════════════════════ */
-  const STORAGE_KEY = 'spectra_ae_keys';
 
-  function getStoredKeys() {
-    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch { return {}; }
-  }
+  // Track connection state in memory (loaded from server on open)
+  const connState = { youtube: false, bluesky: false };
 
-  function saveKey(name, value) {
-    const keys = getStoredKeys();
-    keys[name] = value;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(keys));
-  }
-
-  function loadStoredKeys() {
-    const keys = getStoredKeys();
-    if (keys.youtube) {
-      const el = $('key-youtube');
-      if (el) { el.value = keys.youtube; el.classList.add('has-value'); }
-      setKeyStatus('yt', 'active', '● Connected');
-    }
-    if (keys.meta) {
-      const el = $('key-meta');
-      if (el) { el.value = keys.meta; el.classList.add('has-value'); }
-      setKeyStatus('meta', 'active', '● Connected');
-    }
-    updateSummary(keys);
-    updateNavDot(keys);
-  }
-
-  function setKeyStatus(blockId, state, text) {
-    const dot  = document.querySelector(`#${blockId}-status .ae-key-dot`);
-    const label = document.querySelector(`#${blockId}-status .ae-key-status-text`);
-    if (dot)  { dot.className = `ae-key-dot ${state}`; }
-    if (label){ label.className = `ae-key-status-text ${state}`; label.textContent = text; }
-    // Mark block as connected
-    const block = document.querySelector(`[data-platform="${blockId === 'yt' ? 'youtube' : 'meta'}"]`);
-    if (block && state === 'active') block.classList.add('connected');
-  }
-
-  function updateSummary(keys) {
-    const ytEl  = $('sum-youtube');
-    const igEl  = $('sum-instagram');
-    const fbEl  = $('sum-facebook');
-    if (ytEl) {
-      ytEl.textContent   = keys.youtube ? '✓ Key saved' : '— Not set';
-      ytEl.className     = `ae-sum-val ${keys.youtube ? 'connected' : 'missing'}`;
-    }
-    if (igEl) {
-      igEl.textContent   = keys.meta ? '✓ Token saved' : '— Not set';
-      igEl.className     = `ae-sum-val ${keys.meta ? 'connected' : 'missing'}`;
-    }
-    if (fbEl) {
-      fbEl.textContent   = keys.meta ? '✓ Token saved' : '— Not set';
-      fbEl.className     = `ae-sum-val ${keys.meta ? 'connected' : 'missing'}`;
-    }
-  }
-
-  function updateNavDot(keys) {
-    const dot = $('keys-status-dot');
-    if (!dot) return;
-    const hasYT   = !!keys.youtube;
-    const hasMeta = !!keys.meta;
-    if (hasYT && hasMeta)        { dot.className = 'ae-keys-status-dot has-keys'; }
-    else if (hasYT || hasMeta)   { dot.className = 'ae-keys-status-dot partial'; }
-    else                          { dot.className = 'ae-keys-status-dot'; }
-  }
-
-  function initKeysDrawer() {
-    const overlay = $('keys-overlay');
-    const drawer  = $('keys-drawer');
-    const btnOpen = $('btn-open-keys');
+  function initConnectionsDrawer() {
+    const overlay  = $('keys-overlay');
+    const drawer   = $('keys-drawer');
+    const btnOpen  = $('btn-open-keys');
     const btnClose = $('btn-close-keys');
 
     function openDrawer() {
       drawer?.classList.add('open');
       overlay?.classList.add('open');
       document.body.style.overflow = 'hidden';
+      // Refresh status from server each time drawer opens
+      loadConnectionStatus();
     }
     function closeDrawer() {
       drawer?.classList.remove('open');
@@ -1103,31 +1044,7 @@ METRICS ENTERED
     btnClose?.addEventListener('click', closeDrawer);
     overlay?.addEventListener('click', closeDrawer);
 
-    // Save buttons
-    $$('.ae-key-save').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const keyName = btn.dataset.key;
-        const inputId = `key-${keyName}`;
-        const input   = $(inputId);
-        if (!input) return;
-        const val = input.value.trim();
-        if (!val) { showToast('Enter a key first', 'error'); return; }
-        saveKey(keyName, val);
-        input.classList.add('has-value');
-        // Animate button
-        btn.textContent = 'Saved ✓';
-        btn.classList.add('saved');
-        setTimeout(() => { btn.textContent = 'Save'; btn.classList.remove('saved'); }, 2200);
-        const statusId = keyName === 'youtube' ? 'yt' : 'meta';
-        setKeyStatus(statusId, 'active', '● Connected');
-        const keys = getStoredKeys();
-        updateSummary(keys);
-        updateNavDot(keys);
-        showToast(`${keyName === 'youtube' ? 'YouTube' : 'Meta'} key saved`, 'success');
-      });
-    });
-
-    // Toggle show/hide key inputs
+    // Toggle show/hide password inputs
     $$('.ae-key-toggle').forEach(btn => {
       btn.addEventListener('click', () => {
         const input = $(btn.dataset.target);
@@ -1135,6 +1052,164 @@ METRICS ENTERED
         input.type = input.type === 'password' ? 'text' : 'password';
       });
     });
+
+    // YouTube OAuth connect
+    $('btn-connect-youtube')?.addEventListener('click', () => {
+      const btn = $('btn-connect-youtube');
+      btn.classList.add('loading');
+      btn.textContent = 'Opening Google sign-in...';
+      // Open OAuth popup
+      const popup = window.open('/api/auth/youtube/start', 'yt-oauth', 'width=500,height=650,left=200,top=100');
+      // Listen for result message from callback page
+      const handler = (e) => {
+        if (e.data?.type !== 'yt-auth') return;
+        window.removeEventListener('message', handler);
+        btn.classList.remove('loading');
+        if (e.data.success) {
+          setYouTubeConnected(e.data.channelName);
+          showToast(`YouTube connected: ${e.data.channelName}`, 'success');
+        } else {
+          btn.innerHTML = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg> Connect YouTube Account`;
+          showToast('YouTube connection failed: ' + (e.data.error || 'cancelled'), 'error');
+        }
+      };
+      window.addEventListener('message', handler);
+      // Cleanup if popup closed without message
+      const checkClosed = setInterval(() => {
+        if (popup?.closed) {
+          clearInterval(checkClosed);
+          window.removeEventListener('message', handler);
+          if (!connState.youtube) {
+            btn.classList.remove('loading');
+            btn.innerHTML = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg> Connect YouTube Account`;
+          }
+        }
+      }, 800);
+    });
+
+    // YouTube disconnect
+    $('btn-disconnect-youtube')?.addEventListener('click', async () => {
+      try {
+        await fetch('/api/auth/youtube/disconnect', { method: 'DELETE' });
+        setYouTubeDisconnected();
+        showToast('YouTube disconnected', 'success');
+      } catch { showToast('Disconnect failed', 'error'); }
+    });
+
+    // Bluesky connect
+    $('btn-connect-bluesky')?.addEventListener('click', async () => {
+      const handle   = $('bsky-handle')?.value.trim();
+      const password = $('bsky-password')?.value.trim();
+      if (!handle || !password) { showToast('Enter your handle and app password', 'error'); return; }
+      const btn = $('btn-connect-bluesky');
+      btn.textContent = 'Connecting...';
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/attention/bluesky/connect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ handle, app_password: password }),
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        setBlueskyConnected(data.handle);
+        // Clear inputs for security
+        if ($('bsky-handle'))   $('bsky-handle').value   = '';
+        if ($('bsky-password')) $('bsky-password').value = '';
+        showToast(`Bluesky connected: @${data.handle}`, 'success');
+      } catch (err) {
+        showToast('Bluesky error: ' + err.message, 'error');
+        btn.textContent = 'Connect';
+        btn.disabled = false;
+      }
+    });
+
+    // Bluesky disconnect
+    $('btn-disconnect-bluesky')?.addEventListener('click', async () => {
+      try {
+        await fetch('/api/attention/bluesky/disconnect', { method: 'DELETE' });
+        setBlueskyDisconnected();
+        showToast('Bluesky disconnected', 'success');
+      } catch { showToast('Disconnect failed', 'error'); }
+    });
+  }
+
+  async function loadConnectionStatus() {
+    // Check YouTube status
+    try {
+      const ytRes = await fetch('/api/auth/youtube/status');
+      const ytData = await ytRes.json();
+      if (ytData.connected) setYouTubeConnected(ytData.channelName);
+      else setYouTubeDisconnected();
+    } catch {}
+
+    // Check Bluesky status
+    try {
+      const bskyRes = await fetch('/api/attention/bluesky/status');
+      const bskyData = await bskyRes.json();
+      if (bskyData.connected) setBlueskyConnected(bskyData.handle);
+      else setBlueskyDisconnected();
+    } catch {}
+  }
+
+  function setYouTubeConnected(channelName) {
+    connState.youtube = true;
+    $('yt-connect-area') && ($('yt-connect-area').style.display = 'none');
+    $('yt-connected-area') && ($('yt-connected-area').style.display = 'block');
+    if ($('yt-channel-name')) $('yt-channel-name').textContent = channelName || 'YouTube Connected';
+    setBlockStatus('yt-status', 'active', '● Connected');
+    const sumYt = $('sum-youtube');
+    if (sumYt) { sumYt.textContent = `✓ ${channelName || 'Connected'}`; sumYt.className = 'ae-sum-val connected'; }
+    updateNavDot();
+  }
+
+  function setYouTubeDisconnected() {
+    connState.youtube = false;
+    $('yt-connect-area') && ($('yt-connect-area').style.display = 'block');
+    $('yt-connected-area') && ($('yt-connected-area').style.display = 'none');
+    const btn = $('btn-connect-youtube');
+    if (btn) btn.innerHTML = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg> Connect YouTube Account`;
+    setBlockStatus('yt-status', 'inactive', 'Not connected');
+    const sumYt = $('sum-youtube');
+    if (sumYt) { sumYt.textContent = '— Not connected'; sumYt.className = 'ae-sum-val missing'; }
+    updateNavDot();
+  }
+
+  function setBlueskyConnected(handle) {
+    connState.bluesky = true;
+    $('bsky-connect-area') && ($('bsky-connect-area').style.display = 'none');
+    $('bsky-connected-area') && ($('bsky-connected-area').style.display = 'block');
+    if ($('bsky-handle-display')) $('bsky-handle-display').textContent = `@${handle}`;
+    setBlockStatus('bsky-status', 'active', '● Connected');
+    const sumBsky = $('sum-bluesky');
+    if (sumBsky) { sumBsky.textContent = `✓ @${handle}`; sumBsky.className = 'ae-sum-val connected'; }
+    updateNavDot();
+  }
+
+  function setBlueskyDisconnected() {
+    connState.bluesky = false;
+    $('bsky-connect-area') && ($('bsky-connect-area').style.display = 'block');
+    $('bsky-connected-area') && ($('bsky-connected-area').style.display = 'none');
+    setBlockStatus('bsky-status', 'inactive', 'Not connected');
+    const sumBsky = $('sum-bluesky');
+    if (sumBsky) { sumBsky.textContent = '— Not connected'; sumBsky.className = 'ae-sum-val missing'; }
+    updateNavDot();
+  }
+
+  function setBlockStatus(statusId, state, text) {
+    const dot   = document.querySelector(`#${statusId} .ae-key-dot`);
+    const label = document.querySelector(`#${statusId} .ae-key-status-text`);
+    if (dot)   dot.className = `ae-key-dot ${state}`;
+    if (label) { label.className = `ae-key-status-text ${state}`; label.textContent = text; }
+  }
+
+  function updateNavDot() {
+    const dot = $('keys-status-dot');
+    if (!dot) return;
+    const count = (connState.youtube ? 1 : 0) + (connState.bluesky ? 1 : 0);
+    if (count >= 2)     dot.className = 'ae-keys-status-dot has-keys';
+    else if (count >= 1) dot.className = 'ae-keys-status-dot partial';
+    else                 dot.className = 'ae-keys-status-dot';
   }
 
   /* ══════════════════════════════════════════════════════════════════
@@ -1177,6 +1252,7 @@ METRICS ENTERED
     else if (url.includes('facebook.com') || url.includes('fb.watch')) detected = 'facebook';
     else if (url.includes('tiktok.com'))     detected = 'tiktok';
     else if (url.includes('twitter.com') || url.includes('x.com')) detected = 'twitter';
+    else if (url.includes('bsky.app'))       detected = 'bluesky';
 
     if (detected) {
       const btn = document.querySelector(`.ae-platform-btn[data-platform="${detected}"]`);
@@ -1189,31 +1265,19 @@ METRICS ENTERED
   }
 
   async function tryFetchURL(url) {
-    const keys = getStoredKeys();
-
-    // Check if we have the key for this platform
-    const isYT   = url.includes('youtube.com') || url.includes('youtu.be');
-    const isIG   = url.includes('instagram.com');
-    const isFB   = url.includes('facebook.com') || url.includes('fb.watch');
-
-    // Show spinner
     const spinner = $('url-spinner');
     if (spinner) spinner.classList.add('active');
 
     try {
       const params = new URLSearchParams({ url });
-      if (keys.youtube) params.set('yt_key', keys.youtube);
-      if (keys.meta)    params.set('fb_token', keys.meta);
-
       const res  = await fetch(`/api/fetch-url?${params}`);
       const data = await res.json();
 
       if (spinner) spinner.classList.remove('active');
 
-      if (data.needs_key) {
-        // Show hint to add key
-        const platformName = isYT ? 'YouTube' : isIG ? 'Instagram' : isFB ? 'Facebook' : 'platform';
-        showURLNote(`Add your ${platformName} API key via the API Keys button in the nav to auto-populate metrics.`);
+      // Needs platform connection
+      if (data.needs_connect) {
+        showURLNote(`Connect your ${(data.platform || 'platform').replace(/^\w/, c => c.toUpperCase())} account via the Connections button to auto-populate real metrics.`);
         return;
       }
 
@@ -1223,17 +1287,25 @@ METRICS ENTERED
       }
 
       if (data.error && !data.metrics) {
-        showURLNote('Could not fetch data: ' + data.error);
+        showURLNote(data.error);
         return;
       }
 
       // ✅ Success — populate the form
       if (data.title) {
         showURLPreview(data.thumbnail, data.title, data);
+        // Auto-select platform
+        if (data.platform && data.platform !== 'unknown') {
+          const btn = document.querySelector(`.ae-platform-btn[data-platform="${data.platform}"]`);
+          if (btn && !btn.classList.contains('active')) {
+            $$('.ae-platform-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            state.platform = data.platform;
+          }
+        }
       }
 
       populateMetrics(data);
-
       if (data.notes) showURLNote(data.notes);
 
     } catch (err) {

@@ -14,6 +14,8 @@ type Bindings = {
   ENCRYPTION_KEY:        string   // 32-byte hex string for AES-256-GCM
   JWT_SECRET:            string
   YOUTUBE_API_KEY:       string
+  YOUTUBE_CLIENT_ID:     string
+  YOUTUBE_CLIENT_SECRET: string
   FB_ACCESS_TOKEN:       string
   STRIPE_SECRET_KEY:     string   // sk_live_... or sk_test_...
   STRIPE_WEBHOOK_SECRET: string   // whsec_...
@@ -3055,29 +3057,339 @@ app.post('/api/attention/score', requireAuth, async (c) => {
   } catch (err: any) { return c.json({ error: err.message }, 500) }
 })
 
+/* ══════════════════════════════════════════════════════════════════
+   YOUTUBE OAUTH — /api/auth/youtube/start + /callback + /status + /disconnect
+   Uses Authorization Code flow with youtube.readonly scope
+══════════════════════════════════════════════════════════════════ */
+app.get('/api/auth/youtube/start', requireAuth, async (c) => {
+  const clientId    = c.env.YOUTUBE_CLIENT_ID
+  const redirectUri = 'https://spectra-b8s.pages.dev/api/auth/youtube/callback'
+  if (!clientId) return c.json({ error: 'YouTube OAuth not configured' }, 500)
+  const params = new URLSearchParams({
+    client_id:     clientId,
+    redirect_uri:  redirectUri,
+    response_type: 'code',
+    scope:         'https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/userinfo.email',
+    access_type:   'offline',
+    prompt:        'consent',
+    state:         c.get('userId'),
+  })
+  return c.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`)
+})
+
+app.get('/api/auth/youtube/callback', async (c) => {
+  const code     = c.req.query('code') || ''
+  const state    = c.req.query('state') || ''   // userId
+  const error    = c.req.query('error') || ''
+  if (error || !code) {
+    return c.html(`<html><body><script>window.opener?.postMessage({type:'yt-auth',success:false,error:'${error||'cancelled'}'},'*');window.close();</script></body></html>`)
+  }
+  try {
+    const clientId     = c.env.YOUTUBE_CLIENT_ID
+    const clientSecret = c.env.YOUTUBE_CLIENT_SECRET
+    const redirectUri  = 'https://spectra-b8s.pages.dev/api/auth/youtube/callback'
+    // Exchange code for tokens
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri, grant_type: 'authorization_code' }),
+    })
+    const tokens: any = await tokenRes.json()
+    if (tokens.error) throw new Error(tokens.error_description || tokens.error)
+    // Get channel info
+    const channelRes = await fetch('https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true', {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    })
+    const channelData: any = await channelRes.json()
+    const channel = channelData.items?.[0]
+    const channelName = channel?.snippet?.title || 'YouTube Channel'
+    const channelId   = channel?.id || ''
+    // Encrypt and store tokens in D1
+    const encKey = c.env.ENCRYPTION_KEY
+    const encAccess  = await encryptKey(tokens.access_token,  encKey)
+    const encRefresh = tokens.refresh_token ? await encryptKey(tokens.refresh_token, encKey) : null
+    const userId = state
+    await c.env.DB.prepare(`
+      INSERT INTO platform_connections (user_id, platform, access_token_enc, access_token_iv,
+        refresh_token_enc, refresh_token_iv, channel_id, channel_name, connected_at)
+      VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+      ON CONFLICT(user_id, platform) DO UPDATE SET
+        access_token_enc=excluded.access_token_enc, access_token_iv=excluded.access_token_iv,
+        refresh_token_enc=excluded.refresh_token_enc, refresh_token_iv=excluded.refresh_token_iv,
+        channel_id=excluded.channel_id, channel_name=excluded.channel_name, connected_at=CURRENT_TIMESTAMP
+    `).bind(userId, 'youtube', encAccess.encrypted, encAccess.iv,
+            encRefresh?.encrypted || null, encRefresh?.iv || null,
+            channelId, channelName).run()
+    return c.html(`<html><body><script>window.opener?.postMessage({type:'yt-auth',success:true,channelName:${JSON.stringify(channelName)},channelId:${JSON.stringify(channelId)}},'*');window.close();</script></body></html>`)
+  } catch (err: any) {
+    return c.html(`<html><body><script>window.opener?.postMessage({type:'yt-auth',success:false,error:${JSON.stringify(err.message)}},'*');window.close();</script></body></html>`)
+  }
+})
+
+app.get('/api/auth/youtube/status', requireAuth, async (c) => {
+  const userId = c.get('userId')
+  const row = await c.env.DB.prepare(
+    `SELECT channel_name, channel_id, connected_at FROM platform_connections WHERE user_id=? AND platform='youtube'`
+  ).bind(userId).first<any>()
+  if (!row) return c.json({ connected: false })
+  return c.json({ connected: true, channelName: row.channel_name, channelId: row.channel_id, connectedAt: row.connected_at })
+})
+
+app.delete('/api/auth/youtube/disconnect', requireAuth, async (c) => {
+  const userId = c.get('userId')
+  await c.env.DB.prepare(`DELETE FROM platform_connections WHERE user_id=? AND platform='youtube'`).bind(userId).run()
+  return c.json({ success: true })
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   BLUESKY — /api/attention/bluesky/connect + /posts + /post/:uri/metrics
+   Uses AT Protocol app-password auth — no OAuth needed
+══════════════════════════════════════════════════════════════════ */
+app.post('/api/attention/bluesky/connect', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const { handle, app_password } = await c.req.json()
+    if (!handle || !app_password) return c.json({ error: 'Handle and app password required' }, 400)
+    // Authenticate with Bluesky AT Protocol
+    const authRes = await fetch('https://bsky.social/xrpc/com.atproto.server.createSession', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identifier: handle.replace(/^@/, ''), password: app_password }),
+    })
+    const session: any = await authRes.json()
+    if (session.error) return c.json({ error: session.message || session.error }, 400)
+    // Encrypt and store tokens
+    const encKey     = c.env.ENCRYPTION_KEY
+    const encAccess  = await encryptKey(session.accessJwt,  encKey)
+    const encRefresh = await encryptKey(session.refreshJwt, encKey)
+    await c.env.DB.prepare(`
+      INSERT INTO platform_connections (user_id, platform, access_token_enc, access_token_iv,
+        refresh_token_enc, refresh_token_iv, channel_id, channel_name, connected_at)
+      VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+      ON CONFLICT(user_id, platform) DO UPDATE SET
+        access_token_enc=excluded.access_token_enc, access_token_iv=excluded.access_token_iv,
+        refresh_token_enc=excluded.refresh_token_enc, refresh_token_iv=excluded.refresh_token_iv,
+        channel_id=excluded.channel_id, channel_name=excluded.channel_name, connected_at=CURRENT_TIMESTAMP
+    `).bind(userId, 'bluesky', encAccess.encrypted, encAccess.iv,
+            encRefresh.encrypted, encRefresh.iv,
+            session.did, session.handle).run()
+    return c.json({ success: true, handle: session.handle, did: session.did })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+app.get('/api/attention/bluesky/status', requireAuth, async (c) => {
+  const userId = c.get('userId')
+  const row = await c.env.DB.prepare(
+    `SELECT channel_name, channel_id, connected_at FROM platform_connections WHERE user_id=? AND platform='bluesky'`
+  ).bind(userId).first<any>()
+  if (!row) return c.json({ connected: false })
+  return c.json({ connected: true, handle: row.channel_name, did: row.channel_id, connectedAt: row.connected_at })
+})
+
+app.delete('/api/attention/bluesky/disconnect', requireAuth, async (c) => {
+  const userId = c.get('userId')
+  await c.env.DB.prepare(`DELETE FROM platform_connections WHERE user_id=? AND platform='bluesky'`).bind(userId).run()
+  return c.json({ success: true })
+})
+
+app.get('/api/attention/bluesky/posts', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const row = await c.env.DB.prepare(
+      `SELECT access_token_enc, access_token_iv, refresh_token_enc, refresh_token_iv, channel_id, channel_name
+       FROM platform_connections WHERE user_id=? AND platform='bluesky'`
+    ).bind(userId).first<any>()
+    if (!row) return c.json({ error: 'Bluesky not connected', needs_connect: true }, 401)
+    const accessToken = await decryptKey(row.access_token_enc, row.access_token_iv, c.env.ENCRYPTION_KEY)
+    const feedRes = await fetch(
+      `https://bsky.social/xrpc/app.bsky.feed.getAuthorFeed?actor=${encodeURIComponent(row.channel_id)}&limit=20&filter=posts_no_replies`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    )
+    if (feedRes.status === 401) {
+      // Try refresh
+      const refreshToken = await decryptKey(row.refresh_token_enc, row.refresh_token_iv, c.env.ENCRYPTION_KEY)
+      const refreshRes = await fetch('https://bsky.social/xrpc/com.atproto.server.refreshSession', {
+        method: 'POST', headers: { Authorization: `Bearer ${refreshToken}` }
+      })
+      const newSession: any = await refreshRes.json()
+      if (newSession.error) return c.json({ error: 'Session expired — please reconnect Bluesky', needs_connect: true }, 401)
+      const encNew = await encryptKey(newSession.accessJwt, c.env.ENCRYPTION_KEY)
+      await c.env.DB.prepare(`UPDATE platform_connections SET access_token_enc=?, access_token_iv=? WHERE user_id=? AND platform='bluesky'`)
+        .bind(encNew.encrypted, encNew.iv, userId).run()
+      // Retry with new token
+      const retryRes = await fetch(
+        `https://bsky.social/xrpc/app.bsky.feed.getAuthorFeed?actor=${encodeURIComponent(row.channel_id)}&limit=20&filter=posts_no_replies`,
+        { headers: { Authorization: `Bearer ${newSession.accessJwt}` } }
+      )
+      const retryData: any = await retryRes.json()
+      return c.json(formatBskyFeed(retryData))
+    }
+    const feedData: any = await feedRes.json()
+    return c.json(formatBskyFeed(feedData))
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+function formatBskyFeed(data: any) {
+  if (data.error) return { error: data.message || data.error }
+  const posts = (data.feed || []).map((item: any) => {
+    const post = item.post
+    return {
+      uri:          post.uri,
+      cid:          post.cid,
+      text:         post.record?.text || '',
+      createdAt:    post.record?.createdAt || post.indexedAt,
+      likeCount:    post.likeCount    || 0,
+      repostCount:  post.repostCount  || 0,
+      replyCount:   post.replyCount   || 0,
+      quoteCount:   post.quoteCount   || 0,
+      author:       post.author?.handle || '',
+      authorName:   post.author?.displayName || post.author?.handle || '',
+    }
+  })
+  return { posts }
+}
+
+app.get('/api/attention/bluesky/post/metrics', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const uri    = c.req.query('uri') || ''
+    if (!uri) return c.json({ error: 'uri parameter required' }, 400)
+    const row = await c.env.DB.prepare(
+      `SELECT access_token_enc, access_token_iv FROM platform_connections WHERE user_id=? AND platform='bluesky'`
+    ).bind(userId).first<any>()
+    if (!row) return c.json({ error: 'Bluesky not connected', needs_connect: true }, 401)
+    const accessToken = await decryptKey(row.access_token_enc, row.access_token_iv, c.env.ENCRYPTION_KEY)
+    const threadRes = await fetch(
+      `https://bsky.social/xrpc/app.bsky.feed.getPostThread?uri=${encodeURIComponent(uri)}&depth=0`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    )
+    const threadData: any = await threadRes.json()
+    if (threadData.error) return c.json({ error: threadData.message || threadData.error }, 400)
+    const post = threadData.thread?.post
+    if (!post) return c.json({ error: 'Post not found' }, 404)
+    return c.json({
+      uri:         post.uri,
+      text:        post.record?.text || '',
+      createdAt:   post.record?.createdAt || post.indexedAt,
+      likeCount:   post.likeCount   || 0,
+      repostCount: post.repostCount || 0,
+      replyCount:  post.replyCount  || 0,
+      quoteCount:  post.quoteCount  || 0,
+      author:      post.author?.handle || '',
+      authorName:  post.author?.displayName || post.author?.handle || '',
+    })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   FETCH URL — auto-populate metrics from YouTube (OAuth) or Bluesky
+   Also handles YouTube via stored OAuth token (no API key needed from user)
+══════════════════════════════════════════════════════════════════ */
 app.get('/api/fetch-url', async (c) => {
-  const url    = c.req.query('url') || ''
-  const ytKey  = c.req.query('yt_key') || c.env.YOUTUBE_API_KEY || ''
+  const url     = c.req.query('url') || ''
+  const ytKey   = c.req.query('yt_key') || c.env.YOUTUBE_API_KEY || ''
   const fbToken = c.req.query('fb_token') || c.env.FB_ACCESS_TOKEN || ''
   if (!url) return c.json({ error: 'No URL provided' }, 400)
+
+  // ── YouTube ───────────────────────────────────────────────────────
   const ytMatch = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([A-Za-z0-9_-]{11})/)
   if (ytMatch) {
     const videoId = ytMatch[1]
-    if (!ytKey) return c.json({ error:'YouTube API key required', platform:'youtube', needs_key:true }, 200)
+    // Try to get stored OAuth token for the logged-in user first
+    let accessToken = ytKey
     try {
-      const res = await fetch(`https://www.googleapis.com/youtube/v3/videos?id=${videoId}&key=${ytKey}&part=snippet,statistics,contentDetails`)
+      const authHeader = c.req.header('Cookie') || ''
+      const sessionToken = getCookie(c, 'session')
+      if (sessionToken && c.env.ENCRYPTION_KEY) {
+        // Try to find stored YouTube OAuth token — best effort, fall through to API key if not found
+        const decoded: any = await import('hono/jwt').then(m => m.verify(sessionToken, c.env.JWT_SECRET)).catch(() => null)
+        if (decoded?.sub) {
+          const row = await c.env.DB.prepare(
+            `SELECT access_token_enc, access_token_iv FROM platform_connections WHERE user_id=? AND platform='youtube'`
+          ).bind(decoded.sub).first<any>()
+          if (row) accessToken = await decryptKey(row.access_token_enc, row.access_token_iv, c.env.ENCRYPTION_KEY)
+        }
+      }
+    } catch {}
+    if (!accessToken) return c.json({ error: 'Connect your YouTube account via the Connections button to auto-populate metrics.', platform: 'youtube', needs_connect: true }, 200)
+    try {
+      // Use OAuth token if it looks like a JWT, otherwise use as API key
+      const isOAuth = accessToken.length > 100
+      const apiUrl = isOAuth
+        ? `https://www.googleapis.com/youtube/v3/videos?id=${videoId}&part=snippet,statistics,contentDetails`
+        : `https://www.googleapis.com/youtube/v3/videos?id=${videoId}&key=${accessToken}&part=snippet,statistics,contentDetails`
+      const headers: any = isOAuth ? { Authorization: `Bearer ${accessToken}` } : {}
+      const res = await fetch(apiUrl, { headers })
       const data: any = await res.json()
-      if (!data.items?.length) return c.json({ error:'Video not found', platform:'youtube' }, 200)
-      const item=data.items[0]; const stats=item.statistics||{}; const snippet=item.snippet||{}
-      const dur=item.contentDetails?.duration||'PT0S'; const dm=dur.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/)
-      const durSec=(parseInt(dm?.[1]||'0')*3600)+(parseInt(dm?.[2]||'0')*60)+parseInt(dm?.[3]||'0')
-      return c.json({ platform:'youtube', title:snippet.title||'', channel:snippet.channelTitle||'', thumbnail:snippet.thumbnails?.high?.url||'', published:snippet.publishedAt||'', duration_sec:durSec, metrics:{ views:parseInt(stats.viewCount||'0'), likes:parseInt(stats.likeCount||'0'), comments:parseInt(stats.commentCount||'0'), shares:0, saves:0, watch_time_pct:0 }, notes:'Shares/saves/watch time not in public API.' })
-    } catch(err:any) { return c.json({ error:err.message, platform:'youtube' }, 500) }
+      if (!data.items?.length) return c.json({ error: 'Video not found', platform: 'youtube' }, 200)
+      const item = data.items[0]; const stats = item.statistics || {}; const snippet = item.snippet || {}
+      const dur = item.contentDetails?.duration || 'PT0S'
+      const dm = dur.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/)
+      const durSec = (parseInt(dm?.[1] || '0') * 3600) + (parseInt(dm?.[2] || '0') * 60) + parseInt(dm?.[3] || '0')
+      return c.json({ platform: 'youtube', title: snippet.title || '', channel: snippet.channelTitle || '', thumbnail: snippet.thumbnails?.high?.url || '', published: snippet.publishedAt || '', duration_sec: durSec, metrics: { views: parseInt(stats.viewCount || '0'), likes: parseInt(stats.likeCount || '0'), comments: parseInt(stats.commentCount || '0'), shares: 0, saves: 0, watch_time_pct: 0 }, notes: 'Shares/saves/watch time not available via YouTube API.' })
+    } catch (err: any) { return c.json({ error: err.message, platform: 'youtube' }, 500) }
   }
+
+  // ── Bluesky ───────────────────────────────────────────────────────
+  // Bluesky post URLs: https://bsky.app/profile/{handle}/post/{rkey}
+  const bskyMatch = url.match(/bsky\.app\/profile\/([^/]+)\/post\/([A-Za-z0-9]+)/)
+  if (bskyMatch) {
+    const handle = bskyMatch[1]
+    const rkey   = bskyMatch[2]
+    const atUri  = `at://${handle}/app.bsky.feed.post/${rkey}`
+    try {
+      // Try with auth if user is logged in
+      let authHeader = ''
+      try {
+        const sessionToken = getCookie(c, 'session')
+        if (sessionToken) {
+          const decoded: any = await import('hono/jwt').then(m => m.verify(sessionToken, c.env.JWT_SECRET)).catch(() => null)
+          if (decoded?.sub) {
+            const row = await c.env.DB.prepare(
+              `SELECT access_token_enc, access_token_iv FROM platform_connections WHERE user_id=? AND platform='bluesky'`
+            ).bind(decoded.sub).first<any>()
+            if (row) {
+              const token = await decryptKey(row.access_token_enc, row.access_token_iv, c.env.ENCRYPTION_KEY)
+              authHeader = `Bearer ${token}`
+            }
+          }
+        }
+      } catch {}
+      const fetchHeaders: any = authHeader ? { Authorization: authHeader } : {}
+      const threadRes = await fetch(
+        `https://bsky.social/xrpc/app.bsky.feed.getPostThread?uri=${encodeURIComponent(atUri)}&depth=0`,
+        { headers: fetchHeaders }
+      )
+      const threadData: any = await threadRes.json()
+      if (threadData.error) return c.json({ error: 'Could not fetch Bluesky post. Connect your Bluesky account for full access.', platform: 'bluesky', needs_connect: !authHeader }, 200)
+      const post = threadData.thread?.post
+      if (!post) return c.json({ error: 'Post not found', platform: 'bluesky' }, 200)
+      return c.json({
+        platform:    'bluesky',
+        title:       post.record?.text?.slice(0, 80) || 'Bluesky Post',
+        channel:     post.author?.displayName || post.author?.handle || handle,
+        thumbnail:   post.author?.avatar || '',
+        published:   post.record?.createdAt || '',
+        duration_sec: 0,
+        metrics: {
+          views:         0,
+          likes:         post.likeCount   || 0,
+          comments:      post.replyCount  || 0,
+          shares:        post.repostCount || 0,
+          saves:         post.quoteCount  || 0,
+          watch_time_pct: 0,
+        },
+        notes: 'Bluesky metrics: Likes, Replies, Reposts, Quotes. Views/watch time not available.',
+        bsky_uri: atUri,
+      })
+    } catch (err: any) { return c.json({ error: err.message, platform: 'bluesky' }, 500) }
+  }
+
   let dp = 'unknown'
-  if (url.includes('tiktok.com')) dp='tiktok'
-  if (url.includes('twitter.com')||url.includes('x.com')) dp='twitter'
-  return c.json({ platform:dp, error:'Auto-populate not available for this platform.', needs_manual:true })
+  if (url.includes('tiktok.com'))                               dp = 'tiktok'
+  if (url.includes('twitter.com') || url.includes('x.com'))    dp = 'twitter'
+  if (url.includes('instagram.com'))                            dp = 'instagram'
+  return c.json({ platform: dp, error: 'Auto-populate not available for this platform yet.', needs_manual: true })
 })
 
 /* ══════════════════════════════════════════════════════════════════
@@ -4768,9 +5080,9 @@ function attentionEnginePage(): string {
   <a href="/" class="ae-nav-logo"><span class="ae-logo-mark">S</span><span class="ae-logo-text">SPECTRA</span></a>
   <div class="ae-nav-center"><span class="ae-tool-badge"><span class="ae-tool-pip"></span>Attention Engine</span></div>
   <div class="ae-nav-right">
-    <button class="ae-keys-btn" id="btn-open-keys" title="API Keys">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="5.5"/><path d="M21 2l-9.6 9.6"/><path d="M15.5 7.5l3 3"/><path d="M18 5l2 2"/></svg>
-      API Keys
+    <button class="ae-keys-btn" id="btn-open-keys" title="Connect Platforms">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
+      Connections
       <span class="ae-keys-status-dot" id="keys-status-dot"></span>
     </button>
     <a href="/" class="ae-nav-back"><svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M13 8H3M7 4l-4 4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Suite</a>
@@ -4779,44 +5091,112 @@ function attentionEnginePage(): string {
 <div class="ae-drawer-overlay" id="keys-overlay"></div>
 <aside class="ae-keys-drawer" id="keys-drawer">
   <div class="ae-drawer-header">
-    <div class="ae-drawer-title"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="5.5"/><path d="M21 2l-9.6 9.6"/><path d="M15.5 7.5l3 3"/><path d="M18 5l2 2"/></svg>API Keys</div>
-    <div class="ae-drawer-subtitle">Keys are stored in your browser only — never sent to our servers</div>
+    <div class="ae-drawer-title"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>Connect Platforms</div>
+    <div class="ae-drawer-subtitle">Link your accounts to auto-populate real metrics</div>
     <button class="ae-drawer-close" id="btn-close-keys"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
   </div>
   <div class="ae-drawer-body">
-    <div class="ae-key-block" data-platform="youtube">
+
+    <!-- ── YouTube OAuth ─────────────────────────────────────────── -->
+    <div class="ae-key-block" id="yt-block" data-platform="youtube">
       <div class="ae-key-block-header">
-        <div class="ae-key-block-icon" style="--kc:#F87171"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M23 7s-.3-2-1.2-2.8c-1.1-1.2-2.4-1.2-3-1.3C16.6 2.8 12 2.8 12 2.8s-4.6 0-6.8.1c-.6.1-1.9.1-3 1.3C1.3 5 1 7 1 7S.7 9.1.7 11.3v2c0 2.1.3 4.2.3 4.2s.3 2 1.2 2.8c1.1 1.2 2.6 1.1 3.3 1.2C7.6 21.7 12 21.7 12 21.7s4.6 0 6.8-.2c.6-.1 1.9-.1 3-1.3.9-.8 1.2-2.8 1.2-2.8s.3-2.1.3-4.2v-2C23.3 9.1 23 7 23 7zM9.7 15.5V8.4l8.1 3.6-8.1 3.5z"/></svg></div>
-        <div class="ae-key-block-info"><div class="ae-key-block-name">YouTube Data API v3</div><div class="ae-key-block-desc">Auto-fills title, duration, views, likes, comments from any YouTube URL</div></div>
-        <div class="ae-key-block-status" id="yt-status"><span class="ae-key-dot inactive"></span><span class="ae-key-status-text">Not set</span></div>
+        <div class="ae-key-block-icon" style="--kc:#F87171">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M23 7s-.3-2-1.2-2.8c-1.1-1.2-2.4-1.2-3-1.3C16.6 2.8 12 2.8 12 2.8s-4.6 0-6.8.1c-.6.1-1.9.1-3 1.3C1.3 5 1 7 1 7S.7 9.1.7 11.3v2c0 2.1.3 4.2.3 4.2s.3 2 1.2 2.8c1.1 1.2 2.6 1.1 3.3 1.2C7.6 21.7 12 21.7 12 21.7s4.6 0 6.8-.2c.6-.1 1.9-.1 3-1.3.9-.8 1.2-2.8 1.2-2.8s.3-2.1.3-4.2v-2C23.3 9.1 23 7 23 7zM9.7 15.5V8.4l8.1 3.6-8.1 3.5z"/></svg>
+        </div>
+        <div class="ae-key-block-info">
+          <div class="ae-key-block-name">YouTube</div>
+          <div class="ae-key-block-desc" id="yt-block-desc">Auto-fills views, likes, comments, duration from any YouTube URL</div>
+        </div>
+        <div class="ae-key-block-status" id="yt-status"><span class="ae-key-dot inactive"></span><span class="ae-key-status-text">Not connected</span></div>
       </div>
-      <div class="ae-key-input-row">
-        <div class="ae-key-field"><input type="password" class="ae-key-input" id="key-youtube" placeholder="AIzaSy..." autocomplete="off" spellcheck="false"/><button class="ae-key-toggle" data-target="key-youtube" title="Show/hide"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
-        <button class="ae-key-save" data-key="youtube">Save</button>
+      <!-- Not connected state -->
+      <div id="yt-connect-area">
+        <button class="ae-oauth-btn" id="btn-connect-youtube">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+          Connect YouTube Account
+        </button>
+        <div class="ae-oauth-note">Opens a Google sign-in popup. No API key needed.</div>
+      </div>
+      <!-- Connected state (hidden until auth) -->
+      <div id="yt-connected-area" style="display:none">
+        <div class="ae-connected-info">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--c-green)" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+          <span id="yt-channel-name">Connected</span>
+        </div>
+        <button class="ae-disconnect-btn" id="btn-disconnect-youtube">Disconnect</button>
       </div>
     </div>
-    <div class="ae-key-block" data-platform="meta">
+
+    <!-- ── Bluesky ────────────────────────────────────────────────── -->
+    <div class="ae-key-block" id="bsky-block" data-platform="bluesky">
       <div class="ae-key-block-header">
-        <div class="ae-key-block-icon" style="--kc:#A78BFA"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1.2" fill="currentColor" stroke="none"/></svg></div>
-        <div class="ae-key-block-info"><div class="ae-key-block-name">Meta Graph API</div><div class="ae-key-block-desc">Powers both Instagram and Facebook auto-population</div></div>
-        <div class="ae-key-block-status" id="meta-status"><span class="ae-key-dot inactive"></span><span class="ae-key-status-text">Not set</span></div>
+        <div class="ae-key-block-icon" style="--kc:#0085ff">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14.5v-4.5H8l4-5 4 5h-3v4.5h-2z"/></svg>
+        </div>
+        <div class="ae-key-block-info">
+          <div class="ae-key-block-name">Bluesky</div>
+          <div class="ae-key-block-desc">Auto-fills likes, reposts, replies, quotes from any Bluesky post URL</div>
+        </div>
+        <div class="ae-key-block-status" id="bsky-status"><span class="ae-key-dot inactive"></span><span class="ae-key-status-text">Not connected</span></div>
       </div>
-      <div class="ae-key-input-row">
-        <div class="ae-key-field"><input type="password" class="ae-key-input" id="key-meta" placeholder="EAAGm0P..." autocomplete="off" spellcheck="false"/><button class="ae-key-toggle" data-target="key-meta" title="Show/hide"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
-        <button class="ae-key-save" data-key="meta">Save</button>
+      <!-- Not connected state -->
+      <div id="bsky-connect-area">
+        <div class="ae-key-input-row" style="margin-bottom:0.5rem">
+          <div class="ae-key-field">
+            <input type="text" class="ae-key-input" id="bsky-handle" placeholder="yourhandle.bsky.social" autocomplete="off" spellcheck="false"/>
+          </div>
+        </div>
+        <div class="ae-key-input-row">
+          <div class="ae-key-field">
+            <input type="password" class="ae-key-input" id="bsky-password" placeholder="App password (not your main password)" autocomplete="off" spellcheck="false"/>
+            <button class="ae-key-toggle" data-target="bsky-password" title="Show/hide">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+          <button class="ae-key-save" id="btn-connect-bluesky">Connect</button>
+        </div>
+        <div class="ae-key-steps" style="margin-top:0.65rem">
+          <div class="ae-key-step"><span class="ae-step-num">1</span>Go to <strong>bsky.app → Settings → App Passwords</strong></div>
+          <div class="ae-key-step"><span class="ae-step-num">2</span>Click <strong>Add App Password</strong> → name it "Spectra"</div>
+          <div class="ae-key-step"><span class="ae-step-num">3</span>Copy the generated password and paste above</div>
+        </div>
+      </div>
+      <!-- Connected state -->
+      <div id="bsky-connected-area" style="display:none">
+        <div class="ae-connected-info">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--c-green)" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+          <span id="bsky-handle-display">Connected</span>
+        </div>
+        <button class="ae-disconnect-btn" id="btn-disconnect-bluesky">Disconnect</button>
       </div>
     </div>
+
+    <!-- ── Instagram (Coming Soon) ───────────────────────────────── -->
+    <div class="ae-key-block ae-key-block-coming-soon" data-platform="instagram">
+      <div class="ae-key-block-header">
+        <div class="ae-key-block-icon" style="--kc:#E1306C">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/></svg>
+        </div>
+        <div class="ae-key-block-info">
+          <div class="ae-key-block-name">Instagram <span class="ae-coming-soon-badge">Coming Soon</span></div>
+          <div class="ae-key-block-desc">Requires Meta app review approval. We're working on it.</div>
+        </div>
+        <div class="ae-key-block-status"><span class="ae-key-dot inactive"></span><span class="ae-key-status-text" style="color:var(--ice-dim);opacity:0.5">Pending</span></div>
+      </div>
+    </div>
+
+    <!-- ── Connection Status Summary ────────────────────────────── -->
     <div class="ae-keys-summary" id="keys-summary">
       <div class="ae-summary-title">Connection Status</div>
-      <div class="ae-summary-row"><span class="ae-sum-label">YouTube</span><span class="ae-sum-val" id="sum-youtube">—</span></div>
-      <div class="ae-summary-row"><span class="ae-sum-label">Instagram</span><span class="ae-sum-val" id="sum-instagram">—</span></div>
-      <div class="ae-summary-row"><span class="ae-sum-label">Facebook</span><span class="ae-sum-val" id="sum-facebook">—</span></div>
+      <div class="ae-summary-row"><span class="ae-sum-label">YouTube</span><span class="ae-sum-val" id="sum-youtube">— Not connected</span></div>
+      <div class="ae-summary-row"><span class="ae-sum-label">Bluesky</span><span class="ae-sum-val" id="sum-bluesky">— Not connected</span></div>
+      <div class="ae-summary-row"><span class="ae-sum-label">Instagram</span><span class="ae-sum-val" style="color:rgba(232,244,253,0.2)">Coming soon</span></div>
     </div>
   </div>
 </aside>
 <main id="ae-main">
   <aside id="ae-input-panel">
-    <div class="ae-section"><div class="ae-section-label">Platform</div><div class="ae-platform-grid" id="platform-grid"><button class="ae-platform-btn active" data-platform="tiktok"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 01-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 01-2.88 2.5 2.89 2.89 0 01-2.89-2.89 2.89 2.89 0 012.89-2.89c.28 0 .54.04.79.1V9.01a6.27 6.27 0 00-.79-.05 6.34 6.34 0 00-6.34 6.34 6.34 6.34 0 006.34 6.34 6.34 6.34 0 006.33-6.34V8.69a8.18 8.18 0 004.78 1.52V6.75a4.85 4.85 0 01-1.01-.06z"/></svg>TikTok</button><button class="ae-platform-btn" data-platform="instagram"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/></svg>Instagram</button><button class="ae-platform-btn" data-platform="youtube"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M23 7s-.3-2-1.2-2.8c-1.1-1.2-2.4-1.2-3-1.3C16.6 2.8 12 2.8 12 2.8s-4.6 0-6.8.1c-.6.1-1.9.1-3 1.3C1.3 5 1 7 1 7S.7 9.1.7 11.3v2c0 2.1.3 4.2.3 4.2s.3 2 1.2 2.8c1.1 1.2 2.6 1.1 3.3 1.2C7.6 21.7 12 21.7 12 21.7s4.6 0 6.8-.2c.6-.1 1.9-.1 3-1.3.9-.8 1.2-2.8 1.2-2.8s.3-2.1.3-4.2v-2C23.3 9.1 23 7 23 7zM9.7 15.5V8.4l8.1 3.6-8.1 3.5z"/></svg>YouTube</button><button class="ae-platform-btn" data-platform="twitter"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>Twitter/X</button><button class="ae-platform-btn" data-platform="facebook"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M24 12.073C24 5.405 18.627 0 12 0S0 5.405 0 12.073c0 6.024 4.388 11.02 10.125 11.927v-8.437H7.078v-3.49h3.047V9.41c0-3.025 1.792-4.697 4.533-4.697 1.312 0 2.686.235 2.686.235v2.97h-1.513c-1.491 0-1.956.93-1.956 1.886v2.254h3.328l-.532 3.49h-2.796v8.437C19.612 23.093 24 18.097 24 12.073z"/></svg>Facebook</button><button class="ae-platform-btn" data-platform="ads"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M7 15l3-4 3 4 3-5"/></svg>Paid Ads</button></div></div>
+    <div class="ae-section"><div class="ae-section-label">Platform</div><div class="ae-platform-grid" id="platform-grid"><button class="ae-platform-btn active" data-platform="tiktok"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 01-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 01-2.88 2.5 2.89 2.89 0 01-2.89-2.89 2.89 2.89 0 012.89-2.89c.28 0 .54.04.79.1V9.01a6.27 6.27 0 00-.79-.05 6.34 6.34 0 00-6.34 6.34 6.34 6.34 0 006.34 6.34 6.34 6.34 0 006.33-6.34V8.69a8.18 8.18 0 004.78 1.52V6.75a4.85 4.85 0 01-1.01-.06z"/></svg>TikTok</button><button class="ae-platform-btn" data-platform="instagram"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/></svg>Instagram</button><button class="ae-platform-btn" data-platform="youtube"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M23 7s-.3-2-1.2-2.8c-1.1-1.2-2.4-1.2-3-1.3C16.6 2.8 12 2.8 12 2.8s-4.6 0-6.8.1c-.6.1-1.9.1-3 1.3C1.3 5 1 7 1 7S.7 9.1.7 11.3v2c0 2.1.3 4.2.3 4.2s.3 2 1.2 2.8c1.1 1.2 2.6 1.1 3.3 1.2C7.6 21.7 12 21.7 12 21.7s4.6 0 6.8-.2c.6-.1 1.9-.1 3-1.3.9-.8 1.2-2.8 1.2-2.8s.3-2.1.3-4.2v-2C23.3 9.1 23 7 23 7zM9.7 15.5V8.4l8.1 3.6-8.1 3.5z"/></svg>YouTube</button><button class="ae-platform-btn" data-platform="twitter"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>Twitter/X</button><button class="ae-platform-btn" data-platform="facebook"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M24 12.073C24 5.405 18.627 0 12 0S0 5.405 0 12.073c0 6.024 4.388 11.02 10.125 11.927v-8.437H7.078v-3.49h3.047V9.41c0-3.025 1.792-4.697 4.533-4.697 1.312 0 2.686.235 2.686.235v2.97h-1.513c-1.491 0-1.956.93-1.956 1.886v2.254h3.328l-.532 3.49h-2.796v8.437C19.612 23.093 24 18.097 24 12.073z"/></svg>Facebook</button><button class="ae-platform-btn" data-platform="ads"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M7 15l3-4 3 4 3-5"/></svg>Paid Ads</button><button class="ae-platform-btn" data-platform="bluesky"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14.5v-4.5H8l4-5 4 5h-3v4.5h-2z"/></svg>Bluesky</button></div></div>
     <div class="ae-section"><div class="ae-section-label">Content Input</div><div class="ae-input-tabs"><button class="ae-tab active" data-tab="url">URL / Link</button><button class="ae-tab" data-tab="manual">Manual Entry</button></div><div class="ae-tab-content active" id="tab-url"><div class="ae-field"><label class="ae-label">Video / Post URL<span class="ae-url-fetch-spinner" id="url-spinner"></span></label><div class="ae-url-input-wrap"><svg class="ae-input-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 13a3 3 0 100-6 3 3 0 000 6z"/><path d="M10 2C5.58 2 2 5.58 2 10s3.58 8 8 8 8-3.58 8-8-3.58-8-8-8z"/></svg><input type="url" id="content-url" class="ae-input" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off"/></div><div class="ae-url-preview" id="url-preview"><img class="ae-url-preview-thumb" id="url-thumb" src="" alt=""/><div class="ae-url-preview-info"><div class="ae-url-preview-title" id="url-preview-title"></div><div class="ae-url-preview-meta" id="url-preview-meta"></div></div></div><div id="url-fetch-note" style="display:none;font-size:0.68rem;color:var(--ice-dim);margin-top:0.4rem;font-style:italic;line-height:1.5"></div></div><div class="ae-field"><label class="ae-label">Hook / Opening Line</label><input type="text" id="hook-text" class="ae-input" placeholder="First 3 seconds of your content..."/></div></div><div class="ae-tab-content" id="tab-manual"><div class="ae-field"><label class="ae-label">Content Description</label><textarea id="content-desc" class="ae-textarea" rows="3" placeholder="Describe your content — topic, format, target audience..."></textarea></div><div class="ae-field"><label class="ae-label">Hook / Opening Line</label><input type="text" id="hook-text-2" class="ae-input" placeholder="First 3 seconds..."/></div><div class="ae-field"><label class="ae-label">Script / Caption</label><textarea id="script-text" class="ae-textarea" rows="4" placeholder="Paste your script or caption here..."></textarea></div></div></div>
     <div class="ae-section"><div class="ae-section-label">Performance Metrics</div><div class="ae-metrics-grid"><div class="ae-field"><label class="ae-label">Views</label><input type="number" id="m-views" class="ae-input ae-metric-input" placeholder="0" min="0"/></div><div class="ae-field"><label class="ae-label">Likes</label><input type="number" id="m-likes" class="ae-input ae-metric-input" placeholder="0" min="0"/></div><div class="ae-field"><label class="ae-label">Comments</label><input type="number" id="m-comments" class="ae-input ae-metric-input" placeholder="0" min="0"/></div><div class="ae-field"><label class="ae-label">Shares</label><input type="number" id="m-shares" class="ae-input ae-metric-input" placeholder="0" min="0"/></div><div class="ae-field"><label class="ae-label">Saves</label><input type="number" id="m-saves" class="ae-input ae-metric-input" placeholder="0" min="0"/></div><div class="ae-field"><label class="ae-label">Watch Time %</label><input type="number" id="m-watchtime" class="ae-input ae-metric-input" placeholder="0" min="0" max="100"/></div></div></div>
     <div class="ae-section"><div class="ae-section-label">Timeline</div><div class="ae-two-col"><div class="ae-field"><label class="ae-label">Duration (seconds)</label><input type="number" id="duration" class="ae-input" placeholder="60" value="60" min="1"/></div><div class="ae-field"><label class="ae-label">Drop-off Points (sec)</label><input type="text" id="dropoff-points" class="ae-input" placeholder="e.g. 3, 15, 42"/></div></div></div>
