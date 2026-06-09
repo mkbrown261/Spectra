@@ -15,7 +15,12 @@
     rewriteData: null,
     isAnalyzing: false,
     isRewriting: false,
+    hasRealData: false,   // true once URL fetch succeeds OR user enters views>0
+    fetchedPlatform: null, // platform from last successful URL fetch
   };
+
+  // Current logged-in user (set after checkSession)
+  let aeUser = null;
 
   /* ── DOM REFS ───────────────────────────────────────────────────── */
   const $ = (id) => document.getElementById(id);
@@ -23,16 +28,105 @@
 
   /* ── INIT ───────────────────────────────────────────────────────── */
   document.addEventListener('DOMContentLoaded', () => {
+    injectToast();
+    checkSession();
+  });
+
+  // ── AUTH GATE ────────────────────────────────────────────────────
+  async function checkSession() {
+    try {
+      const res  = await fetch('/api/auth/me');
+      const data = await res.json();
+      if (res.ok && data.id) {
+        aeUser = { id: data.id, email: data.email, tier: data.tier, credits: data.credits };
+        enterApp();
+      } else {
+        showAuthGate();
+      }
+    } catch {
+      showAuthGate();
+    }
+  }
+
+  function showAuthGate() {
+    const gate = $('ae-auth-gate');
+    const app  = $('ae-app');
+    if (gate) gate.classList.add('visible');
+    if (app)  app.style.display = 'none';
+    initAuthForm();
+  }
+
+  function enterApp() {
+    const gate = $('ae-auth-gate');
+    const app  = $('ae-app');
+    if (gate) gate.classList.remove('visible');
+    if (app)  app.style.display = '';
+    // Boot all app functionality now that we're authenticated
     bindPlatform();
     bindInputTabs();
     bindOutputTabs();
     bindActions();
     bindResultsButtons();
-    injectToast();
     initConnectionsDrawer();
     initURLFetch();
     loadConnectionStatus();
-  });
+  }
+
+  function initAuthForm() {
+    let currentMode = 'login';
+
+    // Tab switching
+    $$('.ae-auth-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        currentMode = tab.dataset.aeAuthTab;
+        $$('.ae-auth-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        const submitBtn = $('btn-ae-auth-submit');
+        if (submitBtn) submitBtn.textContent = currentMode === 'login' ? 'Sign In' : 'Create Account';
+        clearAuthError();
+      });
+    });
+
+    // Form submit
+    $('ae-auth-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email    = $('ae-auth-email')?.value.trim();
+      const password = $('ae-auth-password')?.value.trim();
+      if (!email || !password) { showAuthError('Email and password are required.'); return; }
+
+      const submitBtn = $('btn-ae-auth-submit');
+      if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Signing in...'; }
+      clearAuthError();
+
+      try {
+        const endpoint = currentMode === 'login' ? '/api/auth/login' : '/api/auth/register';
+        const res  = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Authentication failed');
+        aeUser = { id: data.id || data.userId, email: data.email, tier: data.tier, credits: data.credits };
+        enterApp();
+      } catch (err) {
+        showAuthError(err.message);
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = currentMode === 'login' ? 'Sign In' : 'Create Account';
+        }
+      }
+    });
+  }
+
+  function showAuthError(msg) {
+    const el = $('ae-auth-error');
+    if (el) { el.textContent = msg; el.style.display = 'block'; }
+  }
+  function clearAuthError() {
+    const el = $('ae-auth-error');
+    if (el) { el.textContent = ''; el.style.display = 'none'; }
+  }
 
   /* ══════════════════════════════════════════════════════════════════
      PLATFORM SELECTOR
@@ -40,22 +134,49 @@
   function bindPlatform() {
     $$('.ae-platform-btn').forEach(btn => {
       btn.addEventListener('click', () => {
+        const platform = btn.dataset.platform;
+
         $$('.ae-platform-btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
-        state.platform = btn.dataset.platform;
+        state.platform = platform;
+
         // Update URL placeholder
         const urlInput = $('content-url');
         if (urlInput) {
           const placeholders = {
-            tiktok: 'https://www.tiktok.com/@user/video/...',
+            tiktok:    'https://www.tiktok.com/@user/video/...',
             instagram: 'https://www.instagram.com/reel/...',
-            youtube: 'https://www.youtube.com/watch?v=...',
-            twitter: 'https://twitter.com/user/status/...',
-            facebook: 'https://www.facebook.com/watch/?v=...',
-            bluesky: 'https://bsky.app/profile/yourhandle/post/...',
-            ads: 'Paste ad URL or leave blank...',
+            youtube:   'https://www.youtube.com/watch?v=...',
+            twitter:   'https://twitter.com/user/status/...',
+            facebook:  'https://www.facebook.com/watch/?v=...',
+            bluesky:   'https://bsky.app/profile/yourhandle/post/...',
+            ads:       'Paste ad URL or leave blank...',
           };
-          urlInput.placeholder = placeholders[state.platform] || 'Paste your content URL...';
+          urlInput.placeholder = placeholders[platform] || 'Paste your content URL...';
+        }
+
+        // YouTube: open drawer and kick off OAuth if not connected
+        if (platform === 'youtube') {
+          if (!connState.youtube) {
+            openConnectionsDrawer();
+            // Small delay so drawer opens first, then auto-start OAuth
+            setTimeout(() => {
+              if (!connState.youtube) {
+                $('btn-connect-youtube')?.click();
+              }
+            }, 350);
+          }
+        }
+
+        // Bluesky: open drawer and scroll to Bluesky form if not connected
+        if (platform === 'bluesky') {
+          if (!connState.bluesky) {
+            openConnectionsDrawer();
+            setTimeout(() => {
+              $('bsky-block')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              $('bsky-handle')?.focus();
+            }, 350);
+          }
         }
       });
     });
@@ -137,9 +258,49 @@
     $('btn-score')?.addEventListener('click', runScoreOnly);
   }
 
+  function validateHasRealData() {
+    // Accept if URL was successfully fetched (real platform data)
+    if (state.hasRealData) return true;
+    // Accept if user manually entered views > 0 AND at least one engagement metric
+    const m = collectFormData().metrics;
+    const hasViews = m.views > 0;
+    const hasEngagement = m.likes > 0 || m.comments > 0 || m.shares > 0 || m.saves > 0 || m.watch_time_pct > 0;
+    return hasViews && hasEngagement;
+  }
+
+  function showNoDataMessage(platform) {
+    // Inject a warning before the analyze buttons
+    const existing = $('ae-no-data-banner');
+    if (existing) existing.remove();
+    const actions = document.querySelector('.ae-actions');
+    if (!actions) return;
+    const banner = document.createElement('div');
+    banner.id = 'ae-no-data-banner';
+    banner.className = 'ae-no-data-msg';
+    const connectable = platform === 'youtube' || platform === 'bluesky';
+    let tip = '';
+    if (platform === 'youtube' && !connState.youtube) {
+      tip = ' <a href="#" id="no-data-connect-yt" style="color:var(--ae);text-decoration:underline;cursor:pointer">Connect YouTube →</a>';
+    } else if (platform === 'bluesky' && !connState.bluesky) {
+      tip = ' <a href="#" id="no-data-connect-bsky" style="color:var(--ae);text-decoration:underline;cursor:pointer">Connect Bluesky →</a>';
+    }
+    banner.innerHTML = `<strong>No real data to analyze</strong>Paste a ${platform.charAt(0).toUpperCase()+platform.slice(1)} URL to auto-fill metrics, or enter Views + at least one engagement metric manually.${tip}`;
+    actions.before(banner);
+    // Wire connect links
+    $('no-data-connect-yt')?.addEventListener('click', (e) => { e.preventDefault(); openConnectionsDrawer(); $('btn-connect-youtube')?.click(); });
+    $('no-data-connect-bsky')?.addEventListener('click', (e) => { e.preventDefault(); openConnectionsDrawer(); $('bsky-handle')?.focus(); });
+    // Auto-dismiss after 6s
+    setTimeout(() => { const b = $('ae-no-data-banner'); if (b) b.remove(); }, 6000);
+  }
+
   async function runScoreOnly() {
     if (state.isAnalyzing) return;
     const data = collectFormData();
+
+    if (!validateHasRealData()) {
+      showNoDataMessage(state.platform);
+      return;
+    }
 
     showLoading('Calculating scores...');
 
@@ -186,6 +347,12 @@
 
   async function runAnalysis() {
     if (state.isAnalyzing) return;
+
+    if (!validateHasRealData()) {
+      showNoDataMessage(state.platform);
+      return;
+    }
+
     state.isAnalyzing = true;
 
     const data = collectFormData();
@@ -456,9 +623,18 @@
   }
 
   function renderScores(meta, aiData, overrideScores) {
-    // Platform badge
+    // Platform badge — only show if real data was fetched from that platform
     const badge = $('results-platform-badge');
-    if (badge && meta) badge.textContent = meta.platform?.toUpperCase() || state.platform.toUpperCase();
+    if (badge) {
+      if (state.fetchedPlatform) {
+        badge.textContent = state.fetchedPlatform.toUpperCase();
+        badge.style.display = '';
+      } else {
+        // Manual entry — no platform badge (no fake "from platform" labeling)
+        badge.textContent = '';
+        badge.style.display = 'none';
+      }
+    }
 
     const scores = overrideScores || (meta ? meta.scores : {});
 
@@ -511,7 +687,7 @@
 
     // Signal bars
     const signalLabel = $('signal-platform-label');
-    if (signalLabel && meta) signalLabel.textContent = meta.platform?.toUpperCase() || '';
+    if (signalLabel) signalLabel.textContent = state.fetchedPlatform ? state.fetchedPlatform.toUpperCase() : '';
 
     const barsContainer = $('signal-bars');
     if (barsContainer && meta?.signal_breakdown) {
@@ -568,8 +744,26 @@
      RENDER: TIMELINE
   ══════════════════════════════════════════════════════════════════ */
   function renderTimeline(segments, aiData) {
-    const chart = $('timeline-chart');
-    if (!chart || !segments?.length) return;
+    const chart      = $('timeline-chart');
+    const dropoffList = $('dropoff-list');
+    if (!chart) return;
+
+    // Only render actual timeline if we have real drop-off data
+    // Segments generated from no drop-off points are generic and misleading
+    const formData = collectFormData();
+    const hasRealDropoffs = formData.dropoff_points && formData.dropoff_points.length > 0;
+
+    if (!segments?.length || !hasRealDropoffs) {
+      chart.innerHTML = `<div class="ae-timeline-empty">
+        <div>
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="opacity:0.4;display:block;margin:0 auto 0.75rem"><path d="M3 3v18h18"/><path d="M7 16l4-4 4 4 4-6"/></svg>
+          No drop-off data entered.<br>
+          <span style="opacity:0.6">Add timestamps to the <strong>Drop-off Points</strong> field above to see the retention curve.</span>
+        </div>
+      </div>`;
+      if (dropoffList) dropoffList.innerHTML = '';
+      return;
+    }
 
     const maxRet = Math.max(...segments.map(s => s.retention), 1);
 
@@ -1021,28 +1215,28 @@ METRICS ENTERED
   // Track connection state in memory (loaded from server on open)
   const connState = { youtube: false, bluesky: false };
 
+  // Exposed so platform buttons and no-data banner can open drawer
+  function openConnectionsDrawer() {
+    const drawer  = $('keys-drawer');
+    const overlay = $('keys-overlay');
+    if (drawer)  drawer.classList.add('open');
+    if (overlay) overlay.classList.add('open');
+    document.body.style.overflow = 'hidden';
+    loadConnectionStatus();
+  }
+
+  function closeConnectionsDrawer() {
+    const drawer  = $('keys-drawer');
+    const overlay = $('keys-overlay');
+    if (drawer)  drawer.classList.remove('open');
+    if (overlay) overlay.classList.remove('open');
+    document.body.style.overflow = '';
+  }
+
   function initConnectionsDrawer() {
-    const overlay  = $('keys-overlay');
-    const drawer   = $('keys-drawer');
-    const btnOpen  = $('btn-open-keys');
-    const btnClose = $('btn-close-keys');
-
-    function openDrawer() {
-      drawer?.classList.add('open');
-      overlay?.classList.add('open');
-      document.body.style.overflow = 'hidden';
-      // Refresh status from server each time drawer opens
-      loadConnectionStatus();
-    }
-    function closeDrawer() {
-      drawer?.classList.remove('open');
-      overlay?.classList.remove('open');
-      document.body.style.overflow = '';
-    }
-
-    btnOpen?.addEventListener('click', openDrawer);
-    btnClose?.addEventListener('click', closeDrawer);
-    overlay?.addEventListener('click', closeDrawer);
+    $('btn-open-keys')?.addEventListener('click',  openConnectionsDrawer);
+    $('btn-close-keys')?.addEventListener('click', closeConnectionsDrawer);
+    $('keys-overlay')?.addEventListener('click',   closeConnectionsDrawer);
 
     // Toggle show/hide password inputs
     $$('.ae-key-toggle').forEach(btn => {
@@ -1160,6 +1354,8 @@ METRICS ENTERED
     setBlockStatus('yt-status', 'active', '● Connected');
     const sumYt = $('sum-youtube');
     if (sumYt) { sumYt.textContent = `✓ ${channelName || 'Connected'}`; sumYt.className = 'ae-sum-val connected'; }
+    // Green badge on platform button
+    $('plat-btn-youtube')?.classList.add('conn-active');
     updateNavDot();
   }
 
@@ -1172,6 +1368,7 @@ METRICS ENTERED
     setBlockStatus('yt-status', 'inactive', 'Not connected');
     const sumYt = $('sum-youtube');
     if (sumYt) { sumYt.textContent = '— Not connected'; sumYt.className = 'ae-sum-val missing'; }
+    $('plat-btn-youtube')?.classList.remove('conn-active');
     updateNavDot();
   }
 
@@ -1183,6 +1380,8 @@ METRICS ENTERED
     setBlockStatus('bsky-status', 'active', '● Connected');
     const sumBsky = $('sum-bluesky');
     if (sumBsky) { sumBsky.textContent = `✓ @${handle}`; sumBsky.className = 'ae-sum-val connected'; }
+    // Green badge on platform button
+    $('plat-btn-bluesky')?.classList.add('conn-active');
     updateNavDot();
   }
 
@@ -1193,6 +1392,7 @@ METRICS ENTERED
     setBlockStatus('bsky-status', 'inactive', 'Not connected');
     const sumBsky = $('sum-bluesky');
     if (sumBsky) { sumBsky.textContent = '— Not connected'; sumBsky.className = 'ae-sum-val missing'; }
+    $('plat-btn-bluesky')?.classList.remove('conn-active');
     updateNavDot();
   }
 
@@ -1228,6 +1428,13 @@ METRICS ENTERED
       // Reset preview
       hideURLPreview();
       clearURLNote();
+
+      // If user cleared the URL, reset hasRealData so they can't run on stale data
+      if (!val) {
+        state.hasRealData = false;
+        state.fetchedPlatform = null;
+        $('ae-no-data-banner')?.remove();
+      }
 
       if (!val || val.length < 20) return;
 
@@ -1347,7 +1554,13 @@ METRICS ENTERED
     });
 
     const count = Object.values(m).filter(v => v > 0).length;
-    if (count > 0) showToast(`${count} metric${count > 1 ? 's' : ''} auto-filled from ${(data.platform || 'URL').toUpperCase()}`, 'success');
+    if (count > 0) {
+      state.hasRealData = true;
+      state.fetchedPlatform = data.platform || state.platform;
+      showToast(`${count} metric${count > 1 ? 's' : ''} auto-filled from ${(data.platform || 'URL').toUpperCase()}`, 'success');
+    }
+    // Remove any stale no-data warning
+    $('ae-no-data-banner')?.remove();
   }
 
   function showURLPreview(thumb, title, data) {
