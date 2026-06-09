@@ -582,7 +582,14 @@
   }
 
   function showEmpty() {
-    $('ae-empty').style.display = 'flex';
+    const emptyEl = $('ae-empty');
+    if (emptyEl) {
+      emptyEl.style.display = 'flex';
+      // If YouTube is connected and the grid hasn't loaded yet, load it
+      if (connState.youtube && !$('ae-vg-grid')) {
+        loadVideoGrid();
+      }
+    }
     $('ae-loading').style.display = 'none';
     $('ae-results').style.display = 'none';
   }
@@ -1208,6 +1215,153 @@ METRICS ENTERED
   }
 
   /* ══════════════════════════════════════════════════════════════════
+     VIDEO GRID — shows YouTube uploads in the output panel
+  ══════════════════════════════════════════════════════════════════ */
+
+  let videoGridData = []; // cached video list
+
+  async function loadVideoGrid() {
+    const empty = $('ae-empty');
+    if (!empty) return;
+
+    // Show loading state
+    empty.innerHTML = `
+      <div class="ae-vg-loading">
+        <div class="ae-loading-ring" style="width:32px;height:32px;border-width:2px;margin:0 auto"></div>
+        <p style="color:var(--ice-dim);font-size:0.85rem;margin-top:0.75rem">Loading your videos...</p>
+      </div>`;
+
+    try {
+      const res  = await fetch('/api/auth/youtube/videos?limit=20');
+      const data = await res.json();
+
+      if (data.error || !data.videos?.length) {
+        resetEmptyState(`No videos found. ${data.error || ''}`);
+        return;
+      }
+
+      videoGridData = data.videos;
+      renderVideoGrid(data.videos, data.channel || 'Your Channel');
+    } catch {
+      resetEmptyState('Could not load videos — check your YouTube connection.');
+    }
+  }
+
+  function resetEmptyState(msg) {
+    const empty = $('ae-empty');
+    if (!empty) return;
+    empty.innerHTML = `
+      <div class="ae-empty-icon"><svg viewBox="0 0 64 64" fill="none"><circle cx="32" cy="32" r="28" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 3" opacity="0.3"/><circle cx="32" cy="32" r="16" stroke="currentColor" stroke-width="1.5" opacity="0.5"/><circle cx="32" cy="32" r="5" fill="currentColor" opacity="0.7"/><circle cx="32" cy="12" r="2.5" fill="currentColor" opacity="0.4"/><circle cx="50" cy="42" r="2.5" fill="currentColor" opacity="0.4"/><circle cx="14" cy="42" r="2.5" fill="currentColor" opacity="0.4"/><line x1="32" y1="32" x2="32" y2="14.5" stroke="currentColor" stroke-width="1" opacity="0.3"/><line x1="32" y1="32" x2="48" y2="40.5" stroke="currentColor" stroke-width="1" opacity="0.3"/><line x1="32" y1="32" x2="16" y2="40.5" stroke="currentColor" stroke-width="1" opacity="0.3"/></svg></div>
+      <h2 class="ae-empty-title">Attention Engine Ready</h2>
+      <p class="ae-empty-sub">${msg || 'Connect YouTube or Bluesky via the Connections button to load your content.'}</p>
+      <div class="ae-empty-chips"><span class="ae-chip">Drop-off Detection</span><span class="ae-chip">Engagement Scoring</span><span class="ae-chip">Hook Analysis</span><span class="ae-chip">Script Rewrite</span></div>`;
+  }
+
+  function renderVideoGrid(videos, channelName) {
+    const empty = $('ae-empty');
+    if (!empty) return;
+
+    empty.innerHTML = `
+      <div class="ae-vg-header">
+        <div class="ae-vg-title">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="color:#F87171;flex-shrink:0"><path d="M23 7s-.3-2-1.2-2.8c-1.1-1.2-2.4-1.2-3-1.3C16.6 2.8 12 2.8 12 2.8s-4.6 0-6.8.1c-.6.1-1.9.1-3 1.3C1.3 5 1 7 1 7S.7 9.1.7 11.3v2c0 2.1.3 4.2.3 4.2s.3 2 1.2 2.8c1.1 1.2 2.6 1.1 3.3 1.2C7.6 21.7 12 21.7 12 21.7s4.6 0 6.8-.2c.6-.1 1.9-.1 3-1.3.9-.8 1.2-2.8 1.2-2.8s.3-2.1.3-4.2v-2C23.3 9.1 23 7 23 7zM9.7 15.5V8.4l8.1 3.6-8.1 3.5z"/></svg>
+          ${channelName}
+        </div>
+        <div class="ae-vg-sub">Click any video to load its metrics, then run analysis</div>
+      </div>
+      <div class="ae-vg-grid" id="ae-vg-grid">
+        ${videos.map((v, i) => videoCard(v, i)).join('')}
+      </div>`;
+
+    // Wire click handlers
+    $$('.ae-vg-card', empty).forEach(card => {
+      card.addEventListener('click', () => {
+        const idx = parseInt(card.dataset.idx, 10);
+        if (!isNaN(idx) && videos[idx]) {
+          selectVideo(videos[idx]);
+          $$('.ae-vg-card', empty).forEach(c => c.classList.remove('selected'));
+          card.classList.add('selected');
+        }
+      });
+    });
+  }
+
+  function videoCard(v, idx) {
+    const views = formatCount(v.metrics.views);
+    const likes = formatCount(v.metrics.likes);
+    const dur   = v.duration_sec ? formatDuration(v.duration_sec) : '';
+    const date  = v.published ? new Date(v.published).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' }) : '';
+    return `
+      <div class="ae-vg-card" data-idx="${idx}" title="${v.title.replace(/"/g,'&quot;')}">
+        <div class="ae-vg-thumb">
+          <img src="${v.thumbnail}" alt="" loading="lazy" onerror="this.style.opacity='0'"/>
+          ${dur ? `<span class="ae-vg-dur">${dur}</span>` : ''}
+          <div class="ae-vg-play"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>
+        </div>
+        <div class="ae-vg-info">
+          <div class="ae-vg-name">${v.title}</div>
+          <div class="ae-vg-meta">
+            <span><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg> ${views}</span>
+            ${v.metrics.likes ? `<span><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z"/></svg> ${likes}</span>` : ''}
+            ${date ? `<span class="ae-vg-date">${date}</span>` : ''}
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function selectVideo(v) {
+    // Switch to URL tab
+    const urlTab = document.querySelector('.ae-tab[data-tab="url"]');
+    if (urlTab && !urlTab.classList.contains('active')) urlTab.click();
+
+    // Fill URL input
+    const urlInput = $('content-url');
+    if (urlInput) {
+      urlInput.value = v.url;
+      autoSelectPlatform(v.url);
+      clearURLNote();
+      hideURLPreview();
+    }
+
+    // Fill all metric inputs
+    const setVal = (id, val) => { const el = $(id); if (el && val > 0) el.value = val; };
+    setVal('m-views',    v.metrics.views);
+    setVal('m-likes',    v.metrics.likes);
+    setVal('m-comments', v.metrics.comments);
+    setVal('m-shares',   v.metrics.shares);
+    setVal('m-saves',    v.metrics.saves);
+    if ($('duration') && v.duration_sec > 0) $('duration').value = v.duration_sec;
+
+    // Mark as real data — unlocks Run Analysis
+    state.hasRealData     = true;
+    state.fetchedPlatform = 'youtube';
+
+    // Flash filled inputs green
+    ['m-views','m-likes','m-comments','m-shares','m-saves','duration'].forEach(id => {
+      const el = $(id);
+      if (el && parseFloat(el.value) > 0) {
+        el.style.borderColor = 'rgba(52,211,153,0.5)';
+        setTimeout(() => { el.style.borderColor = ''; }, 2000);
+      }
+    });
+
+    // Show URL preview strip
+    showURLPreview(v.thumbnail, v.title, { channel: v.channel, duration_sec: v.duration_sec, platform: 'youtube' });
+
+    // Remove any stale no-data warning
+    $('ae-no-data-banner')?.remove();
+
+    showToast(`"${v.title.slice(0,42)}${v.title.length>42?'…':''}" loaded — hit Run Analysis`, 'success');
+  }
+
+  function formatCount(n) {
+    if (!n || n === 0) return '0';
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (n >= 1_000)     return (n / 1_000).toFixed(1).replace(/\.0$/, '') + 'K';
+    return n.toLocaleString();
+  }
+
+  /* ══════════════════════════════════════════════════════════════════
      CONNECTIONS DRAWER — YouTube OAuth + Bluesky App Password
   ══════════════════════════════════════════════════════════════════ */
 
@@ -1356,6 +1510,11 @@ METRICS ENTERED
     // Green badge on platform button
     $('plat-btn-youtube')?.classList.add('conn-active');
     updateNavDot();
+    // Load video grid into the empty output panel
+    // Only load if results aren't already showing
+    if ($('ae-empty')?.style.display !== 'none' && $('ae-results')?.style.display === 'none') {
+      loadVideoGrid();
+    }
   }
 
   function setYouTubeDisconnected() {

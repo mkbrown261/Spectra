@@ -3141,6 +3141,121 @@ app.delete('/api/auth/youtube/disconnect', requireAuth, async (c) => {
   return c.json({ success: true })
 })
 
+/* ── YouTube: get latest uploads ─────────────────────────────────
+   GET /api/auth/youtube/videos?limit=20
+   Returns the channel's latest uploads with per-video stats
+══════════════════════════════════════════════════════════════════ */
+app.get('/api/auth/youtube/videos', requireAuth, async (c) => {
+  const userId = c.get('userId')
+  const limit  = Math.min(parseInt(c.req.query('limit') || '20'), 50)
+
+  // Get stored OAuth token + channel_id
+  const conn = await c.env.DB.prepare(
+    `SELECT access_token_enc, access_token_iv, refresh_token_enc, refresh_token_iv, channel_id
+     FROM platform_connections WHERE user_id=? AND platform='youtube'`
+  ).bind(userId).first<any>()
+  if (!conn) return c.json({ error: 'YouTube not connected', needs_connect: true }, 200)
+
+  let accessToken = await decryptKey(conn.access_token_enc, conn.access_token_iv, c.env.ENCRYPTION_KEY)
+
+  // Helper: refresh access token if needed
+  async function refreshYTToken(): Promise<string | null> {
+    if (!conn.refresh_token_enc || !conn.refresh_token_iv) return null
+    try {
+      const refreshToken = await decryptKey(conn.refresh_token_enc, conn.refresh_token_iv, c.env.ENCRYPTION_KEY)
+      const r = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id:     c.env.YOUTUBE_CLIENT_ID,
+          client_secret: c.env.YOUTUBE_CLIENT_SECRET,
+          refresh_token: refreshToken,
+          grant_type:    'refresh_token',
+        }),
+      })
+      const data: any = await r.json()
+      if (!data.access_token) return null
+      // Store refreshed token
+      const { enc: newEnc, iv: newIv } = await encryptKey(data.access_token, c.env.ENCRYPTION_KEY)
+      await c.env.DB.prepare(
+        `UPDATE platform_connections SET access_token_enc=?, access_token_iv=? WHERE user_id=? AND platform='youtube'`
+      ).bind(newEnc, newIv, userId).run()
+      return data.access_token
+    } catch { return null }
+  }
+
+  // Step 1: Get the uploads playlist ID for this channel
+  async function getUploadsPlaylistId(token: string): Promise<string | null> {
+    const r = await fetch(
+      `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&mine=true`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    )
+    const d: any = await r.json()
+    if (d.error?.code === 401) return null
+    return d.items?.[0]?.contentDetails?.relatedPlaylists?.uploads || null
+  }
+
+  let uploadsPlaylistId = await getUploadsPlaylistId(accessToken)
+
+  // If 401, try to refresh token
+  if (!uploadsPlaylistId) {
+    const newToken = await refreshYTToken()
+    if (newToken) {
+      accessToken = newToken
+      uploadsPlaylistId = await getUploadsPlaylistId(accessToken)
+    }
+  }
+  if (!uploadsPlaylistId) return c.json({ error: 'Could not access YouTube channel. Try reconnecting.' }, 200)
+
+  // Step 2: Get video IDs from uploads playlist
+  const playlistRes = await fetch(
+    `https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails,snippet&playlistId=${uploadsPlaylistId}&maxResults=${limit}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  )
+  const playlistData: any = await playlistRes.json()
+  if (!playlistData.items?.length) return c.json({ videos: [] })
+
+  const videoIds = playlistData.items
+    .map((item: any) => item.contentDetails?.videoId)
+    .filter(Boolean)
+    .join(',')
+
+  // Step 3: Get full stats for all videos in one call
+  const statsRes = await fetch(
+    `https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics,contentDetails&id=${videoIds}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  )
+  const statsData: any = await statsRes.json()
+  if (!statsData.items?.length) return c.json({ videos: [] })
+
+  const videos = statsData.items.map((item: any) => {
+    const stats   = item.statistics   || {}
+    const snippet = item.snippet      || {}
+    const dur     = item.contentDetails?.duration || 'PT0S'
+    const dm      = dur.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/)
+    const durSec  = (parseInt(dm?.[1] || '0') * 3600) + (parseInt(dm?.[2] || '0') * 60) + parseInt(dm?.[3] || '0')
+    return {
+      id:           item.id,
+      url:          `https://www.youtube.com/watch?v=${item.id}`,
+      title:        snippet.title        || 'Untitled',
+      channel:      snippet.channelTitle || '',
+      thumbnail:    snippet.thumbnails?.medium?.url || snippet.thumbnails?.default?.url || '',
+      published:    snippet.publishedAt  || '',
+      duration_sec: durSec,
+      metrics: {
+        views:         parseInt(stats.viewCount    || '0'),
+        likes:         parseInt(stats.likeCount    || '0'),
+        comments:      parseInt(stats.commentCount || '0'),
+        shares:        0,
+        saves:         0,
+        watch_time_pct: 0,
+      },
+    }
+  })
+
+  return c.json({ videos, channel: statsData.items[0]?.snippet?.channelTitle || '' })
+})
+
 /* ══════════════════════════════════════════════════════════════════
    BLUESKY — /api/attention/bluesky/connect + /posts + /post/:uri/metrics
    Uses AT Protocol app-password auth — no OAuth needed
@@ -3298,15 +3413,16 @@ app.get('/api/fetch-url', async (c) => {
     // Try to get stored OAuth token for the logged-in user first
     let accessToken = ytKey
     try {
-      const authHeader = c.req.header('Cookie') || ''
       const sessionToken = getCookie(c, 'session')
-      if (sessionToken && c.env.ENCRYPTION_KEY) {
-        // Try to find stored YouTube OAuth token — best effort, fall through to API key if not found
-        const decoded: any = await import('hono/jwt').then(m => m.verify(sessionToken, c.env.JWT_SECRET)).catch(() => null)
-        if (decoded?.sub) {
+      if (sessionToken) {
+        // Look up session in D1 (same pattern as requireAuth — sessions are opaque IDs, NOT JWTs)
+        const session = await c.env.DB.prepare(
+          `SELECT s.user_id FROM sessions s WHERE s.id = ? AND s.expires_at > datetime('now')`
+        ).bind(sessionToken).first<{ user_id: string }>()
+        if (session?.user_id) {
           const row = await c.env.DB.prepare(
             `SELECT access_token_enc, access_token_iv FROM platform_connections WHERE user_id=? AND platform='youtube'`
-          ).bind(decoded.sub).first<any>()
+          ).bind(session.user_id).first<any>()
           if (row) accessToken = await decryptKey(row.access_token_enc, row.access_token_iv, c.env.ENCRYPTION_KEY)
         }
       }
@@ -3343,11 +3459,13 @@ app.get('/api/fetch-url', async (c) => {
       try {
         const sessionToken = getCookie(c, 'session')
         if (sessionToken) {
-          const decoded: any = await import('hono/jwt').then(m => m.verify(sessionToken, c.env.JWT_SECRET)).catch(() => null)
-          if (decoded?.sub) {
+          const session = await c.env.DB.prepare(
+            `SELECT s.user_id FROM sessions s WHERE s.id = ? AND s.expires_at > datetime('now')`
+          ).bind(sessionToken).first<{ user_id: string }>()
+          if (session?.user_id) {
             const row = await c.env.DB.prepare(
               `SELECT access_token_enc, access_token_iv FROM platform_connections WHERE user_id=? AND platform='bluesky'`
-            ).bind(decoded.sub).first<any>()
+            ).bind(session.user_id).first<any>()
             if (row) {
               const token = await decryptKey(row.access_token_enc, row.access_token_iv, c.env.ENCRYPTION_KEY)
               authHeader = `Bearer ${token}`
