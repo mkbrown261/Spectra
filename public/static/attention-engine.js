@@ -790,7 +790,6 @@
     });
 
     // Drop-off list
-    const dropoffList = $('dropoff-list');
     if (!dropoffList) return;
 
     const dropoffs = segments.filter(s => s.is_dropoff);
