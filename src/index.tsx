@@ -1244,8 +1244,8 @@ app.delete('/api/shots/:shotId', requireAuth, async (c) => {
    ITEM 1 — R2 VIDEO SERVE
 ══════════════════════════════════════════════════════════════════ */
 
-// GET /api/video/:key — serve an R2 video (key is URL-encoded path)
-app.get('/api/video/:key', requireAuth, async (c) => {
+// GET /api/video/:key — serve an R2 video (public — keys are unguessable UUIDs)
+app.get('/api/video/:key', async (c) => {
   try {
     if (!c.env.STORAGE) return c.json({ error: 'Storage not configured' }, 500)
     const key    = decodeURIComponent(c.req.param('key'))
@@ -1955,8 +1955,8 @@ app.post('/api/upload', requireAuth, async (c) => {
   }
 })
 
-// GET /api/image/:key — serve an R2 image
-app.get('/api/image/:key', requireAuth, async (c) => {
+// GET /api/image/:key — serve an R2 image (public — Higgsfield fetches this URL directly)
+app.get('/api/image/:key', async (c) => {
   try {
     if (!c.env.STORAGE) return c.json({ error: 'Storage not configured' }, 500)
     const key    = decodeURIComponent(c.req.param('key'))
