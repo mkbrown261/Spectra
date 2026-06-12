@@ -9,6 +9,7 @@
   /* ── STATE ─────────────────────────────────────────────────────── */
   const state = {
     platform: 'tiktok',
+    contentType: 'organic_video',  // content type selector value
     activeTab: 'url',
     outputTab: 'scores',
     analysisData: null,
@@ -63,6 +64,7 @@
     if (app)  app.style.display = '';
     // Boot all app functionality now that we're authenticated
     bindPlatform();
+    bindContentType();
     bindInputTabs();
     bindOutputTabs();
     bindActions();
@@ -183,6 +185,19 @@
   }
 
   /* ══════════════════════════════════════════════════════════════════
+     CONTENT TYPE SELECTOR
+  ══════════════════════════════════════════════════════════════════ */
+  function bindContentType() {
+    $$('.ae-ct-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        $$('.ae-ct-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        state.contentType = btn.dataset.ct;
+      });
+    });
+  }
+
+  /* ══════════════════════════════════════════════════════════════════
      INPUT TABS (URL / Manual)
   ══════════════════════════════════════════════════════════════════ */
   function bindInputTabs() {
@@ -231,6 +246,7 @@
 
     return {
       platform: state.platform,
+      content_type: state.contentType || 'organic_video',
       content_url: $('content-url')?.value || '',
       content_description: $('content-desc')?.value || '',
       hook_text: hookText,
@@ -637,10 +653,22 @@
         badge.textContent = state.fetchedPlatform.toUpperCase();
         badge.style.display = '';
       } else {
-        // Manual entry — no platform badge (no fake "from platform" labeling)
         badge.textContent = '';
         badge.style.display = 'none';
       }
+    }
+    // Content-type badge — always show what type was analyzed
+    const ctBadge = $('results-ct-badge');
+    if (ctBadge) {
+      const ctLabelMap = {
+        organic_video: '🎬 Organic Video', music_video: '🎵 Music Video',
+        commercial: '📢 Commercial',        short_form_ad: '⚡ Short Ad',
+        tutorial: '📚 Tutorial',            vlog: '🎙 Vlog',
+        documentary: '🎞 Documentary',      product_demo: '📦 Product Demo',
+      };
+      const label = (meta?.content_type_label) || ctLabelMap[state.contentType] || state.contentType;
+      ctBadge.textContent = label;
+      ctBadge.style.display = label ? '' : 'none';
     }
 
     const scores = overrideScores || (meta ? meta.scores : {});
@@ -829,6 +857,38 @@
   /* ══════════════════════════════════════════════════════════════════
      RENDER: DIAGNOSIS
   ══════════════════════════════════════════════════════════════════ */
+  // Human-readable labels and icons for any diagnosis key the AI might return
+  const DIAG_LABEL_MAP = {
+    hook_effectiveness:   { label: 'Hook Effectiveness',    icon: '⚡' },
+    pacing:               { label: 'Content Pacing',         icon: '⏱' },
+    visual_engagement:    { label: 'Visual Engagement',      icon: '👁' },
+    visual_storytelling:  { label: 'Visual Storytelling',    icon: '🎬' },
+    messaging_clarity:    { label: 'Messaging Clarity',      icon: '💬' },
+    emotional_impact:     { label: 'Emotional Impact',       icon: '❤' },
+    emotional_resonance:  { label: 'Emotional Resonance',    icon: '💫' },
+    cta_strength:         { label: 'CTA Strength',           icon: '🎯' },
+    shareability:         { label: 'Shareability',           icon: '↗' },
+    audio_sync:           { label: 'Audio Sync',             icon: '🎵' },
+    replay_value:         { label: 'Replay Value',           icon: '🔁' },
+    brand_recall:         { label: 'Brand Recall',           icon: '🏷' },
+    message_compression:  { label: 'Message Compression',    icon: '⚡' },
+    skip_resistance:      { label: 'Skip Resistance',        icon: '🚫' },
+    visual_impact:        { label: 'Visual Impact',          icon: '💥' },
+    information_density:  { label: 'Info Density',           icon: '📊' },
+    visual_clarity:       { label: 'Visual Clarity',         icon: '🔍' },
+    step_progression:     { label: 'Step Progression',       icon: '📋' },
+    personality_strength: { label: 'Personality',            icon: '✨' },
+    storytelling:         { label: 'Storytelling',           icon: '📖' },
+    authenticity:         { label: 'Authenticity',           icon: '🎙' },
+    audience_connection:  { label: 'Audience Connection',    icon: '🤝' },
+    narrative_arc:        { label: 'Narrative Arc',          icon: '📈' },
+    information_depth:    { label: 'Info Depth',             icon: '🔬' },
+    emotional_journey:    { label: 'Emotional Journey',      icon: '🌊' },
+    visual_production:    { label: 'Production Quality',     icon: '🎞' },
+    product_clarity:      { label: 'Product Clarity',        icon: '📦' },
+    trust_signals:        { label: 'Trust Signals',          icon: '✅' },
+  };
+
   function renderDiagnosis(aiData) {
     const grid = $('diagnosis-grid');
     if (!grid) return;
@@ -838,16 +898,12 @@
       return;
     }
 
-    const diagItems = [
-      { key: 'hook_effectiveness', label: 'Hook Effectiveness',  icon: '⚡' },
-      { key: 'pacing',             label: 'Content Pacing',       icon: '⏱' },
-      { key: 'visual_engagement',  label: 'Visual Engagement',    icon: '👁' },
-      { key: 'messaging_clarity',  label: 'Messaging Clarity',    icon: '💬' },
-      { key: 'emotional_impact',   label: 'Emotional Impact',     icon: '❤' },
-      { key: 'cta_strength',       label: 'CTA Strength',         icon: '🎯' },
-    ];
-
     const d = aiData.diagnosis;
+    // Use whatever keys the AI returned — don't assume a fixed set
+    const diagItems = Object.keys(d).map(key => {
+      const mapped = DIAG_LABEL_MAP[key];
+      return { key, label: mapped?.label || key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()), icon: mapped?.icon || '◆' };
+    });
 
     grid.innerHTML = diagItems.map(item => {
       const data = d[item.key];

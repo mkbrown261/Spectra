@@ -1983,30 +1983,122 @@ const PLATFORM_WEIGHTS: Record<string, Record<string, number>> = {
   ads:       { watch_time:0.30, views:0.20, likes:0.18, shares:0.14, comments:0.12, saves:0.06 },
 }
 
-function computeWeightedScore(metrics: any, platform: string): Record<string, number> {
-  const weights = PLATFORM_WEIGHTS[platform] || PLATFORM_WEIGHTS.tiktok
+// Content-type-specific normalization multipliers.
+// These represent what a "perfect" score (100/100) looks like for each format.
+// Higher multiplier = harder to reach 100 (tougher benchmark).
+// Lower multiplier = easier to reach 100 (lower expectation for that signal).
+const CONTENT_TYPE_BENCHMARKS: Record<string, Record<string, number>> = {
+  // Organic video: standard social benchmarks
+  organic_video: { likes: 20, comments: 40, shares: 50, saves: 60, watch_time: 1, views: 1000 },
+  // Music video: high like/comment norms, rewatch is key — watch_time weighted harder
+  music_video:   { likes: 12, comments: 25, shares: 40, saves: 50, watch_time: 1, views: 800 },
+  // Commercial: very low like expectations for paid, watch_time is primary success metric
+  commercial:    { likes: 100, comments: 200, shares: 80, saves: 120, watch_time: 1, views: 500 },
+  // Short-form ad: almost no likes/comments expected, completion is everything
+  short_form_ad: { likes: 200, comments: 400, shares: 100, saves: 150, watch_time: 1, views: 300 },
+  // Tutorial: saves are the star metric (people bookmark tutorials)
+  tutorial:      { likes: 25, comments: 35, shares: 55, saves: 20, watch_time: 1, views: 1200 },
+  // Vlog: comments are the primary community signal
+  vlog:          { likes: 15, comments: 20, shares: 55, saves: 70, watch_time: 1, views: 1000 },
+  // Documentary: long watch time expected, saves+shares matter, likes less so
+  documentary:   { likes: 18, comments: 22, shares: 35, saves: 30, watch_time: 1, views: 1500 },
+  // Product demo: saves dominate (purchase intent), click-through proxied by shares
+  product_demo:  { likes: 22, comments: 30, shares: 45, saves: 15, watch_time: 1, views: 900 },
+}
+
+function computeWeightedScore(metrics: any, platform: string, content_type = 'organic_video'): Record<string, number> {
+  const platformWeights = PLATFORM_WEIGHTS[platform] || PLATFORM_WEIGHTS.tiktok
+  const benchmarks      = CONTENT_TYPE_BENCHMARKS[content_type] || CONTENT_TYPE_BENCHMARKS.organic_video
   const { views=0, likes=0, comments=0, shares=0, saves=0, watch_time_pct=0 } = metrics
-  const likeRate    = views > 0 ? Math.min((likes    / views)*100*20, 100) : 0
-  const commentRate = views > 0 ? Math.min((comments / views)*100*40, 100) : 0
-  const shareRate   = views > 0 ? Math.min((shares   / views)*100*50, 100) : 0
-  const saveRate    = views > 0 ? Math.min((saves    / views)*100*60, 100) : 0
+
+  // Normalize each metric against its content-type benchmark multiplier
+  // (multiplier is the denominator: higher = tougher standard for 100)
+  const likeRate    = views > 0 ? Math.min((likes    / views) * 100 * benchmarks.likes,    100) : 0
+  const commentRate = views > 0 ? Math.min((comments / views) * 100 * benchmarks.comments, 100) : 0
+  const shareRate   = views > 0 ? Math.min((shares   / views) * 100 * benchmarks.shares,   100) : 0
+  const saveRate    = views > 0 ? Math.min((saves    / views) * 100 * benchmarks.saves,    100) : 0
   const wtScore     = Math.min(watch_time_pct, 100)
-  const viewScore   = Math.min(views / 1000, 100)
+  const viewScore   = Math.min(views / benchmarks.views, 100)
+
   const raw: Record<string, number> = { likes: likeRate, comments: commentRate, shares: shareRate, saves: saveRate, watch_time: wtScore, views: viewScore }
   let composite = 0
-  for (const [k, w] of Object.entries(weights)) composite += (raw[k] || 0) * w
+  for (const [k, w] of Object.entries(platformWeights)) composite += (raw[k] || 0) * w
   return { composite: Math.round(composite), like_score: Math.round(likeRate), comment_score: Math.round(commentRate), share_score: Math.round(shareRate), save_score: Math.round(saveRate), watch_score: Math.round(wtScore), view_score: Math.round(viewScore) }
 }
 
-function buildSegments(duration_sec: number, dropoff_points: number[]): any[] {
+// Returns base retention at segment i/segCount for a given content type.
+// Each curve shape reflects the typical audience behavior for that format.
+function baseRetention(t: number, contentType: string): number {
+  switch (contentType) {
+    case 'music_video':
+      // Sharp hook spike at start, brief valley, peak at chorus (~40–60%), gradual tail
+      // Pattern: high open, slight dip, big chorus peak, slow close
+      if (t < 0.05) return 96
+      if (t < 0.15) return 88 - Math.random()*5   // slight post-hook settle
+      if (t < 0.35) return 78 - t*12              // building to chorus
+      if (t < 0.55) return 84 - t*8               // chorus peak — retention goes UP slightly
+      if (t < 0.75) return 76 - t*20              // post-chorus decay
+      return Math.max(55 - (t - 0.75)*80, 20)     // outro tail
+
+    case 'commercial':
+      // Very fast drop-off if hook doesn't land, then stable if it does
+      if (t < 0.08) return 95
+      if (t < 0.25) return 88 - t*50              // hook test: sharp drop if not compelling
+      if (t < 0.70) return Math.max(72 - t*18, 40) // sustained if brand message holds
+      return Math.max(65 - (t - 0.70)*60, 25)     // end-card drop
+
+    case 'short_form_ad':
+      // Extremely front-loaded — must deliver in first 30% or it's over
+      if (t < 0.15) return 97
+      if (t < 0.40) return Math.max(85 - t*70, 30) // brutal mid-drop
+      return Math.max(45 - (t - 0.40)*50, 15)      // survivors watching through
+
+    case 'tutorial':
+      // Step-based plateaus — people pause and rewatch, then skip ahead
+      // Natural staircase pattern with occasional spikes at key moments
+      if (t < 0.10) return 92
+      const step = Math.floor(t / 0.18)
+      const baseT = 85 - step * 8                  // each step loses some viewers
+      return Math.max(baseT - Math.random()*5, 25)
+
+    case 'vlog':
+      // Steady decline with personality-driven retention — loyal fans stay, casual drop early
+      if (t < 0.08) return 90
+      return Math.max(85 - t*42 - Math.random()*6, 18) // gentle consistent slope
+
+    case 'documentary':
+      // Slow start (setup), tension builds through middle, payoff holds people
+      if (t < 0.10) return 88                      // opening hook
+      if (t < 0.30) return 82 - t*15              // setup/context section — some drop
+      if (t < 0.65) return Math.max(72 - t*10, 45) // investigation builds tension
+      return Math.max(60 - (t - 0.65)*25, 30)     // conclusion payoff holds some, others done
+
+    case 'product_demo':
+      // High hook (unboxing excitement), mid-drop during specs, recovers at price reveal
+      if (t < 0.10) return 93
+      if (t < 0.35) return 85 - t*20              // post-reveal settle
+      if (t < 0.55) return 68 - t*12              // spec/detail section — skip risk
+      if (t < 0.75) return 72 - t*8               // price/verdict recovery
+      return Math.max(55 - (t - 0.75)*60, 20)
+
+    default: // organic_video
+      // Standard gentle decline with scroll-stop recovery potential mid-video
+      return Math.max(95 - t*38 - Math.random()*7, 10)
+  }
+}
+
+function buildSegments(duration_sec: number, dropoff_points: number[], content_type = 'organic_video'): any[] {
   const segCount = Math.min(Math.max(Math.ceil(duration_sec / 5), 4), 20)
   const segLen   = duration_sec / segCount
   const segs     = []
   for (let i = 0; i < segCount; i++) {
-    const tStart = Math.round(i * segLen), tEnd = Math.round((i+1) * segLen)
-    let retention = Math.max(100 - (i / segCount)*35 - Math.random()*8, 10)
+    const tStart  = Math.round(i * segLen)
+    const tEnd    = Math.round((i+1) * segLen)
+    const t       = i / segCount  // normalized position 0–1
+    let retention = baseRetention(t, content_type)
+    // Apply user-provided drop-off points as additional penalties
     const isDropoff = dropoff_points.some(dp => dp >= tStart && dp <= tEnd)
-    if (isDropoff) retention = Math.max(retention - 25 - Math.random()*15, 5)
+    if (isDropoff) retention = Math.max(retention - 22 - Math.random()*14, 5)
     segs.push({ index:i, start:tStart, end:tEnd, label:`${tStart}s–${tEnd}s`, retention:Math.round(retention), is_dropoff:isDropoff, severity:isDropoff?(retention<30?'critical':'warning'):'normal' })
   }
   return segs
@@ -2917,21 +3009,92 @@ app.get('/tools/distribution', async (c) => {
 app.post('/api/attention/analyze', requireAuth, async (c) => {
   try {
     const body = await c.req.json()
-    const { platform='tiktok', content_url='', content_description='', duration_sec=60, metrics={}, dropoff_points=[], hook_text='', script_excerpt='' } = body
-    const scores   = computeWeightedScore(metrics, platform)
-    const segments = buildSegments(duration_sec, dropoff_points)
+    const { platform='tiktok', content_type='organic_video', content_url='', content_description='', duration_sec=60, metrics={}, dropoff_points=[], hook_text='', script_excerpt='' } = body
+    const scores   = computeWeightedScore(metrics, platform, content_type)
+    const segments = buildSegments(duration_sec, dropoff_points, content_type)
     const weights  = PLATFORM_WEIGHTS[platform] || PLATFORM_WEIGHTS.tiktok
 
-    const systemPrompt = `You are Spectra's Attention Engine — an elite content performance analyst for Pano Marketing.
-Output format: You must return a valid JSON object with this exact structure:
+    // ── Content-type profiles ──────────────────────────────────────
+    const CONTENT_TYPE_PROFILES: Record<string, { label: string; diagKeys: string[]; benchmarks: string; criteria: string }> = {
+      organic_video: {
+        label: 'Organic Social Video',
+        diagKeys: ['hook_effectiveness','pacing','visual_engagement','messaging_clarity','emotional_impact','shareability'],
+        benchmarks: 'Organic: avg like rate 3–6%, comment rate 0.5–1.5%, watch-through 35–55%. High shareability and emotional resonance drive organic reach.',
+        criteria: 'Evaluate hook in first 3 seconds, pattern interrupts, scroll-stopping visuals, relatability, and share triggers. CTA is optional for organic — focus on emotional resonance and replay value instead.',
+      },
+      music_video: {
+        label: 'Music Video',
+        diagKeys: ['hook_effectiveness','visual_storytelling','audio_sync','emotional_resonance','replay_value','pacing'],
+        benchmarks: 'Music videos: avg like rate 4–10%, comment rate 1–3%, high rewatch rates are the primary success metric. Drop-off before the chorus is a critical failure point.',
+        criteria: 'Evaluate intro hook (first 5s), visual narrative coherence, audio-visual synchronization, chorus/drop moment impact, emotional journey, and replay triggers. CTA is irrelevant. Traditional "messaging clarity" does not apply — instead judge emotional and sensory engagement. Mid-video peaks at chorus/hook sections should show retention spikes, NOT drops.',
+      },
+      commercial: {
+        label: 'Brand Commercial',
+        diagKeys: ['hook_effectiveness','brand_recall','messaging_clarity','emotional_impact','cta_strength','visual_engagement'],
+        benchmarks: 'Commercial benchmarks: 15–30s ads need >70% view-through, 60s+ need >50%. Like rate above 1% is exceptional for paid. Brand recall within 3s is critical. Clear single message outperforms multi-message.',
+        criteria: 'Evaluate brand visibility in first 3s, single core message delivery, emotional brand association, urgency/CTA effectiveness, product/service clarity, and memorability. Pacing must be tight — commercials cannot afford slow sections. Every second must earn its place.',
+      },
+      short_form_ad: {
+        label: 'Short-Form Ad (6–15s)',
+        diagKeys: ['hook_effectiveness','message_compression','brand_recall','cta_strength','visual_impact','skip_resistance'],
+        benchmarks: 'Short ads: <6s non-skippable need 100% message delivery; 6–15s need brand recall by 3s and CTA by 10s. Like rate is not a success metric — completion rate and click-through are.',
+        criteria: 'Evaluate immediate pattern disruption (0s), brand presence within 3s, compressed message delivery, hard CTA placement, visual distinctiveness to stop mid-scroll skip. NO time for storytelling — every frame is a conversion event. Pacing and emotional arc are secondary to message clarity and skip-resistance.',
+      },
+      tutorial: {
+        label: 'Tutorial / How-To',
+        diagKeys: ['hook_effectiveness','information_density','pacing','visual_clarity','step_progression','cta_strength'],
+        benchmarks: 'Tutorials: avg watch-through 55–75%, save rate 3–8% (saves are the primary success metric), comment rate 1–3%. Drop-off at any step indicates that step is unclear or too slow.',
+        criteria: 'Evaluate promise clarity in hook (what will you learn?), information density per minute, visual demonstration quality, step-by-step logical flow, appropriate pacing (not too fast or slow), and end-screen CTA for saves/subscribe. Emotional impact is secondary — clarity and utility drive performance. Each drop-off likely indicates a confusing or skippable section.',
+      },
+      vlog: {
+        label: 'Vlog / Talking Head',
+        diagKeys: ['hook_effectiveness','personality_strength','pacing','storytelling','authenticity','audience_connection'],
+        benchmarks: 'Vlogs: avg watch-through 40–60%, comment rate 1.5–4% (comments indicate community), like rate 3–7%. Drop-off in first 30s means the hook failed to establish why viewers should stay.',
+        criteria: 'Evaluate personality hook (why this creator, why now?), storytelling momentum, authentic moments vs performance, pacing (dead air, repetition, unnecessary tangents), B-roll and visual variety, and community-building language. CTA effectiveness is important but secondary to personality/connection. Traditional brand messaging does not apply.',
+      },
+      documentary: {
+        label: 'Documentary / Long-Form',
+        diagKeys: ['hook_effectiveness','narrative_arc','pacing','information_depth','emotional_journey','visual_production'],
+        benchmarks: 'Documentary/long-form: avg watch-through 30–50% for 10–30min content, save rate 2–5%, comment depth (long comments) is success indicator. Chapters/timestamps increase completion significantly.',
+        criteria: 'Evaluate opening narrative hook (curiosity/tension), structural chapter flow, investigative/informational depth, emotional beats and tension pacing, visual production quality, and narrative payoff at conclusion. Drop-offs map to loss of narrative tension or information overload. CTA is secondary — end cards and chapters matter more than explicit CTAs.',
+      },
+      product_demo: {
+        label: 'Product Demo / Unboxing',
+        diagKeys: ['hook_effectiveness','product_clarity','pacing','trust_signals','cta_strength','visual_engagement'],
+        benchmarks: 'Product demos: avg watch-through 50–70%, save rate 4–10% (saves = purchase consideration), click-through on product links. Like rate is secondary to save rate and link clicks.',
+        criteria: 'Evaluate product reveal timing (too early = no hook, too late = lost interest), feature demonstration clarity, trust signals (honest pros/cons, real reactions), value proposition communication, and purchase CTA placement. Unboxings need genuine reaction moments. Pacing must match product complexity — tech demos need more time per feature than beauty unboxings.',
+      },
+    }
+
+    const ctProfile = CONTENT_TYPE_PROFILES[content_type] || CONTENT_TYPE_PROFILES.organic_video
+    const diagKeys  = ctProfile.diagKeys
+
+    // Build the format-specific diagnosis schema dynamically
+    const diagSchemaLines = diagKeys.map(k => `    "${k}": { "score": 0-100, "verdict": "string", "reasoning": "string", "fix": "string" }`).join(',\n')
+
+    const systemPrompt = `You are Spectra's Attention Engine — an elite content performance analyst for Pano Marketing. You specialize in distinguishing performance by content format. Generic analysis is a failure state.
+
+CONTENT TYPE BEING ANALYZED: ${ctProfile.label}
+PLATFORM: ${platform.toUpperCase()}
+
+BENCHMARKS FOR THIS FORMAT:
+${ctProfile.benchmarks}
+
+EVALUATION CRITERIA FOR THIS FORMAT:
+${ctProfile.criteria}
+
+CRITICAL RULES:
+1. You MUST apply the benchmarks and criteria above specifically for ${ctProfile.label} content. Do NOT use generic social media analysis.
+2. Scores must be calibrated to this format — a 70/100 hook for a music video means something completely different than a 70/100 hook for a commercial.
+3. The diagnosis categories below are format-specific. Only evaluate what is listed.
+4. Scores must vary meaningfully based on the actual data provided. Do not cluster all scores in the 60–75 range. Use the full 0–100 range.
+5. If metrics indicate genuinely strong performance for this format, say so with high scores. If weak, score low.
+6. The overall_verdict must be a specific, opinionated diagnosis — not generic praise.
+
+Output format: You must return a valid JSON object with EXACTLY this structure (no extra keys, no markdown):
 {
   "diagnosis": {
-    "hook_effectiveness": { "score": 0-100, "verdict": "string", "reasoning": "string", "fix": "string" },
-    "pacing": { "score": 0-100, "verdict": "string", "reasoning": "string", "fix": "string" },
-    "visual_engagement": { "score": 0-100, "verdict": "string", "reasoning": "string", "fix": "string" },
-    "messaging_clarity": { "score": 0-100, "verdict": "string", "reasoning": "string", "fix": "string" },
-    "emotional_impact": { "score": 0-100, "verdict": "string", "reasoning": "string", "fix": "string" },
-    "cta_strength": { "score": 0-100, "verdict": "string", "reasoning": "string", "fix": "string" }
+${diagSchemaLines}
   },
   "dropoff_analysis": [{ "timestamp":"string","cause":"string","severity":"critical|warning","fix":"string" }],
   "top_issues": ["string","string","string"],
@@ -2941,15 +3104,33 @@ Output format: You must return a valid JSON object with this exact structure:
   "overall_verdict": "string"
 }`
 
-    const userPrompt = `Analyze this ${platform.toUpperCase()} content:
-CONTENT URL: ${content_url||'Not provided'}\nCONTENT DESCRIPTION: ${content_description||'Not provided'}\nHOOK TEXT: ${hook_text||'Not provided'}\nSCRIPT EXCERPT: ${script_excerpt||'Not provided'}\nDURATION: ${duration_sec} seconds
-WEIGHTED SCORES: Composite: ${scores.composite}/100, Watch: ${scores.watch_score}/100, Share: ${scores.share_score}/100
-DROP-OFF POINTS: ${dropoff_points.length>0?dropoff_points.map((p:number)=>`${p}s`).join(', '):'None'}
-TIMELINE:\n${segments.map((s:any)=>`[${s.label}] Retention: ${s.retention}% ${s.is_dropoff?'⚠️ DROP-OFF':''}`).join('\n')}`
+    const userPrompt = `Analyze this ${platform.toUpperCase()} ${ctProfile.label}:
+CONTENT URL: ${content_url||'Not provided'}
+CONTENT DESCRIPTION: ${content_description||'Not provided'}
+HOOK TEXT: ${hook_text||'Not provided'}
+SCRIPT EXCERPT: ${script_excerpt||'Not provided'}
+DURATION: ${duration_sec} seconds
+
+PERFORMANCE METRICS (calibrate scores against ${ctProfile.label} benchmarks, not generic social):
+  Views: ${(metrics as any).views||0}
+  Likes: ${(metrics as any).likes||0} (like rate: ${(metrics as any).views > 0 ? (((metrics as any).likes/(metrics as any).views)*100).toFixed(2) : '0'}%)
+  Comments: ${(metrics as any).comments||0} (comment rate: ${(metrics as any).views > 0 ? (((metrics as any).comments/(metrics as any).views)*100).toFixed(2) : '0'}%)
+  Shares: ${(metrics as any).shares||0}
+  Saves: ${(metrics as any).saves||0}
+  Watch Time: ${(metrics as any).watch_time_pct||0}%
+
+WEIGHTED COMPOSITE SCORE: ${scores.composite}/100 (${platform} platform weights applied)
+INDIVIDUAL SIGNAL SCORES: Watch: ${scores.watch_score}/100 | Shares: ${scores.share_score}/100 | Likes: ${scores.like_score}/100 | Comments: ${scores.comment_score}/100
+
+DROP-OFF POINTS: ${dropoff_points.length>0?dropoff_points.map((p:number)=>`${p}s`).join(', '):'None provided'}
+TIMELINE RETENTION:
+${segments.map((s:any)=>`[${s.label}] Retention: ${s.retention}% ${s.is_dropoff?'⚠️ DROP-OFF':''}`).join('\n')}
+
+Now give a precise, format-specific analysis. Scores must reflect the actual data above and be calibrated to ${ctProfile.label} norms.`
 
     const ai     = getAIClient(c.env)
-    const stream = await ai.chat.completions.create({ model:'gpt-4o', messages:[{role:'system',content:systemPrompt},{role:'user',content:userPrompt}], stream:true, temperature:0.4, max_tokens:2800 })
-    const metaChunk = JSON.stringify({ type:'meta', scores, segments, platform, weights })
+    const stream = await ai.chat.completions.create({ model:'gpt-4o', messages:[{role:'system',content:systemPrompt},{role:'user',content:userPrompt}], stream:true, temperature:0.65, max_tokens:3200 })
+    const metaChunk = JSON.stringify({ type:'meta', scores, segments, platform, content_type, content_type_label: ctProfile.label, diag_keys: diagKeys, weights })
     return new Response(new ReadableStream({ async start(ctrl) {
       const enc = new TextEncoder()
       ctrl.enqueue(enc.encode(`data: ${metaChunk}\n\n`))
@@ -3045,9 +3226,9 @@ ${style_preset ? `Style preset active: ${style_preset} — keep improved prompt 
 app.post('/api/attention/score', requireAuth, async (c) => {
   try {
     const body = await c.req.json()
-    const { platform='tiktok', metrics={}, duration_sec=60, dropoff_points=[] } = body
-    const scores   = computeWeightedScore(metrics, platform)
-    const segments = buildSegments(duration_sec, dropoff_points)
+    const { platform='tiktok', content_type='organic_video', metrics={}, duration_sec=60, dropoff_points=[] } = body
+    const scores   = computeWeightedScore(metrics, platform, content_type)
+    const segments = buildSegments(duration_sec, dropoff_points, content_type)
     const weights  = PLATFORM_WEIGHTS[platform]
     const hookScore       = dropoff_points.some((d:number)=>d<=5) ? Math.max(scores.composite-30,10) : Math.min(scores.watch_score+15,100)
     const retentionScore  = Math.round(segments.reduce((a:number,s:any)=>a+s.retention,0)/segments.length)
@@ -5343,6 +5524,7 @@ function attentionEnginePage(): string {
 <main id="ae-main">
   <aside id="ae-input-panel">
     <div class="ae-section"><div class="ae-section-label">Platform</div><div class="ae-platform-grid" id="platform-grid"><button class="ae-platform-btn active" data-platform="tiktok"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 01-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 01-2.88 2.5 2.89 2.89 0 01-2.89-2.89 2.89 2.89 0 012.89-2.89c.28 0 .54.04.79.1V9.01a6.27 6.27 0 00-.79-.05 6.34 6.34 0 00-6.34 6.34 6.34 6.34 0 006.34 6.34 6.34 6.34 0 006.33-6.34V8.69a8.18 8.18 0 004.78 1.52V6.75a4.85 4.85 0 01-1.01-.06z"/></svg>TikTok</button><button class="ae-platform-btn" data-platform="instagram"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/></svg>Instagram</button><button class="ae-platform-btn" data-platform="youtube" id="plat-btn-youtube"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M23 7s-.3-2-1.2-2.8c-1.1-1.2-2.4-1.2-3-1.3C16.6 2.8 12 2.8 12 2.8s-4.6 0-6.8.1c-.6.1-1.9.1-3 1.3C1.3 5 1 7 1 7S.7 9.1.7 11.3v2c0 2.1.3 4.2.3 4.2s.3 2 1.2 2.8c1.1 1.2 2.6 1.1 3.3 1.2C7.6 21.7 12 21.7 12 21.7s4.6 0 6.8-.2c.6-.1 1.9-.1 3-1.3.9-.8 1.2-2.8 1.2-2.8s.3-2.1.3-4.2v-2C23.3 9.1 23 7 23 7zM9.7 15.5V8.4l8.1 3.6-8.1 3.5z"/></svg>YouTube<span class="ae-conn-badge"></span></button><button class="ae-platform-btn" data-platform="twitter"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>Twitter/X</button><button class="ae-platform-btn" data-platform="facebook"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M24 12.073C24 5.405 18.627 0 12 0S0 5.405 0 12.073c0 6.024 4.388 11.02 10.125 11.927v-8.437H7.078v-3.49h3.047V9.41c0-3.025 1.792-4.697 4.533-4.697 1.312 0 2.686.235 2.686.235v2.97h-1.513c-1.491 0-1.956.93-1.956 1.886v2.254h3.328l-.532 3.49h-2.796v8.437C19.612 23.093 24 18.097 24 12.073z"/></svg>Facebook</button><button class="ae-platform-btn" data-platform="ads"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M7 15l3-4 3 4 3-5"/></svg>Paid Ads</button><button class="ae-platform-btn" data-platform="bluesky" id="plat-btn-bluesky"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14.5v-4.5H8l4-5 4 5h-3v4.5h-2z"/></svg>Bluesky<span class="ae-conn-badge"></span></button></div></div>
+    <div class="ae-section"><div class="ae-section-label">Content Type</div><div class="ae-ct-grid" id="content-type-grid"><button class="ae-ct-btn active" data-ct="organic_video">🎬 Organic Video</button><button class="ae-ct-btn" data-ct="music_video">🎵 Music Video</button><button class="ae-ct-btn" data-ct="commercial">📢 Commercial</button><button class="ae-ct-btn" data-ct="short_form_ad">⚡ Short Ad</button><button class="ae-ct-btn" data-ct="tutorial">📚 Tutorial</button><button class="ae-ct-btn" data-ct="vlog">🎙 Vlog</button><button class="ae-ct-btn" data-ct="documentary">🎞 Documentary</button><button class="ae-ct-btn" data-ct="product_demo">📦 Product Demo</button></div></div>
     <div class="ae-section"><div class="ae-section-label">Content Input</div><div class="ae-input-tabs"><button class="ae-tab active" data-tab="url">URL / Link</button><button class="ae-tab" data-tab="manual">Manual Entry</button></div><div class="ae-tab-content active" id="tab-url"><div class="ae-field"><label class="ae-label">Video / Post URL<span class="ae-url-fetch-spinner" id="url-spinner"></span></label><div class="ae-url-input-wrap"><svg class="ae-input-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 13a3 3 0 100-6 3 3 0 000 6z"/><path d="M10 2C5.58 2 2 5.58 2 10s3.58 8 8 8 8-3.58 8-8-3.58-8-8-8z"/></svg><input type="url" id="content-url" class="ae-input" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off"/></div><div class="ae-url-preview" id="url-preview"><img class="ae-url-preview-thumb" id="url-thumb" src="" alt=""/><div class="ae-url-preview-info"><div class="ae-url-preview-title" id="url-preview-title"></div><div class="ae-url-preview-meta" id="url-preview-meta"></div></div></div><div id="url-fetch-note" style="display:none;font-size:0.68rem;color:var(--ice-dim);margin-top:0.4rem;font-style:italic;line-height:1.5"></div></div><div class="ae-field"><label class="ae-label">Hook / Opening Line</label><input type="text" id="hook-text" class="ae-input" placeholder="First 3 seconds of your content..."/></div></div><div class="ae-tab-content" id="tab-manual"><div class="ae-field"><label class="ae-label">Content Description</label><textarea id="content-desc" class="ae-textarea" rows="3" placeholder="Describe your content — topic, format, target audience..."></textarea></div><div class="ae-field"><label class="ae-label">Hook / Opening Line</label><input type="text" id="hook-text-2" class="ae-input" placeholder="First 3 seconds..."/></div><div class="ae-field"><label class="ae-label">Script / Caption</label><textarea id="script-text" class="ae-textarea" rows="4" placeholder="Paste your script or caption here..."></textarea></div></div></div>
     <div class="ae-section"><div class="ae-section-label">Performance Metrics</div><div class="ae-metrics-grid"><div class="ae-field"><label class="ae-label">Views</label><input type="number" id="m-views" class="ae-input ae-metric-input" placeholder="0" min="0"/></div><div class="ae-field"><label class="ae-label">Likes</label><input type="number" id="m-likes" class="ae-input ae-metric-input" placeholder="0" min="0"/></div><div class="ae-field"><label class="ae-label">Comments</label><input type="number" id="m-comments" class="ae-input ae-metric-input" placeholder="0" min="0"/></div><div class="ae-field"><label class="ae-label">Shares</label><input type="number" id="m-shares" class="ae-input ae-metric-input" placeholder="0" min="0"/></div><div class="ae-field"><label class="ae-label">Saves</label><input type="number" id="m-saves" class="ae-input ae-metric-input" placeholder="0" min="0"/></div><div class="ae-field"><label class="ae-label">Watch Time %</label><input type="number" id="m-watchtime" class="ae-input ae-metric-input" placeholder="0" min="0" max="100"/></div></div></div>
     <div class="ae-section"><div class="ae-section-label">Timeline</div><div class="ae-two-col"><div class="ae-field"><label class="ae-label">Duration (seconds)</label><input type="number" id="duration" class="ae-input" placeholder="60" value="60" min="1"/></div><div class="ae-field"><label class="ae-label">Drop-off Points (sec)</label><input type="text" id="dropoff-points" class="ae-input" placeholder="e.g. 3, 15, 42"/></div></div></div>
@@ -5353,7 +5535,7 @@ function attentionEnginePage(): string {
     <div class="ae-empty-state" id="ae-empty"><div class="ae-empty-icon"><svg viewBox="0 0 64 64" fill="none"><circle cx="32" cy="32" r="28" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 3" opacity="0.3"/><circle cx="32" cy="32" r="16" stroke="currentColor" stroke-width="1.5" opacity="0.5"/><circle cx="32" cy="32" r="5" fill="currentColor" opacity="0.7"/><circle cx="32" cy="12" r="2.5" fill="currentColor" opacity="0.4"/><circle cx="50" cy="42" r="2.5" fill="currentColor" opacity="0.4"/><circle cx="14" cy="42" r="2.5" fill="currentColor" opacity="0.4"/><line x1="32" y1="32" x2="32" y2="14.5" stroke="currentColor" stroke-width="1" opacity="0.3"/><line x1="32" y1="32" x2="48" y2="40.5" stroke="currentColor" stroke-width="1" opacity="0.3"/><line x1="32" y1="32" x2="16" y2="40.5" stroke="currentColor" stroke-width="1" opacity="0.3"/></svg></div><h2 class="ae-empty-title">Attention Engine Ready</h2><p class="ae-empty-sub">Enter your content details and performance metrics on the left, then run the analysis to get a full breakdown.</p><div class="ae-empty-chips"><span class="ae-chip">Drop-off Detection</span><span class="ae-chip">Intelligent Diagnosis</span><span class="ae-chip">Hook Scoring</span><span class="ae-chip">Script Rewrite</span><span class="ae-chip">Platform Weights</span><span class="ae-chip">Optimization Plan</span></div></div>
     <div class="ae-loading" id="ae-loading" style="display:none"><div class="ae-loading-ring"></div><div class="ae-loading-label" id="loading-label">Initializing analysis...</div><div class="ae-loading-stream" id="loading-stream"></div></div>
     <div class="ae-results" id="ae-results" style="display:none">
-      <div class="ae-results-header"><div class="ae-results-title"><span class="ae-results-platform-badge" id="results-platform-badge"></span><h2>Analysis Complete</h2></div><div class="ae-results-actions"><button class="ae-btn-icon" id="btn-export" title="Export Report"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></button><button class="ae-btn-icon" id="btn-copy" title="Copy Results"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></button><button class="ae-btn-icon" id="btn-rerun" title="Re-run Analysis"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg></button></div></div>
+      <div class="ae-results-header"><div class="ae-results-title"><span class="ae-results-platform-badge" id="results-platform-badge"></span><span class="ae-results-ct-badge" id="results-ct-badge"></span><h2>Analysis Complete</h2></div><div class="ae-results-actions"><button class="ae-btn-icon" id="btn-export" title="Export Report"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></button><button class="ae-btn-icon" id="btn-copy" title="Copy Results"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></button><button class="ae-btn-icon" id="btn-rerun" title="Re-run Analysis"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg></button></div></div>
       <div class="ae-output-tabs"><button class="ae-output-tab active" data-output-tab="scores">Scores</button><button class="ae-output-tab" data-output-tab="timeline">Timeline</button><button class="ae-output-tab" data-output-tab="diagnosis">Diagnosis</button><button class="ae-output-tab" data-output-tab="optimize">Optimize</button><button class="ae-output-tab" data-output-tab="rewrite">Rewrite</button></div>
       <div class="ae-output-content active" id="out-scores"><div class="ae-score-row" id="score-cards-row"></div><div class="ae-signal-section"><div class="ae-signal-title">Signal Breakdown<span class="ae-signal-platform-label" id="signal-platform-label"></span></div><div class="ae-signal-bars" id="signal-bars"></div></div><div class="ae-verdict-card" id="verdict-card" style="display:none"><div class="ae-verdict-label">INTELLIGENT VERDICT</div><div class="ae-verdict-text" id="verdict-text"></div></div></div>
       <div class="ae-output-content" id="out-timeline"><div class="ae-timeline-header"><div class="ae-tl-legend"><span class="ae-tl-dot normal"></span>Strong<span class="ae-tl-dot warning"></span>Warning<span class="ae-tl-dot critical"></span>Critical Drop-off</div></div><div class="ae-timeline-chart" id="timeline-chart"></div><div class="ae-dropoff-list" id="dropoff-list"></div></div>
