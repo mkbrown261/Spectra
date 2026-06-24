@@ -1099,7 +1099,7 @@ async function loadShots(projectId) {
    SHOT GRID RENDER
    ═══════════════════════════════════════════════════════════════ */
 
-function renderShotGrid(projectId) {
+function baseRenderShotGrid(projectId) {
   const grid = $('vg-shot-grid');
   if (!grid) return;
 
@@ -4903,9 +4903,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
 /* ── Patch renderShotGrid to show Compare + Timeline buttons
       and wire compare-checkbox on each shot card ──────────────── */
-const _origRenderShotGrid = renderShotGrid;
 function renderShotGrid(projectId) {
-  _origRenderShotGrid(projectId);
+  baseRenderShotGrid(projectId);
 
   // Show board header action buttons when a project is loaded
   const compareBtn  = $('btn-open-compare');
