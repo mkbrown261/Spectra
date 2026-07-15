@@ -57,6 +57,12 @@
   /* Transitions */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in:  cubic-bezier(0.4, 0, 1, 1);
+  --t-fast:   0.18s;
+
+  /* Aliases used by later sections (Findings #31) */
+  --accent-mid: rgba(124,106,247,0.35);
+  --text-main:  var(--text-primary);
+  --font-mono:  'Space Mono', 'Courier New', monospace;
 
   /* Nav */
   --nav-h: 52px;

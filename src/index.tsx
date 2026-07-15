@@ -2396,9 +2396,8 @@ app.post('/api/distribution/upload', requireAuth, async (c) => {
       httpMetadata: { contentType: file.type || 'video/mp4' },
     })
 
-    const publicUrl = `https://pub-${c.env.STORAGE.toString().split(':')[0]}.r2.dev/${key}`
-    // Serve through our own proxy route
-    const serveUrl = `/api/media/${key}`
+    // Serve through our own R2 proxy route (same pattern as /api/video/:key used elsewhere)
+    const serveUrl = `/api/video/${encodeURIComponent(key)}`
 
     return c.json({ ok: true, key, url: serveUrl, size: file.size, name: file.name })
   } catch (err: any) { return c.json({ error: err.message }, 500) }
