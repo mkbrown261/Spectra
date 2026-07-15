@@ -53,6 +53,35 @@ const HF_MODELS = [
 const HF_BASE = 'https://platform.higgsfield.ai'
 
 /* ══════════════════════════════════════════════════════════════════
+   MOTION ENGINE — CAMERA MOVE CATALOG
+   Vocabulary shared between the AI composer and the manual beat
+   editor. `prompt_fragment` is appended to the shot prompt sent to
+   Higgsfield; `strength_hint` seeds the default intensity slider.
+══════════════════════════════════════════════════════════════════ */
+const CAMERA_MOVES = [
+  { id: 'static',        label: 'Static Lock',      category: 'still',  prompt_fragment: 'locked-off static shot, no camera movement',              strength_hint: 2 },
+  { id: 'push_in',       label: 'Push In',          category: 'dolly',  prompt_fragment: 'slow dolly push-in toward the subject',                    strength_hint: 5 },
+  { id: 'pull_out',      label: 'Pull Out',         category: 'dolly',  prompt_fragment: 'slow dolly pull-out revealing the wider scene',            strength_hint: 5 },
+  { id: 'pan_left',      label: 'Pan Left',         category: 'pan',    prompt_fragment: 'smooth camera pan to the left',                            strength_hint: 4 },
+  { id: 'pan_right',     label: 'Pan Right',        category: 'pan',    prompt_fragment: 'smooth camera pan to the right',                           strength_hint: 4 },
+  { id: 'tilt_up',       label: 'Tilt Up',          category: 'pan',    prompt_fragment: 'camera tilts upward, revealing scale',                     strength_hint: 4 },
+  { id: 'tilt_down',     label: 'Tilt Down',        category: 'pan',    prompt_fragment: 'camera tilts downward',                                    strength_hint: 4 },
+  { id: 'orbit_left',    label: 'Orbit Left',       category: 'orbit',  prompt_fragment: 'camera orbits counter-clockwise around the subject',       strength_hint: 6 },
+  { id: 'orbit_right',   label: 'Orbit Right',      category: 'orbit',  prompt_fragment: 'camera orbits clockwise around the subject',               strength_hint: 6 },
+  { id: 'crane_up',      label: 'Crane Up',         category: 'crane',  prompt_fragment: 'crane shot rising upward above the subject',               strength_hint: 6 },
+  { id: 'crane_down',    label: 'Crane Down',       category: 'crane',  prompt_fragment: 'crane shot descending toward the subject',                 strength_hint: 6 },
+  { id: 'handheld',      label: 'Handheld',         category: 'handheld', prompt_fragment: 'handheld camera with natural shake, documentary feel',  strength_hint: 7 },
+  { id: 'whip_pan',      label: 'Whip Pan',         category: 'pan',    prompt_fragment: 'fast whip-pan transition, motion blur',                    strength_hint: 9 },
+  { id: 'zoom_in',       label: 'Zoom In',          category: 'zoom',   prompt_fragment: 'lens zoom in, tightening on the subject',                  strength_hint: 5 },
+  { id: 'zoom_out',      label: 'Zoom Out',         category: 'zoom',   prompt_fragment: 'lens zoom out, widening the frame',                        strength_hint: 5 },
+  { id: 'dolly_zoom',    label: 'Dolly Zoom (Vertigo)', category: 'dolly', prompt_fragment: 'dolly zoom vertigo effect, background warps',           strength_hint: 8 },
+  { id: 'tracking',      label: 'Tracking Shot',    category: 'tracking', prompt_fragment: 'camera tracks alongside the subject in motion',         strength_hint: 6 },
+  { id: 'aerial',        label: 'Aerial / Drone',   category: 'aerial', prompt_fragment: 'sweeping aerial drone shot from above',                    strength_hint: 7 },
+  { id: 'low_angle',     label: 'Low Angle Push',   category: 'dolly',  prompt_fragment: 'low-angle push-in, subject towers over camera',            strength_hint: 6 },
+  { id: 'shake_impact',  label: 'Impact Shake',     category: 'handheld', prompt_fragment: 'sudden camera shake on impact, high energy',             strength_hint: 9 },
+]
+
+/* ══════════════════════════════════════════════════════════════════
    UTILITIES
 ══════════════════════════════════════════════════════════════════ */
 function uuid(): string {
@@ -494,6 +523,91 @@ async function enhancePromptAdvanced(env: Bindings, params: {
   }
 }
 
+/* ══════════════════════════════════════════════════════════════════
+   MOTION ENGINE — AI SEQUENCE COMPOSER
+   Given a scene description + desired beat count, ask GPT-4o to pick
+   an ordered list of camera moves from CAMERA_MOVES (by id only) with
+   per-beat intensity/duration/notes. Falls back to a simple
+   push-in → orbit → pull-out arc if the model call fails or returns
+   something we can't parse.
+══════════════════════════════════════════════════════════════════ */
+async function composeMotionSequence(env: Bindings, params: {
+  description: string
+  beat_count?: number
+  mood?: string
+}): Promise<Array<{ camera_move: string; intensity: number; duration_sec: number; notes: string }>> {
+  const beatCount = Math.min(Math.max(params.beat_count || 4, 2), 10)
+  const catalogIds = CAMERA_MOVES.map(m => m.id).join(', ')
+
+  const fallback = () => {
+    const arc = ['push_in', 'orbit_left', 'tracking', 'pull_out']
+    return Array.from({ length: beatCount }, (_, i) => {
+      const id = arc[i % arc.length]
+      const move = CAMERA_MOVES.find(m => m.id === id)!
+      return { camera_move: id, intensity: move.strength_hint, duration_sec: 5, notes: 'Fallback beat (AI composer unavailable).' }
+    })
+  }
+
+  try {
+    const ai = getAIClient(env)
+    const systemPrompt = `You are a cinematography director composing a camera-motion sequence for an AI video generator.
+Choose exactly ${beatCount} beats, each using ONE camera move id from this catalog: ${catalogIds}.
+For each beat return: camera_move (catalog id, exact match), intensity (1-10 integer), duration_sec (2-10 integer), notes (one short sentence explaining the choice).
+Respond with ONLY a JSON array of ${beatCount} objects, no prose, no markdown fences.`
+
+    const userPrompt = `Scene: ${params.description}${params.mood ? `\nMood/genre: ${params.mood}` : ''}`
+
+    const resp = await ai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userPrompt },
+      ],
+      temperature: 0.8,
+      max_tokens:  600,
+      response_format: { type: 'json_object' as any },
+    }).catch(async () => {
+      // Some models reject response_format on plain arrays — retry without it.
+      return ai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user',   content: userPrompt },
+        ],
+        temperature: 0.8,
+        max_tokens:  600,
+      })
+    })
+
+    let raw = resp.choices[0]?.message?.content?.trim() || ''
+    raw = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim()
+
+    let parsed: any = JSON.parse(raw)
+    // Model may wrap the array under a key like {"beats":[...]} when json_object mode forces an object.
+    if (!Array.isArray(parsed)) {
+      const arrKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]))
+      parsed = arrKey ? parsed[arrKey] : null
+    }
+    if (!Array.isArray(parsed) || parsed.length === 0) return fallback()
+
+    const validIds = new Set(CAMERA_MOVES.map(m => m.id))
+    const beats = parsed.slice(0, beatCount).map((b: any) => {
+      const moveId = validIds.has(b.camera_move) ? b.camera_move : 'push_in'
+      const move    = CAMERA_MOVES.find(m => m.id === moveId)!
+      const intensity = Number.isFinite(Number(b.intensity)) ? Math.min(10, Math.max(1, Math.round(Number(b.intensity)))) : move.strength_hint
+      const duration  = Number.isFinite(Number(b.duration_sec)) ? Math.min(10, Math.max(2, Math.round(Number(b.duration_sec)))) : 5
+      return {
+        camera_move:  moveId,
+        intensity,
+        duration_sec: duration,
+        notes:        String(b.notes || '').slice(0, 200) || move.label,
+      }
+    })
+    return beats.length ? beats : fallback()
+  } catch {
+    return fallback()
+  }
+}
 
 async function checkTierLimits(db: D1Database, userId: string, tier: string): Promise<{ ok: boolean; reason?: string }> {
   const limits = TIER_LIMITS[tier] || TIER_LIMITS.free
@@ -3837,6 +3951,339 @@ function formatTimecode(totalSeconds: number): string {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+   MOTION COMPOSITION ENGINE — API ROUTES
+   Choreograph ordered camera-move sequences ("beats") per project,
+   either hand-built beat by beat or AI-composed from a scene
+   description. Beats can optionally be linked to a generated shot
+   and their move+intensity translate directly into the
+   motion_strength/prompt fields Video Generator sends to Higgsfield.
+══════════════════════════════════════════════════════════════════ */
+
+// GET /api/motion/catalog — camera-move vocabulary for the UI palette
+app.get('/api/motion/catalog', (c) => c.json({ moves: CAMERA_MOVES }))
+
+// GET /api/motion/sequences?project_id=... — list sequences for a project
+app.get('/api/motion/sequences', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const projectId = c.req.query('project_id')
+    if (!projectId) return c.json({ error: 'project_id required' }, 400)
+
+    const project = await c.env.DB.prepare(
+      `SELECT id FROM projects WHERE id = ? AND user_id = ?`
+    ).bind(projectId, userId).first()
+    if (!project) return c.json({ error: 'Project not found' }, 404)
+
+    const rows = await c.env.DB.prepare(
+      `SELECT ms.*, (SELECT COUNT(*) FROM motion_beats mb WHERE mb.sequence_id = ms.id) as beat_count,
+              (SELECT COALESCE(SUM(duration_sec),0) FROM motion_beats mb WHERE mb.sequence_id = ms.id) as total_duration_sec
+       FROM motion_sequences ms
+       WHERE ms.project_id = ? AND ms.user_id = ?
+       ORDER BY ms.updated_at DESC`
+    ).bind(projectId, userId).all()
+
+    return c.json({ sequences: rows.results })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// POST /api/motion/sequences — create an empty sequence
+app.post('/api/motion/sequences', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const { project_id, name, mood } = await c.req.json()
+    if (!project_id) return c.json({ error: 'project_id required' }, 400)
+    if (!name?.trim()) return c.json({ error: 'name required' }, 400)
+
+    const project = await c.env.DB.prepare(
+      `SELECT id FROM projects WHERE id = ? AND user_id = ?`
+    ).bind(project_id, userId).first()
+    if (!project) return c.json({ error: 'Project not found' }, 404)
+
+    const id = uuid()
+    await c.env.DB.prepare(
+      `INSERT INTO motion_sequences (id, project_id, user_id, name, mood) VALUES (?, ?, ?, ?, ?)`
+    ).bind(id, project_id, userId, name.trim(), mood?.trim() || null).run()
+
+    return c.json({ ok: true, id }, 201)
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// GET /api/motion/sequences/:id — full sequence with ordered beats
+app.get('/api/motion/sequences/:id', requireAuth, async (c) => {
+  try {
+    const userId     = c.get('userId')
+    const sequenceId = c.req.param('id')
+
+    const sequence = await c.env.DB.prepare(
+      `SELECT * FROM motion_sequences WHERE id = ? AND user_id = ?`
+    ).bind(sequenceId, userId).first()
+    if (!sequence) return c.json({ error: 'Sequence not found' }, 404)
+
+    const beats = await c.env.DB.prepare(
+      `SELECT * FROM motion_beats WHERE sequence_id = ? ORDER BY sort_order ASC, created_at ASC`
+    ).bind(sequenceId).all()
+
+    return c.json({ ...sequence, beats: beats.results })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// PATCH /api/motion/sequences/:id — rename / update mood
+app.patch('/api/motion/sequences/:id', requireAuth, async (c) => {
+  try {
+    const userId     = c.get('userId')
+    const sequenceId = c.req.param('id')
+    const { name, mood } = await c.req.json()
+
+    const sequence = await c.env.DB.prepare(
+      `SELECT id FROM motion_sequences WHERE id = ? AND user_id = ?`
+    ).bind(sequenceId, userId).first()
+    if (!sequence) return c.json({ error: 'Sequence not found' }, 404)
+
+    const fields: string[] = []
+    const values: any[]    = []
+    if (name !== undefined) { fields.push('name = ?'); values.push(String(name).trim()) }
+    if (mood !== undefined) { fields.push('mood = ?'); values.push(mood ? String(mood).trim() : null) }
+    if (!fields.length) return c.json({ error: 'Nothing to update' }, 400)
+    fields.push(`updated_at = datetime('now')`)
+
+    await c.env.DB.prepare(
+      `UPDATE motion_sequences SET ${fields.join(', ')} WHERE id = ?`
+    ).bind(...values, sequenceId).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// DELETE /api/motion/sequences/:id
+app.delete('/api/motion/sequences/:id', requireAuth, async (c) => {
+  const userId     = c.get('userId')
+  const sequenceId = c.req.param('id')
+  await c.env.DB.prepare(
+    `DELETE FROM motion_sequences WHERE id = ? AND user_id = ?`
+  ).bind(sequenceId, userId).run()
+  return c.json({ ok: true })
+})
+
+// POST /api/motion/sequences/:id/beats — append a single beat
+app.post('/api/motion/sequences/:id/beats', requireAuth, async (c) => {
+  try {
+    const userId     = c.get('userId')
+    const sequenceId = c.req.param('id')
+    const { camera_move, intensity, duration_sec, notes } = await c.req.json()
+
+    const sequence = await c.env.DB.prepare(
+      `SELECT id FROM motion_sequences WHERE id = ? AND user_id = ?`
+    ).bind(sequenceId, userId).first()
+    if (!sequence) return c.json({ error: 'Sequence not found' }, 404)
+
+    if (!CAMERA_MOVES.some(m => m.id === camera_move)) {
+      return c.json({ error: 'Invalid camera_move id' }, 400)
+    }
+
+    const { count } = await c.env.DB.prepare(
+      `SELECT COUNT(*) as count FROM motion_beats WHERE sequence_id = ?`
+    ).bind(sequenceId).first<{ count: number }>() || { count: 0 }
+
+    const id = uuid()
+    await c.env.DB.prepare(
+      `INSERT INTO motion_beats (id, sequence_id, sort_order, camera_move, intensity, duration_sec, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      id, sequenceId, count, camera_move,
+      Math.min(10, Math.max(1, Number(intensity) || 5)),
+      Math.min(10, Math.max(2, Number(duration_sec) || 5)),
+      notes?.trim() || null,
+    ).run()
+
+    await c.env.DB.prepare(`UPDATE motion_sequences SET updated_at = datetime('now') WHERE id = ?`).bind(sequenceId).run()
+
+    return c.json({ ok: true, id }, 201)
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// PATCH /api/motion/beats/:beatId — edit a beat's move/intensity/duration/notes/shot link
+app.patch('/api/motion/beats/:beatId', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const beatId = c.req.param('beatId')
+    const body   = await c.req.json()
+
+    // Ownership check via join to motion_sequences
+    const beat = await c.env.DB.prepare(
+      `SELECT mb.id, mb.sequence_id FROM motion_beats mb
+       JOIN motion_sequences ms ON ms.id = mb.sequence_id
+       WHERE mb.id = ? AND ms.user_id = ?`
+    ).bind(beatId, userId).first<{ id: string; sequence_id: string }>()
+    if (!beat) return c.json({ error: 'Beat not found' }, 404)
+
+    const fields: string[] = []
+    const values: any[]    = []
+    if (body.camera_move !== undefined) {
+      if (!CAMERA_MOVES.some(m => m.id === body.camera_move)) return c.json({ error: 'Invalid camera_move id' }, 400)
+      fields.push('camera_move = ?'); values.push(body.camera_move)
+    }
+    if (body.intensity    !== undefined) { fields.push('intensity = ?');    values.push(Math.min(10, Math.max(1, Number(body.intensity)))) }
+    if (body.duration_sec !== undefined) { fields.push('duration_sec = ?'); values.push(Math.min(10, Math.max(2, Number(body.duration_sec)))) }
+    if (body.notes        !== undefined) { fields.push('notes = ?');        values.push(body.notes?.trim() || null) }
+    if (body.shot_id      !== undefined) { fields.push('shot_id = ?');      values.push(body.shot_id || null) }
+    if (!fields.length) return c.json({ error: 'Nothing to update' }, 400)
+
+    await c.env.DB.prepare(
+      `UPDATE motion_beats SET ${fields.join(', ')} WHERE id = ?`
+    ).bind(...values, beatId).run()
+
+    await c.env.DB.prepare(`UPDATE motion_sequences SET updated_at = datetime('now') WHERE id = ?`).bind(beat.sequence_id).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// DELETE /api/motion/beats/:beatId
+app.delete('/api/motion/beats/:beatId', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const beatId = c.req.param('beatId')
+
+    const beat = await c.env.DB.prepare(
+      `SELECT mb.id, mb.sequence_id FROM motion_beats mb
+       JOIN motion_sequences ms ON ms.id = mb.sequence_id
+       WHERE mb.id = ? AND ms.user_id = ?`
+    ).bind(beatId, userId).first<{ id: string; sequence_id: string }>()
+    if (!beat) return c.json({ error: 'Beat not found' }, 404)
+
+    await c.env.DB.prepare(`DELETE FROM motion_beats WHERE id = ?`).bind(beatId).run()
+    await c.env.DB.prepare(`UPDATE motion_sequences SET updated_at = datetime('now') WHERE id = ?`).bind(beat.sequence_id).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// PATCH /api/motion/sequences/:id/reorder — reorder beats (mirrors shot reorder)
+app.patch('/api/motion/sequences/:id/reorder', requireAuth, async (c) => {
+  try {
+    const userId     = c.get('userId')
+    const sequenceId = c.req.param('id')
+
+    const sequence = await c.env.DB.prepare(
+      `SELECT id FROM motion_sequences WHERE id = ? AND user_id = ?`
+    ).bind(sequenceId, userId).first()
+    if (!sequence) return c.json({ error: 'Sequence not found' }, 404)
+
+    const { beat_ids } = await c.req.json()
+    if (!Array.isArray(beat_ids) || beat_ids.length === 0) {
+      return c.json({ error: 'beat_ids array required' }, 400)
+    }
+
+    const stmts = beat_ids.map((id: string, idx: number) =>
+      c.env.DB.prepare(`UPDATE motion_beats SET sort_order = ? WHERE id = ? AND sequence_id = ?`).bind(idx, id, sequenceId)
+    )
+    await c.env.DB.batch(stmts)
+    await c.env.DB.prepare(`UPDATE motion_sequences SET updated_at = datetime('now') WHERE id = ?`).bind(sequenceId).run()
+
+    return c.json({ ok: true, count: beat_ids.length })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// POST /api/motion/compose — AI-composed beat list from a scene description
+// Does NOT persist anything by itself; returns beats for the client to
+// review/edit before saving them into a sequence via the beats endpoints.
+app.post('/api/motion/compose', requireAuth, async (c) => {
+  try {
+    const { description, beat_count, mood } = await c.req.json()
+    if (!description?.trim()) return c.json({ error: 'description required' }, 400)
+
+    const beats = await composeMotionSequence(c.env, {
+      description: description.trim(),
+      beat_count:  Number(beat_count) || 4,
+      mood:        mood?.trim() || undefined,
+    })
+
+    return c.json({ ok: true, beats })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// POST /api/motion/sequences/:id/compose — AI-compose AND save directly into an existing sequence
+app.post('/api/motion/sequences/:id/compose', requireAuth, async (c) => {
+  try {
+    const userId     = c.get('userId')
+    const sequenceId = c.req.param('id')
+    const { description, beat_count, mood, replace } = await c.req.json()
+    if (!description?.trim()) return c.json({ error: 'description required' }, 400)
+
+    const sequence = await c.env.DB.prepare(
+      `SELECT id FROM motion_sequences WHERE id = ? AND user_id = ?`
+    ).bind(sequenceId, userId).first()
+    if (!sequence) return c.json({ error: 'Sequence not found' }, 404)
+
+    const beats = await composeMotionSequence(c.env, {
+      description: description.trim(),
+      beat_count:  Number(beat_count) || 4,
+      mood:        mood?.trim() || undefined,
+    })
+
+    if (replace) {
+      await c.env.DB.prepare(`DELETE FROM motion_beats WHERE sequence_id = ?`).bind(sequenceId).run()
+    }
+
+    const { count: existingCount } = await c.env.DB.prepare(
+      `SELECT COUNT(*) as count FROM motion_beats WHERE sequence_id = ?`
+    ).bind(sequenceId).first<{ count: number }>() || { count: 0 }
+
+    const stmts = beats.map((b, idx) =>
+      c.env.DB.prepare(
+        `INSERT INTO motion_beats (id, sequence_id, sort_order, camera_move, intensity, duration_sec, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).bind(uuid(), sequenceId, existingCount + idx, b.camera_move, b.intensity, b.duration_sec, b.notes)
+    )
+    await c.env.DB.batch(stmts)
+    await c.env.DB.prepare(`UPDATE motion_sequences SET updated_at = datetime('now') WHERE id = ?`).bind(sequenceId).run()
+
+    return c.json({ ok: true, beats_added: beats.length })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// GET /api/motion/sequences/:id/export — build a Higgsfield-ready shot-generation plan
+// Each beat becomes a ready-to-submit payload for POST /api/generate, carrying
+// the camera move's prompt fragment + intensity mapped to motion_strength.
+app.get('/api/motion/sequences/:id/export', requireAuth, async (c) => {
+  try {
+    const userId     = c.get('userId')
+    const sequenceId = c.req.param('id')
+
+    const sequence = await c.env.DB.prepare(
+      `SELECT * FROM motion_sequences WHERE id = ? AND user_id = ?`
+    ).bind(sequenceId, userId).first<any>()
+    if (!sequence) return c.json({ error: 'Sequence not found' }, 404)
+
+    const beats = await c.env.DB.prepare(
+      `SELECT * FROM motion_beats WHERE sequence_id = ? ORDER BY sort_order ASC, created_at ASC`
+    ).bind(sequenceId).all<any>()
+
+    const plan = beats.results.map((b: any, idx: number) => {
+      const move = CAMERA_MOVES.find(m => m.id === b.camera_move)
+      return {
+        index:          idx + 1,
+        beat_id:        b.id,
+        camera_move:    b.camera_move,
+        camera_label:   move?.label || b.camera_move,
+        prompt_fragment: move?.prompt_fragment || '',
+        intensity:      b.intensity,
+        quality_string: `motion:${b.intensity}`,
+        duration_sec:   b.duration_sec,
+        notes:          b.notes,
+        shot_id:        b.shot_id,
+      }
+    })
+
+    return c.json({
+      sequence: { id: sequence.id, name: sequence.name, mood: sequence.mood, project_id: sequence.project_id },
+      plan,
+      total_duration_sec: plan.reduce((a: number, p: any) => a + p.duration_sec, 0),
+    })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+/* ══════════════════════════════════════════════════════════════════
    ADMIN PANEL — secret-key gated
    ADMIN_SECRET env var must be set; passed as ?secret= or X-Admin-Secret header
 ══════════════════════════════════════════════════════════════════ */
@@ -4057,7 +4504,7 @@ app.get('/tools/video-generator/',   (c) => c.html(videoGeneratorPage()))
 app.get('/tools/distribution-engine',  (c) => c.redirect('/tools/distribution-engine/'))
 app.get('/tools/distribution-engine/', (c) => c.html(distributionPage()))
 app.get('/tools/motion-engine',  (c) => c.redirect('/tools/motion-engine/'))
-app.get('/tools/motion-engine/', (c) => c.html(toolShell('Motion Composition Engine', 'motion', '#FB923C')))
+app.get('/tools/motion-engine/', (c) => c.html(motionEnginePage()))
 app.get('/tools/persona-engine',  (c) => c.redirect('/tools/persona-engine/'))
 app.get('/tools/persona-engine/', (c) => c.html(toolShell('Spectra Persona Engine', 'persona', '#F87171')))
 app.get('/', (c) => c.html(landingPage()))
@@ -5547,6 +5994,174 @@ function attentionEnginePage(): string {
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="/static/attention-engine.js"></script>
 </div><!-- /ae-app -->
+</body>
+</html>`
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   MOTION COMPOSITION ENGINE PAGE
+══════════════════════════════════════════════════════════════════ */
+function motionEnginePage(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Motion Composition Engine — Spectra</title>
+<meta name="description" content="Choreograph camera-move sequences for AI video generation — AI-composed or hand-built beat by beat.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/motion-engine.css"/>
+</head>
+<body>
+
+<!-- NAV -->
+<nav class="mo-nav">
+  <a href="/" class="mo-nav-logo">
+    <span class="mo-nav-mark">S</span>
+    <span class="mo-nav-wordmark">SPECTRA</span>
+  </a>
+  <div class="mo-nav-center">
+    <span class="mo-nav-tool-badge">
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 20 C8 12, 14 24, 20 14 S28 6, 30 10"/><circle cx="19" cy="9" r="1.6" fill="currentColor" stroke="none"/></svg>
+      Motion Engine
+    </span>
+  </div>
+  <div class="mo-nav-right">
+    <span class="mo-nav-email" id="mo-user-email"></span>
+    <a href="/tools/video-generator/" class="mo-nav-back">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+      Video Generator
+    </a>
+  </div>
+</nav>
+
+<!-- AUTH GATE -->
+<div id="mo-auth-gate" class="mo-auth-gate" style="display:none">
+  <div class="mo-auth-card">
+    <div class="mo-auth-logo"><span class="mo-nav-mark" style="width:40px;height:40px;font-size:1rem">S</span></div>
+    <h2 class="mo-auth-title">Sign in to Spectra</h2>
+    <p class="mo-auth-sub">Access the Motion Composition Engine</p>
+    <form id="mo-auth-form" class="mo-auth-form" autocomplete="off">
+      <input type="email"    id="mo-auth-email" class="mo-input" placeholder="Email" required autocomplete="email"/>
+      <input type="password" id="mo-auth-pass"  class="mo-input" placeholder="Password" required/>
+      <button type="submit"  class="mo-btn-primary" id="mo-auth-submit">Sign In</button>
+    </form>
+    <p class="mo-auth-err" id="mo-auth-err"></p>
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="mo-app" style="display:none">
+
+  <!-- LEFT RAIL — projects + sequences -->
+  <aside class="mo-rail">
+    <div class="mo-rail-section">
+      <div class="mo-rail-label">Project</div>
+      <select id="mo-project-select" class="mo-select"></select>
+    </div>
+
+    <div class="mo-rail-section mo-rail-grow">
+      <div class="mo-rail-label-row">
+        <span class="mo-rail-label">Sequences</span>
+        <button class="mo-icon-btn" id="btn-new-sequence" title="New sequence">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+      </div>
+      <div class="mo-seq-list" id="mo-seq-list">
+        <div class="mo-seq-empty">No sequences yet</div>
+      </div>
+    </div>
+
+    <div class="mo-rail-section">
+      <div class="mo-rail-label">Camera Move Palette</div>
+      <div class="mo-palette" id="mo-palette"></div>
+    </div>
+  </aside>
+
+  <!-- MAIN EDITOR -->
+  <main class="mo-main">
+
+    <!-- Empty state -->
+    <div class="mo-empty-state" id="mo-empty-state">
+      <div class="mo-empty-icon">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 20 C8 12, 14 24, 20 14 S28 6, 30 10"/></svg>
+      </div>
+      <h3>No sequence selected</h3>
+      <p>Create a new motion sequence or select one from the left rail to start choreographing camera moves.</p>
+      <button class="mo-btn-primary" id="btn-empty-new-sequence">New Sequence</button>
+    </div>
+
+    <!-- Sequence editor -->
+    <div class="mo-editor" id="mo-editor" style="display:none">
+      <div class="mo-editor-header">
+        <div class="mo-editor-title-wrap">
+          <input type="text" id="mo-seq-name" class="mo-seq-name-input" placeholder="Sequence name"/>
+          <input type="text" id="mo-seq-mood" class="mo-seq-mood-input" placeholder="Mood / genre (optional — e.g. tense chase)"/>
+        </div>
+        <div class="mo-editor-actions">
+          <span class="mo-editor-stat" id="mo-editor-duration">0s total</span>
+          <button class="mo-btn-ghost" id="btn-export-plan">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Export Plan
+          </button>
+          <button class="mo-btn-danger-ghost" id="btn-delete-sequence">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- AI Composer -->
+      <div class="mo-composer">
+        <div class="mo-composer-row">
+          <textarea id="mo-composer-desc" class="mo-composer-input" placeholder="Describe the scene — e.g. 'A lone figure walks through a neon-lit alley at night, tension building as they realize they're being followed.'" rows="2"></textarea>
+          <div class="mo-composer-controls">
+            <label class="mo-composer-label">Beats
+              <input type="number" id="mo-composer-count" class="mo-composer-count" value="4" min="2" max="10"/>
+            </label>
+            <button class="mo-btn-primary" id="btn-ai-compose">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L9.5 9.5 2 12l7.5 2.5L12 22l2.5-7.5L22 12l-7.5-2.5z"/></svg>
+              AI Compose
+            </button>
+          </div>
+        </div>
+        <label class="mo-composer-replace">
+          <input type="checkbox" id="mo-composer-replace"/> Replace existing beats instead of appending
+        </label>
+      </div>
+
+      <!-- Beat timeline -->
+      <div class="mo-beats-header">
+        <span>Beats</span>
+        <button class="mo-btn-ghost mo-btn-sm" id="btn-add-beat">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add Beat
+        </button>
+      </div>
+      <div class="mo-beats-list" id="mo-beats-list">
+        <div class="mo-beats-empty">No beats yet — use AI Compose or add a beat manually.</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- Export Plan modal -->
+<div class="mo-modal-overlay" id="mo-export-overlay" style="display:none">
+  <div class="mo-modal">
+    <div class="mo-modal-header">
+      <h3>Generation Plan</h3>
+      <button class="mo-icon-btn" id="btn-close-export"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <p class="mo-modal-sub">Each beat below is ready to submit as a Video Generator shot — the camera move's prompt fragment and intensity map directly to <code>motion_strength</code>.</p>
+    <div class="mo-export-body" id="mo-export-body"></div>
+    <button class="mo-btn-primary full-width" id="btn-copy-export">Copy JSON</button>
+  </div>
+</div>
+
+<div class="mo-toast" id="mo-toast"></div>
+
+<script src="/static/motion-engine.js"></script>
 </body>
 </html>`
 }
