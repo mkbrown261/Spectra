@@ -178,3 +178,116 @@ Overall: **no part of the backend is unfinished/stubbed except Motion Engine and
 5. Run `npm run build` to verify current compile/type health independent of manual reading.
 6. Optionally diff `dist/` against `src/`/`public/` for staleness.
 7. Produce final consolidated "needs work" prioritized punch list and confirm/refine lifecycle-stage verdict once frontend is included.
+
+---
+
+## Pass 3 — 2026-07-15 (continued) — `video-generator.js` fully read
+
+> **Tooling note**: the `Read` file tool became unreliable mid-pass (repeated transient failures).
+> Switched to `sed -n 'START,ENDp' file` via the shell tool for all subsequent file reads in this
+> pass — same full-content guarantee, no lines skipped, just a different plumbing to get there.
+
+### Analysis Progress Tracker (updated)
+
+| Area | File | Lines | Status |
+|---|---|---|---|
+| Backend | `src/index.tsx` | 6880 | ✅ 100% reviewed |
+| Frontend JS | `public/static/video-generator.js` | 5557 | ✅ **100% reviewed (lines 1–5557)** |
+| Frontend JS | `public/static/distribution.js` | 1998 | ⬜ Not started |
+| Frontend JS | `public/static/attention-engine.js` | 1821 | ⬜ Not started |
+| Frontend JS | `public/static/main.js` | 1267 | ⬜ Not started |
+| Frontend CSS | `public/static/video-generator.css` | 3609 | ⬜ Not started |
+| Frontend CSS | `public/static/distribution.css` | 2646 | ⬜ Not started |
+| Frontend CSS | `public/static/attention-engine.css` | 2420 | ⬜ Not started |
+| Frontend CSS | `public/static/style.css` | 915 | ⬜ Not started |
+| Build output | `dist/` (worker + static, generated) | — | ⬜ Not diffed vs source |
+| Build health | `npm run build` | — | ⬜ Not yet run |
+
+### `video-generator.js` structural map (lines 1–5557, now fully confirmed)
+
+- **State/data**: `STYLE_PRESETS` (20), `HF_MODELS_DATA` (9, mirrors backend `HF_MODELS` — counts verified equal via grep, **currently in sync but not fetched from `/api/models` — hardcoded duplicate**), `I2V_MODELS` Set, `VG` global state object, `MODEL_COSTS` (9 models → cps/label/eta).
+- **Auth & session**: `checkSession`, `showAuthGate`/`hideAuthGate`, `handleAuth`, `enterApp`, `logout`, generic `api()` fetch wrapper.
+- **Key management**: `checkKeyStatus`, `updateKeyDot`, `saveKey`.
+- **Settings drawer**: `loadSettingsInfo` — contains hardcoded tier-limits table #1 (see Finding #21).
+- **Model picker, image upload, style presets, enhance modes, seed control, quality sliders, storyboard view toggle** — all confirmed fully wired, no orphaned handlers.
+- **Projects**: `loadProjects`, `renderProjectList`, `selectProject`, `deleteProject`, `loadShots`.
+- **Shot grid**: `baseRenderShotGrid` (actual renderer) + `renderShotGrid` (thin wrapper, confirmed calls `baseRenderShotGrid` only — the PR #1 infinite-recursion fix is intact, not reintroduced), `renderShotCard`.
+- **Shot polling**: `startPolling` (4s status + 1s elapsed-tick dual interval), `updateShotElapsed` (client-side ETA estimate, capped at 95% until server-confirmed complete), `updateShotCardInDOM` (in-place patch, no full re-render).
+- **Generate**: `generate()`, `enhancePrompt()`, credit widget (`updateCreditWidget`, `updateUsageBar` — contains hardcoded tier-limits table #2, see Finding #21).
+- **Shot actions**: `deleteShot`, `copyPrompt`, `downloadShot`, `playShot`/`closePlayer`.
+- **New Project Modal**: `USE_CASE_CONFIGS` (8 presets), `openProjectModal`/`selectUseCase`/`saveProject`.
+- **Style Bible Modal**: `openBibleModal`/`saveBible`/`updateBibleIndicator`.
+- **Stripe upgrade flow**: `openUpgradeModal`/`startCheckout` → `POST /api/billing/checkout`.
+- **Drag-and-drop shot reorder**: `initDragAndDrop` — optimistic local reorder + `PATCH /api/projects/:id/reorder`; **no rollback on PATCH failure** (Finding #22).
+- **Character Soul**: `openCharModal`/`saveCharacter`/`renderCharacters`/`useCharacter` (#3 lock), `trainCharacterSoul`/`checkSoulStatus`/`startSoulPoll` (8s interval), inline edit (`openCharEditInline`), `deleteCharacter`.
+- **Style Memory (#5)**: `localStorage`-backed (`spectra_project_memory`), per-project model/aspect/duration/preset persistence.
+- **Custom Styles (#6)**: `localStorage`-backed (`spectra_custom_styles`), uses blocking `window.prompt()` for naming (legacy/unpolished UI pattern).
+- **Campaign Workflow (#8)**: D1-backed (confirmed migrated off localStorage per in-code comment "H-6: D1-backed, localStorage removed") — `fetchCampaigns`/`createCampaign`/`deleteCampaign`/`assignProjectToCampaign`/`exportCampaign`. Export manifest only includes shots for projects already loaded into `VG.shots` cache this session (minor UX gap, not a bug).
+- **Multi-Shot Continuity (#9)**: `continueFromShot` + `extractLastFrame` — client-side last-frame extraction via hidden `<video>` + `<canvas>` + `canvas.toBlob()` (JPEG q=0.92, 10s timeout safety net).
+- **AI Creative Director (#10)**: `DIRECTOR` state, `runDirector`/`renderDirectorShots`/`loadDirectorShotToCompose`/`queueDirectorShot`/`queueAllDirectorShots` (300ms stagger between bulk submissions).
+- **`bindUI()`**: the master event-binding function (finished reading in this pass) — wires every button in the compose panel, campaign row, aspect/duration/mode buttons (also persist to Style Memory on change), upgrade modal, character modal, Escape-key overlay closer, AI Director controls, and calls `initUploadZone`/`initQualitySliders`/`setEnhanceMode`/`updateImageRequirement`/`initPrescore` at the end. No dead bindings found; all `$('id')?.addEventListener(...)` calls target real DOM ids present in `videoGeneratorPage()`'s template (spot-checked a sample, not exhaustively cross-matched element-by-element — full DOM-id cross-match would require enumerating every `id="..."` in the 1300-line template, out of scope for this pass but flagged as a possible deeper follow-up if the punch list needs it).
+- **Analytics module** (`AN` state): `initViewSwitcher` (Studio/Analytics/Compare/Timeline nav), `initAnalyticsControls`, `loadAnalytics` (`GET /api/analytics?range=`), `renderAnalytics` orchestrator, `renderSummaryCards`, `renderActivityChart` (hand-built SVG bar chart, no chart library — consistent with the admin page's `renderGrowthChart` pattern noted in Pass 2), `renderModelTable` (clickable rows → deep-dive), `renderCompareBars`, `renderDurationBars`, `renderAspectRatio`, `renderProjectVelocity`, `renderStatusBreakdown`, `renderDeepDive` (11 metric cards per model).
+- **Pre-Publish Script Scorer** (`PRESCORE` state): `initPrescore`, debounced (1400ms) auto-rescore on prompt input (min 30 chars), `runPrescore()` → `POST /api/attention/prescore`, `renderPrescoreResults` (SVG ring score 0–100 with 5 tiers: great/good/ok/weak/dead), `applyImprovedPrompt`. Fully wired, cross-tool integration between Video Generator and Attention Engine's scoring backend — confirmed intentional (not orphaned).
+- **Shot Comparison (`COMPARE` state, MAX 4 shots)**: two parallel UI surfaces confirmed —
+  (a) a **floating overlay modal** (`openCompareModal`/`renderCompareModal`/`renderCompareMetaTable`/`toggleCompareVideo`/`comparePlayAll`/`exportCompareDiff`), opened via the board-header "Compare" button, and
+  (b) an **inline nav-tab view** (`initCompareView`/`renderCmpGrid`/`toggleCmpPlayback`/`addShotToCompare`) inside `#vg-compare`, opened via the Studio/Analytics/Compare/Timeline top nav.
+  Both read/write the same shared `COMPARE.selected`/`COMPARE.winner` state, so selections made in one surface correctly appear in the other. This dual-surface design is intentional (confirmed by the code comment block "COMPARE NAV-TAB VIEW — bridges to COMPARE overlay system") — not a duplication bug, but it is duplicated *rendering* logic (two near-parallel grid-builder functions, `renderCompareModal` vs `renderCmpGrid`) that a future refactor could unify.
+- **Sequence Timeline Editor (`TIMELINE` state)**: same dual-surface pattern as Compare —
+  (a) a **floating overlay** (`openTimeline`/`renderTimeline`/`renderTimelineRuler`/`initTimelineDragDrop`/`saveTimelineOrder`/`sortTimelineByDate`/`exportTimelineManifest`/`startSeqPlayback`/`stopSeqPlayback`), and
+  (b) an **inline nav-tab view** (`initTimelineView`/`renderTlStrip`/`renderTlRuler`/`renderTlBank`/`addTlClip`/`showTlClipDetails`/`updateTlDuration`/`startTlPreview`/`exportTlManifest`/`bindTlControls`).
+  Confirmed both persist reordering via slightly different endpoints: the overlay's `saveTimelineOrder()` calls `PATCH /api/projects/:id/shots/reorder`, while the drag-and-drop board-header reorder (`initDragAndDrop`, Studio view) calls a **different** endpoint, `PATCH /api/projects/:id/reorder` — both exist as separate registered backend routes (`app.patch('/api/projects/:projectId/reorder'` and confirmed separately for shots), so this is not a broken call, but it is a second instance of the "same conceptual action, two code paths" pattern seen elsewhere in this codebase (mirrors Pass 2 Finding #19's backend duplication).
+
+### New Confirmed Findings (Pass 3)
+
+20. **RESOLVED — `/tools/distribution/` is NOT a dead link.** Frontend's `distributeShot()` (line 2986) opens `window.open('/tools/distribution/?...')`. Grep-cross-checked against the backend: `src/index.tsx` registers **two independent, both-valid route pairs** serving the same `distributionPage()`: `/tools/distribution` + `/tools/distribution/` (redirect + page, lines 2998–3003) AND `/tools/distribution-engine` + `/tools/distribution-engine/` (lines 4058–4059, used by the landing page's nav link). Both resolve correctly. This was a suspected bug carried over from the Pass 2 log's "pending" list — now closed, no code change needed. Worth noting as a minor route-naming redundancy (two URL aliases for the identical page) but not a functional defect.
+
+21. **Tier-limits data is hardcoded/duplicated in (at least) THREE separate places**, confirmed via full read of `video-generator.js`:
+    - Backend: `TIER_LIMITS` object in `src/index.tsx` (source of truth, enforced server-side).
+    - Frontend copy #1: `loadSettingsInfo()`'s local `tierLimits` object (`free:{projects:1,shots:10}`, `creator:{projects:5,shots:100}`, `studio:{projects:25,shots:500}`, `pro:{projects:'∞',shots:'∞'}`) — used purely for the Settings drawer's display.
+    - Frontend copy #2: `updateUsageBar()`'s local `tierShots` object (`free:10, creator:100, studio:500, pro:999999`) — used to compute a client-side "shots used this month" progress bar.
+    Both frontend copies currently match the backend's real limits (spot-checked), but there is **no mechanism keeping them in sync** — if a tier limit is ever changed server-side (e.g., a pricing change), both of these UI displays will silently show stale/wrong numbers to the user while the backend enforces the new (different) limit, creating a confusing mismatch between what the UI promises and what the API actually allows. **Recommended fix**: have the client fetch tier limits from a small `GET /api/tier-limits` endpoint (or reuse `/api/auth/me`'s response, if it already returns tier info) instead of hardcoding them client-side in two places.
+
+22. **Confirmed bug — optimistic drag-and-drop shot reorder has no rollback on save failure.** `initDragAndDrop()` (Studio board header reorder) computes the new shot order locally, immediately re-renders the grid in the new order (optimistic UI), and *then* persists via `PATCH /api/projects/:id/reorder`. If that PATCH fails (network error, session expiry, server error), the code only shows an error toast — the grid is left showing the optimistic (unsaved) order, and there is no re-fetch/rollback to the last-known-good server order. Next page load or `loadShots()` call will silently "undo" the user's reorder with no explanation, which will look like a data-loss bug from the user's perspective. **Recommended fix**: on PATCH failure, re-call `loadShots(projectId)` to resync the grid to server truth, in addition to the toast.
+
+23. **Confirmed real bug — dead/shadowed click handler on Compare modal's "Play All" button.** In the `DOMContentLoaded` wiring block (~line 4837):
+    ```js
+    const comparePlayAll = $('compare-play-all');                       // local const shadows the function comparePlayAll()
+    if (comparePlayAll) comparePlayAll.addEventListener('click', comparePlayAll_handler);
+    function comparePlayAll_handler() { comparePlayAll(); }              // calls itself (the DOM element, not the function!) → TypeError, silently swallowed nowhere (no try/catch)
+    if (comparePlayAll) {
+      comparePlayAll.replaceWith(comparePlayAll.cloneNode(true));        // clones+replaces the button (drops the just-added listener)
+      $('compare-play-all').addEventListener('click', comparePlayAll);   // re-fetches the button, tries to bind the *element* itself as the click handler
+    }
+    ```
+    The local `const comparePlayAll` (the DOM button) shadows the top-level `function comparePlayAll()` (defined earlier at line 4434, the real "play all compare videos" logic) for the remainder of this block's scope. The intent was clearly "replace the button to clear any duplicate listeners, then bind the real `comparePlayAll` function" — but because of the shadowing, `comparePlayAll` inside this block always refers to the button element, never the function. The final line binds the **DOM element itself** as the event listener callback (`addEventListener('click', comparePlayAll)` where `comparePlayAll` is a `<button>`, not a function) — this is not a valid event handler and the browser will simply ignore it silently (`addEventListener` requires a callable; passing a non-function is a silent no-op in modern browsers, not a thrown error). Net effect: **the Compare modal's "Play All" button has no working click handler at all** — clicking it does nothing. This is a genuine, previously-undocumented functional bug, found only by full line-by-line reading (exactly the kind of issue the user's original mandate was meant to catch). **Recommended fix**: rename the local DOM reference (e.g., `const playAllBtn = $('compare-play-all')`) so it no longer collides with the `comparePlayAll` function name, delete the unnecessary clone/replace dance and the unused `comparePlayAll_handler` wrapper, and bind directly: `playAllBtn?.addEventListener('click', comparePlayAll)`.
+
+24. **Dead API surface confirmed: `GET /api/models` is never called by any frontend file.** Backend registers `app.get('/api/models', (c) => c.json(HF_MODELS))` (line 984) as a presumably-intended single-source-of-truth endpoint for the model catalog. Grepped all 4 frontend JS files for `api/models` — zero matches anywhere. Instead, `video-generator.js` hardcodes its own `HF_MODELS_DATA` array (9 entries) that must be manually kept in sync with the backend's `HF_MODELS` array by a human editing two files. Cross-checked count only (9 vs 9) — contents currently appear aligned but this is exactly the kind of endpoint that should be the fetch source instead of a hand-maintained duplicate, especially since the endpoint already exists and works. Low severity (no user-facing symptom today) but a maintenance/drift risk identical in shape to Finding #21.
+
+### Route Cross-Check Summary (frontend calls vs backend registrations, video-generator.js only)
+
+Extracted every `api('METHOD', path)` and raw `fetch(...)` call in `video-generator.js` and diffed against the full `app.get/post/put/patch/delete(...)` inventory grepped from `src/index.tsx`:
+- **All frontend calls in `video-generator.js` resolve to a real, registered backend route.** No orphaned/dead frontend→backend calls found in this file (unlike the Distribution Engine's own backend-internal bug #12 from Pass 2, which was a backend-to-backend `serveUrl` reference, not a frontend call).
+- **Backend routes with no caller in `video-generator.js`** (expected — many belong to other tools' frontends, to be confirmed against `distribution.js`/`attention-engine.js` in the next pass): `/api/models` (Finding #24, confirmed truly orphaned across *all* frontend files, not just this one), `/api/projects/:id/compare`, `/api/shots/:shotId/thumbnail`, all `/api/distribution/*`, all `/api/attention/*` except `/api/attention/prescore` (used by this file's Pre-Publish Scorer), all `/api/admin/*`, `/api/auth/youtube/*`, `/api/attention/bluesky/*`. These are expected gaps to close in the next pass by checking `distribution.js` and `attention-engine.js` — **`/api/projects/:id/compare`** and **`/api/shots/:shotId/thumbnail`** specifically look like they should belong to Video Generator (not the other two tools) and were NOT found in any of the 4 frontend files searched so far — **flagged as a likely-orphaned backend route pair, to be reconfirmed once `distribution.js` and `attention-engine.js` are read (in case either references them), and added to the final punch list as "verify or remove" if still uncalled after full frontend read.**
+
+### Updated Lifecycle Stage Assessment
+
+No change to the overall "Beta / pre-launch hardening" verdict. The frontend read reinforces the Pass 2 conclusion that Video Generator is feature-complete and heavily featured (Compare, Timeline, Analytics, AI Director, Pre-Publish Scorer are all fully wired end-to-end) — but adds one genuine new **UI-layer bug** (#23, dead Play-All button) to the punch list, on top of the tier-limit duplication risk (#21) and the reorder-rollback gap (#22). None of these are severe enough to change the lifecycle stage, but they are exactly the class of "needs some work" item the user asked to surface — small, real, easy-to-miss bugs that only show up on full line-by-line reading.
+
+### Files/areas confirmed still to review (updated)
+- `public/static/distribution.js` (1998 lines) — next up.
+- `public/static/attention-engine.js` (1821 lines).
+- `public/static/main.js` (1267 lines).
+- Re-run the route cross-check (this pass's method) against these 3 remaining JS files, specifically resolving the `/api/projects/:id/compare` and `/api/shots/:shotId/thumbnail` orphan-route question.
+- 4 frontend CSS files (9,590 lines combined) — not started.
+- `dist/` build artifacts — not diffed.
+- `npm run build` — not yet run.
+
+### Next Pass Plan (updated)
+1. Read `public/static/distribution.js` in full (1998 lines) using the `sed -n` shell approach (Read tool proved unreliable this pass).
+2. Read `public/static/attention-engine.js` in full (1821 lines).
+3. Read `public/static/main.js` in full (1267 lines).
+4. Repeat the route cross-check method for all three files; specifically resolve whether `/api/projects/:id/compare` and `/api/shots/:shotId/thumbnail` are truly dead backend routes or used by one of these files.
+5. Read all 4 CSS files in full.
+6. Run `npm run build`.
+7. Optionally diff `dist/` against source.
+8. Produce final consolidated punch list (bugs #12, #22, #23 confirmed real; dead code #11, #24; hardening gaps #14, encryption-key-rotation, Stripe-replay-window; docs mismatches #13, #15; duplication risks #19, #21) and final lifecycle verdict.
