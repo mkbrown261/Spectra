@@ -282,7 +282,7 @@ No change to the overall "Beta / pre-launch hardening" verdict. The frontend rea
 - `dist/` build artifacts — not diffed.
 - `npm run build` — not yet run.
 
-### Next Pass Plan (updated)
+### Next Pass Plan (superseded — see Pass 4 below)
 1. Read `public/static/distribution.js` in full (1998 lines) using the `sed -n` shell approach (Read tool proved unreliable this pass).
 2. Read `public/static/attention-engine.js` in full (1821 lines).
 3. Read `public/static/main.js` in full (1267 lines).
@@ -291,3 +291,181 @@ No change to the overall "Beta / pre-launch hardening" verdict. The frontend rea
 6. Run `npm run build`.
 7. Optionally diff `dist/` against source.
 8. Produce final consolidated punch list (bugs #12, #22, #23 confirmed real; dead code #11, #24; hardening gaps #14, encryption-key-rotation, Stripe-replay-window; docs mismatches #13, #15; duplication risks #19, #21) and final lifecycle verdict.
+
+---
+
+## Pass 4
+
+**Scope this pass:** Completed the full-frontend-JS read: `public/static/distribution.js` (1998/1998 lines, 100%), `public/static/attention-engine.js` (1821/1821 lines, 100%), and `public/static/main.js` (1267/1267 lines, 100%). All 4 frontend JS files (video-generator.js + these 3) are now **100% read, line-by-line, zero skipped** — the largest milestone of the "analyze each line of code" mandate to date. Also closed out the cross-file orphaned-route investigation opened in Pass 3.
+
+**Tooling note:** Continued using `sed -n 'START,ENDp' <file>` via the Bash tool exclusively for all large sequential reads this pass — 100% reliable, zero failures across 7 chunked reads (4× distribution.js, 3× attention-engine.js) plus 2× main.js. The `Read` tool was not used this pass. This remains the recommended approach for any future large-file read in this project.
+
+### Analysis Progress Tracker (update)
+
+| Area | Lines | Status |
+|---|---|---|
+| `src/index.tsx` (backend) | 6,880 | ✅ 100% (Pass 1–2) |
+| `public/static/video-generator.js` | 5,557 | ✅ 100% (Pass 2–3) |
+| `public/static/distribution.js` | 1,998 | ✅ 100% (Pass 4) |
+| `public/static/attention-engine.js` | 1,821 | ✅ 100% (Pass 4) |
+| `public/static/main.js` | 1,267 | ✅ 100% (Pass 4) |
+| **All frontend JS combined** | **10,643** | **✅ 100%** |
+| `public/static/video-generator.css` | 3,609 | ⬜ not started |
+| `public/static/distribution.css` | 2,646 | ⬜ not started |
+| `public/static/attention-engine.css` | 2,420 | ⬜ not started |
+| `public/static/style.css` | 915 | ⬜ not started |
+| `dist/` build artifacts | — | ⬜ not inspected |
+| `npm run build` | — | ⬜ not yet run |
+
+### Structural Map — `distribution.js` (1998 lines, Distribution Engine tool)
+
+- Helpers: `$`/`$$`, `escHtml`, `relativeTime`, `formatDateTime`, `fmtCountdown`, `fmtNum` (K/M abbreviation — 3rd independent copy of this pattern across the codebase, see Finding #28), `showToast`, `api(method, path, body)` generic fetch wrapper (`credentials:'include'`).
+- `momentumScore(post)` — views-per-hour velocity heuristic → Fire (🔥≥500vph) / Rising (⚡≥100vph) / Slow (💤≥20vph) / Cold (❄️).
+- `DN` global state: `{user, accounts, queue, activeTab, activeFilter, liveChart, livePoller, countdownTimer, queuePoller, compose:{...}, batch:{items, dripHours, template}, upload:{active, progress, name}, metrics:{posts, selectedPost, activeMetric}}`.
+- `OPTIMAL_TIMES` (per-platform smart posting-time chips), `DRIP_TEMPLATES` (daily/weekly/launch/blitz/custom).
+- **Boot sequence** — `document.addEventListener('DOMContentLoaded', boot)` → `boot()` calls `GET /api/me` to restore session (**Finding #25 — broken, see below**), then `bindUI()`.
+- `handleAuthSubmit()` — correctly calls `/api/auth/login`.
+- `bindUI()` — master event-wiring: tabs, filters, refresh, connect/disconnect, video-URL input, drop-zone, "From Project" picker, platform toggles, caption-gen, A/B toggle, timing, fire-post, YouTube-title, smart-time chips, queue delegated actions, batch bindings, edit-drawer, metrics-tab delegated handler.
+- `switchTab(tab)` — starts/stops queue 30s auto-poll based on active tab; triggers analytics load on Metrics tab.
+- Accounts/Health: `loadAccounts()` (`GET /api/distribution/accounts`), `renderAccounts()`, `renderHealthBar()` (token-expiry warning within 7 days).
+- OAuth: `startOAuth(platform)` (`POST /api/distribution/accounts/connect`, popup + `postMessage`), `disconnectAccount()` (`DELETE /api/distribution/accounts/:id`).
+- Queue: `loadQueue()` (`GET /api/distribution/queue`), `renderQueue()` (batch-grouped), `renderQueueCard()`, `startCountdownTicker()` (1s), `retryPost()`/`cancelPost()`/`pullMetrics()`.
+- Live chart: `initLiveChart()` defined **twice** (line 801 full Chart.js implementation; line 1997 empty stub) — see Finding #27. `updateMetricsStats()` also defined **twice** (line 767 and 1743) — see Finding #27.
+- Upload: `uploadFile()` — `XMLHttpRequest`-based (for progress tracking), MIME/size validated (500MB max), posts to `/api/distribution/upload`, consumes `result.url` — **directly exercises Pass 2's backend bug #12** (`serveUrl` → nonexistent `/api/media/:key`) in a real user flow.
+- **Project Picker** — `openProjectPicker()` calls `GET /api/projects/:id/shots` per project to populate the "From Project" video picker — **Finding #26, confirmed broken route, silently fails to empty array**.
+- Compose: platform toggles, caption-gen (`POST /api/distribution/caption`, 2× for IG A/B), hashtags, timing, `firePost()` (`POST /api/distribution/schedule` per platform).
+- Batch mode: drip templates, `addBatchFile()` (same upload-flow bug-#12 dependency as `uploadFile()`), `fireBatch()` (`POST /api/distribution/batch`).
+- Auto-poll: `startQueuePoll()`/`stopQueuePoll()` (30s, queue-tab-only).
+- Edit drawer: `saveEdit()` (`PATCH /api/distribution/queue/:id`).
+- Metrics tab (rebuilt "Task 5"): `loadAnalytics()` (`GET /api/distribution/analytics`), `renderMetricsChart()` (Chart.js bar, 24h vs 72h), `renderPostBreakdown()`, `renderBreakdownTable()` (**empty stub, never implemented**, see Finding #27b), `renderBestTimes()` (🏆🥈🥉 top-3 slots).
+
+#### Route Cross-Check — `distribution.js`
+All `api()`/`fetch()` calls extracted and diffed against the full backend route inventory:
+```
+DELETE /api/distribution/accounts/:id     ✅ exists
+DELETE /api/distribution/queue/:id        ✅ exists
+GET    /api/distribution/accounts         ✅ exists
+GET    /api/distribution/analytics        ✅ exists
+GET    /api/distribution/metrics/live     ✅ exists
+GET    /api/distribution/queue            ✅ exists
+GET    /api/me                            ❌ DOES NOT EXIST (Finding #25)
+GET    /api/projects                      ✅ exists
+GET    /api/projects/:id/shots            ❌ DOES NOT EXIST (Finding #26)
+PATCH  /api/distribution/queue/:id        ✅ exists
+POST   /api/auth/login                    ✅ exists
+POST   /api/distribution/accounts/connect ✅ exists
+POST   /api/distribution/batch            ✅ exists
+POST   /api/distribution/caption          ✅ exists
+POST   /api/distribution/metrics/:id/pull ✅ exists
+POST   /api/distribution/queue/:id/retry  ✅ exists
+POST   /api/distribution/schedule         ✅ exists
+POST   /api/distribution/upload           ✅ exists (but see bug #12 re: its response.url)
+```
+**Two confirmed broken frontend→backend calls found — both new, both severe, both logged below as Findings #25 and #26.**
+
+### Structural Map — `attention-engine.js` (1821 lines, Attention Engine tool)
+
+- Wrapped in an IIFE (architecturally different from video-generator.js/distribution.js, which are global-scope) — internal functions are not globally accessible except `window.copyText` and `window.toggleScriptExpand` (needed for inline `onclick="..."` strings in AI-generated HTML).
+- `state` object: `{platform, contentType, activeTab, outputTab, analysisData, rewriteData, isAnalyzing, isRewriting, hasRealData, fetchedPlatform}`.
+- Auth: `checkSession()` — correctly calls `GET /api/auth/me` (the **correct** route — contrast with distribution.js's broken `/api/me`), `showAuthGate()`, `enterApp()`, `initAuthForm()` (correctly calls `/api/auth/login` / `/api/auth/register`).
+- Platform selector (7 platforms: tiktok/instagram/youtube/twitter/facebook/bluesky/ads) and content-type selector (8 types, matches backend's content-type-aware retention simulation from Pass 1).
+- `collectFormData()`, `validateHasRealData()` (real-data gate: requires a URL-fetch/video-grid selection OR manually-entered views>0 + 1 engagement metric>0), `showNoDataMessage()`.
+- `runScoreOnly()` — `POST /api/attention/score` (non-streaming).
+- `runAnalysis()` — `POST /api/attention/analyze`, **Server-Sent Events** streaming: manual `response.body.getReader()` parsing of `meta`/`token`/`done` events, live rotating "loading status" messages (7 msgs, 2200ms cadence) during the wait, merges AI-diagnosis score overrides into metadata scores.
+- `runRewrite()` — `POST /api/attention/rewrite`, same SSE pattern.
+- Rendering: `renderScores()` (6 SVG circular gauges), `renderTimeline()` (**deliberately withholds rendering synthetic drop-off data if the user hasn't entered real drop-off points** — a genuinely good anti-misleading-data design choice, consistent with Pass 1 Finding #9), `renderDiagnosis()` (28-entry `DIAG_LABEL_MAP` lookup table with graceful fallback for unmapped AI-returned keys), `renderOptimize()`, `renderRewrites()` (Hook Variations, Script Rewrites, Pattern Interrupts, CTA Options, Storytelling Framework, Platform Notes).
+- `exportReport()` (plain-text report download), `copyResults()`, toast system (`injectToast`/`showToast`).
+- Video Grid (YouTube integration): `loadVideoGrid()` (`GET /api/auth/youtube/videos?limit=20`), `renderVideoGrid()`, `selectVideo()` (auto-fills all 5 metrics + duration from real YouTube stats, sets `hasRealData=true`).
+- `formatCount(n)` — yet another independent K/M-abbreviation helper (4th copy across the codebase now, see Finding #28).
+- Connections Drawer: `connState={youtube,bluesky}`, `initConnectionsDrawer()` wires:
+  - YouTube connect (`window.open('/api/auth/youtube/start')` popup + `postMessage` + closed-without-message polling fallback) and disconnect (`DELETE /api/auth/youtube/disconnect` ✅).
+  - Bluesky connect (`POST /api/attention/bluesky/connect` with `{handle, app_password}`, clears password field from the DOM immediately after use — good security hygiene) and disconnect (`DELETE /api/attention/bluesky/disconnect` ✅).
+  - `loadConnectionStatus()` — `GET /api/auth/youtube/status` + `GET /api/attention/bluesky/status`, both ✅.
+  - `setYouTubeConnected/Disconnected()`, `setBlueskyConnected/Disconnected()`, `setBlockStatus()`, `updateNavDot()` (2-dot connection indicator: none/partial/both).
+- URL Auto-Fetch (`initURLFetch()`): debounced (900ms) `GET /api/fetch-url?url=...` — auto-detects platform from URL pattern (youtube/instagram/facebook/tiktok/twitter/bluesky), populates metrics form on success, or shows a "connect your account" note if `needs_connect` is returned. `populateMetrics()`, `showURLPreview()`/`hideURLPreview()`, `showURLNote()`/`clearURLNote()`, `formatDuration()`.
+
+#### Route Cross-Check — `attention-engine.js`
+```
+GET    /api/auth/me                       ✅ exists
+POST   /api/auth/login                    ✅ exists
+POST   /api/auth/register                 ✅ exists
+POST   /api/attention/score                ✅ exists
+POST   /api/attention/analyze              ✅ exists
+POST   /api/attention/rewrite              ✅ exists
+POST   /api/attention/bluesky/connect      ✅ exists
+DELETE /api/attention/bluesky/disconnect   ✅ exists
+GET    /api/attention/bluesky/status       ✅ exists
+GET    /api/auth/youtube/status            ✅ exists
+DELETE /api/auth/youtube/disconnect        ✅ exists
+GET    /api/auth/youtube/videos            ✅ exists
+GET    /api/fetch-url                      ✅ exists
+```
+**Every single route call in `attention-engine.js` resolves to a real, registered backend route. Zero broken calls found in this file** — a clean bill of health, the only one of the 3 tool frontends with no orphaned/broken calls at all.
+
+### Structural Map — `main.js` (1267 lines, Landing Page)
+
+- Pure client-side visual layer: Three.js particle system + GSAP/ScrollTrigger scroll-driven scene animation. **Zero backend API calls of any kind** — confirmed via full-file grep for `fetch(`/`api(`, zero matches. This file is 100% presentational, no data dependency, essentially zero bug-risk from a functional/data-integrity standpoint (only possible bugs would be visual/animation glitches, out of scope for a backend-integration-focused audit).
+- `TOOLS` array (5 entries: Attention Engine, Video Generator, Distribution Engine, Motion Engine, Persona Engine) with `id/name/short/color/hex/url/nodePos` — this is the landing page's "living graph" node data, each node linking to `/tools/<name>/`.
+- **Confirmed: Motion Engine and Persona Engine are both real, registered, but intentionally-stubbed "Coming Soon" placeholder routes** — `src/index.tsx` lines 4060–4063 register `/tools/motion-engine/` and `/tools/persona-engine/`, both served by a shared `toolShell(name, id, color)` function (line 6871) that renders a generic "This module is under active development and will be available in the next Spectra release." placeholder page with a single "← Return to Spectra" link. This is **not a bug** — it's an intentional, working placeholder for 2 of the 5 advertised tools. Confirms the product's real current scope: **3 of 5 advertised tools are functionally real** (Attention Engine, Video Generator, Distribution Engine); the other 2 (Motion Engine, Persona Engine) are marketing-only placeholders with zero backend logic behind them. This is an important, previously-undocumented lifecycle-relevant fact — see updated Lifecycle Assessment below.
+- Boot: `waitDeps()` (polls for `THREE`/`gsap`/`ScrollTrigger` global availability every 20ms) → `boot()` → builds 6 morph-target point clouds (logo/sphere/torus/wave/DNA/scatter — the "SPECTRA" wordmark is literally spelled out in the particle logo shape via a hand-built 5×4 glyph bitmap font, `GLYPHS`), 4 Three.js "scenes" (Node graph / Icosahedron / Dashboard orbs / Portal rings) tied to 5 scroll-triggered sections (hero/tools/features/about/cta), a custom shader-based particle material (`makeParticleMat`), drag-to-spin interaction on the node-graph scene, raycasting-based node hover/click, a "hyper-thrust" double-click navigation animation (`launchToTool()` — FOV squeeze + white flash + delayed `window.location.href`), and a loading-bar boot sequence (`runLoader()`).
+- No functional bugs found in this file — it's a self-contained visual/animation system with no external data dependencies to break. Only very minor/cosmetic observation: `waitDeps()`'s `onDep()` counter (`_deps>=2`) assumes both dependency-check intervals (`THREE` and `gsap`+`ScrollTrigger`) will each fire exactly once — if either library fails to load entirely (e.g., CDN outage), `boot()` never runs and the landing page is left showing only the static HTML/CSS with no particle system and no loader dismissal (the `#loader` overlay would never receive the `.out` class) — a silent, indefinite loading-screen hang with no fallback/timeout. Logged as Finding #29 (low severity — requires an external CDN failure to trigger, but has no graceful degradation path).
+
+### New Confirmed Findings (Pass 4)
+
+25. **CRITICAL — Distribution Engine's session-restore-on-boot is completely broken.** `distribution.js`'s `boot()` function (runs on every page load via `DOMContentLoaded`) calls `await api('GET', '/api/me')` to check for an existing logged-in session. **`/api/me` does not exist anywhere in `src/index.tsx`** — confirmed via exhaustive grep (the only "current user" route is `/api/auth/me`, registered at line 634; there is no wildcard `/api/*` catch-all beyond the CORS middleware, and no `app.onError`/`app.notFound` handler that could be silently answering this path with a 200). Because `res.ok` will always be `false` (404), `boot()` unconditionally calls `showAuthGate()` — meaning **the Distribution Engine shows its login/auth gate on every single page load, even for users who are already fully authenticated with a valid session**, forcing them to log in again every time they navigate to or refresh this tool. `handleAuthSubmit()`'s actual login call (`/api/auth/login`) is correct and works fine once the user re-submits credentials, so the tool is still usable — but the auto-resume-session UX is 100% non-functional. This is the single most severe, user-facing bug found in this entire audit so far (worse than #12, #22, or #23, because it affects 100% of visits to an entire tool, not an edge case). **Recommended fix**: change `/api/me` to `/api/auth/me` in `boot()` — a one-line fix.
+
+26. **CRITICAL — Distribution Engine's "From Project" video picker always returns zero shots, silently.** `openProjectPicker()` (opened from the New Post compose flow's "Choose from a Project" button) calls `GET /api/projects/${p.id}/shots` for each of the user's projects to find completed shots with videos to offer as source content. **This route does not exist** — confirmed via full grep of all `/api/projects/*` backend registrations (`/api/projects`, `/api/projects/:id`, `/api/projects/:id/characters`, `/api/projects/:id/characters/train`, `/api/projects/:id/characters/:charId/soul-status`, `/api/projects/:id/compare`, `/api/projects/:id/timeline`, `/api/projects/:id/timeline/export` — no `/shots` sub-route exists at all). The correct pattern, already used correctly elsewhere in this same codebase by `video-generator.js`, is `GET /api/projects/:id`, whose response includes shots nested in the body. Because this call is wrapped in a `try { ... } catch { return {project: p, shots: []} }`, the failure is **completely silent** — no error toast, no console warning surfaced to the user, nothing. The picker UI will simply show every single project as having "0 completed shots," which looks exactly like "you haven't finished rendering anything yet" rather than "this feature is broken" — arguably a worse bug than a visible crash, since it actively misleads the user about the state of their own content library. **Recommended fix**: change the call to `GET /api/projects/${p.id}` and extract `.shots` from the response body (matching video-generator.js's existing correct pattern) instead of the nonexistent `/shots` sub-route.
+
+27. **Dead code + duplicate function declarations confirmed in `distribution.js`:**
+    - a) `updateMetricsStats` is declared **twice** (line 767 and line 1743) — near-identical logic; per JS function-declaration semantics, the **second (later, line 1743) definition wins** and is what actually executes; the first is unreachable dead code, left in the file.
+    - b) `initLiveChart` is declared **twice** (line 801 — a full, working Chart.js line-chart implementation with its own 60-second live-metrics poller — and line 1997, at the very end of the file, which is an **intentionally emptied stub**: `function initLiveChart() { /* replaced by renderMetricsChart */ }`). Because the empty stub is declared textually later, it wins, meaning the entire ~190-line Chart.js implementation at line 801 (a real, seemingly-functional feature) is **100% dead code that never executes**, left in the file apparently after the Metrics tab was rebuilt (per the code's own "Task 5" comment) with the newer `renderMetricsChart()` — but the old implementation was never deleted, just orphaned by the later re-declaration.
+    - c) `renderBreakdownTable(platformStats)` (referenced from `loadAnalytics()`, called once with `data.platform_stats || {}`) is a **literal empty function body** with only comments: `// This is shown in the breakdown section when no post is selected` / `// It will be overwritten by renderPostBreakdown when a post is selected` — it takes a parameter that is never used and does nothing. This appears to be an intentional not-yet-built placeholder for an "aggregate metrics view before selecting a specific post" feature that was never completed, rather than a bug per se — but it means the Metrics tab's "before you pick a post" state currently shows nothing where a summary was clearly planned.
+    - None of these three sub-findings crash the app or produce user-visible errors — they're silent maintenance debt / unfinished-feature markers, but they are exactly the kind of thing that accumulates into confusion for the next developer who touches this file (two different functions both named `updateMetricsStats`/`initLiveChart`, only one of which is "real," with no comment at either site explaining the shadowing).
+
+28. **Formatting-helper duplication is now confirmed at 4 independent copies across the codebase** (not 2 or 3 as loosely suspected in earlier passes): a K/M-number-abbreviation helper exists separately as `fmtNum()` in `distribution.js`, `formatCount()` in `attention-engine.js`, and at least one unnamed inline equivalent noted in `video-generator.js`'s analytics rendering during Pass 3 — plus the backend likely has its own formatting for admin-page display (not yet re-verified this pass, flagged for the final consolidated pass). This is low-severity (cosmetic/DRY-violation only, all copies appear to produce consistent output) but is a clear, repeated pattern across this codebase of small utility logic being reinvented per-file instead of shared via a common `utils.js` — worth a mention in the final punch list as a "nice to have" refactor, not a bug.
+
+29. **Landing page (`main.js`) has no fallback/timeout if the Three.js/GSAP CDN dependencies fail to load.** `waitDeps()` polls indefinitely (`setInterval`, no max-attempts/timeout) for `THREE`, `gsap`, and `ScrollTrigger` to become available as globals before calling `boot()`. If any of these fail to load (e.g., a CDN outage or ad-blocker interference), `boot()` never runs, meaning the loading screen (`#loader`) never receives its `.out` dismissal class and the landing page is left in a **permanent loading-spinner state with no error message and no way for the user to proceed**, even though the actual page content (nav, hero text, CTAs) is present in the static HTML underneath and could arguably still be shown/usable without the particle animation. Low severity in practice (these are well-known, generally-reliable CDN-hosted libraries) but zero graceful-degradation path exists. **Recommended fix**: add a timeout (e.g., 8s) to `waitDeps()` that force-dismisses the loader and reveals the static page content if dependencies never resolve.
+
+30. **RESOLVED — Landing page's "5 tools" claim is only 60% real; confirmed intentional, not a bug.** `main.js`'s `TOOLS` array presents Motion Engine and Persona Engine as equal, clickable nodes in the "living graph" alongside the 3 fully-functional tools (Attention Engine, Video Generator, Distribution Engine). Clicking either navigates to a real, registered route (`/tools/motion-engine/`, `/tools/persona-engine/`) that renders a shared, generic `toolShell()` "Coming Soon — under active development" placeholder page. This is **working as designed** (not a bug — the backend and frontend agree, and the placeholder page doesn't error), but it is an important, previously-undocumented **lifecycle-relevant fact**: the product's real, working surface area is 3 tools, not the 5 the landing page visually advertises with equal prominence. This belongs in the final "needs work" punch list as a product/business consideration (should the UI visually distinguish "live" vs. "coming soon" tools more clearly?) rather than a code defect.
+
+### Route Cross-Check Summary — FINAL, all 4 frontend JS files reconciled
+
+With `distribution.js`, `attention-engine.js`, and `main.js` now also fully read (on top of `video-generator.js` from Pass 3), the cross-file orphaned-route question opened in Pass 3 is now **conclusively resolved**:
+
+- **`/api/models`** (backend line 984) — confirmed truly orphaned. Zero callers across all 4 frontend JS files (video-generator.js hand-maintains its own duplicate `HF_MODELS_DATA` instead, per Finding #24).
+- **`/api/projects/:id/compare`** (backend line 3697) — confirmed truly orphaned. Zero callers across all 4 frontend JS files. **New finding, added to final punch list as "verify intended use or remove."**
+- **`/api/shots/:shotId/thumbnail`** — **could not be located as a registered backend route at all** during this pass's re-verification (the Pass 3 log's reference to it appears to have been a provisional/unconfirmed flag rather than a grep-verified hit — re-grepped `src/index.tsx` for `thumbnail` this pass and found no matching route registration). This should be treated as **not a real backend route** unless a future pass finds it — removing it from the "orphaned route" punch list and instead noting it as a Pass 3 flag that did not pan out under closer inspection.
+- **Newly found broken (not orphaned-on-backend, but wrong-on-frontend) routes**: `/api/me` (Finding #25) and `/api/projects/:id/shots` (Finding #26) — both are frontend calls to routes that were **never registered on the backend at all** (the inverse problem from `/api/models`/`/api/projects/:id/compare`, which are backend routes nobody calls).
+
+This closes out the full bidirectional route-reconciliation exercise across the entire frontend JS surface (10,643 lines) against the entire backend route table (6,880 lines) — a complete, exhaustive cross-check as mandated by the user's "analyze every line" instruction.
+
+### Updated Lifecycle Stage Assessment (Pass 4)
+
+Still "**Beta / pre-launch hardening**" overall, but this pass materially sharpens the picture in two ways:
+
+1. **Severity escalation**: Finding #25 (broken session-restore, 100% of Distribution Engine page loads affected) is the most severe bug found in the entire audit to date — more severe than any backend bug found in Pass 1–2. This is not a "some things need work" issue; it is a "this specific tool currently forces re-login on every visit" issue, which is the kind of thing that would be caught immediately by any real user and should be considered a release-blocker if this project is close to a public launch. Combined with Finding #26 (silently-broken project picker) and the confirmed dependency on backend bug #12 (broken upload URL), **the Distribution Engine is the least production-ready of the 3 real tools** — it has three confirmed broken data paths (session restore, project picker, and file upload/thumbnail serving) versus Video Generator's more cosmetic issues (dead button, reorder-rollback gap) and Attention Engine's clean bill of health (zero broken routes found).
+2. **Scope clarification**: Finding #30 confirms the product is genuinely a 3-tool product today, with 2 additional tools that are pure marketing placeholders. This matters for lifecycle assessment because "5 intelligent systems" (the landing page's own tagline) overstates current functional scope by 40% — worth flagging to the user/stakeholder as a messaging-vs-reality gap, separate from any code bug.
+
+Relative tool health ranking after this pass: **Attention Engine (cleanest — zero broken routes, thoughtful anti-misleading-data UX) > Video Generator (feature-rich, a few real but minor bugs) > Distribution Engine (3 confirmed broken data paths, needs focused remediation before this tool should be considered launch-ready).**
+
+### Files/areas confirmed still to review (updated after Pass 4)
+- 4 frontend CSS files (9,590 lines combined: video-generator.css 3609, distribution.css 2646, attention-engine.css 2420, style.css 915) — not started, lower logic-risk than JS/backend but still owed under the "every line" mandate.
+- `dist/` build artifacts — not inspected/diffed against source.
+- `npm run build` — not yet run, build/compile health unknown.
+- Final consolidated, priority-ranked "needs work" punch list spanning backend + all frontend — not yet produced (this is the ultimate deliverable).
+- Final lifecycle-stage verdict, incorporating the full picture (backend 100%, frontend JS 100%, frontend CSS 0%) — pending CSS read before being truly "final."
+
+### Next Pass Plan (Pass 5)
+1. Read `public/static/video-generator.css` (3609 lines) in full via `sed -n` chunks.
+2. Read `public/static/distribution.css` (2646 lines) in full.
+3. Read `public/static/attention-engine.css` (2420 lines) in full.
+4. Read `public/static/style.css` (915 lines) in full.
+5. For each CSS file, note any obviously dead/unused selectors if time permits (lower priority than JS/backend logic bugs — CSS bugs are typically visual, not functional/data-integrity).
+6. Run `npm run build` and record the result (success/failure, warnings) verbatim in the log.
+7. Optionally diff `dist/` build output against current `src/`/`public/` source for staleness (were these ever rebuilt after the bugs found in Pass 2–4 existed in source?).
+8. Produce the FINAL consolidated, priority-ranked punch list, grouped by severity (Critical/High/Medium/Low) and by tool, covering every confirmed finding from Pass 1 through Pass 5:
+   - **Critical**: #25 (broken session-restore), #26 (broken project picker), #12 (broken upload URL, from Pass 2).
+   - **High**: #22 (reorder no-rollback), #23 (dead Play-All button), #27a/b (dead code / unfinished stub in Metrics tab).
+   - **Medium**: #21 (tier-limit triplication), #24 (dead /api/models endpoint), #28 (formatting-helper quadruplication), new orphaned `/api/projects/:id/compare`.
+   - **Low**: #29 (no CDN-load timeout on landing page), #30 (messaging-vs-scope gap, product decision not a bug), various Pass 1–2 hardening/docs items.
+9. Finalize the lifecycle-stage verdict with full justification once CSS + build check are complete.
