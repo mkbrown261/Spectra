@@ -19,6 +19,12 @@ type Bindings = {
   FB_ACCESS_TOKEN:       string
   STRIPE_SECRET_KEY:     string   // sk_live_... or sk_test_...
   STRIPE_WEBHOOK_SECRET: string   // whsec_...
+  RESEND_API_KEY:        string   // re_...  (email delivery — https://resend.com)
+  RESEND_FROM_EMAIL:     string   // verified sender, e.g. "Spectra <noreply@yourdomain.com>"
+  TWILIO_ACCOUNT_SID:    string   // AC...
+  TWILIO_AUTH_TOKEN:     string
+  TWILIO_VERIFY_SERVICE_SID: string  // VA...  (Twilio Verify service — handles OTP generation/expiry server-side)
+  APP_BASE_URL:          string   // e.g. https://spectra-b8s.pages.dev — used to build email links; falls back to request origin if unset
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -189,6 +195,21 @@ function generateSessionToken(): string {
   return bytesToBase64(crypto.getRandomValues(new Uint8Array(32)))
 }
 
+// URL-safe random token for email links (verify-email / reset-password) — raw value is
+// emailed to the user and NEVER stored; only its SHA-256 hex digest lives in D1.
+function generateUrlSafeToken(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32))
+  let s = ''
+  for (const b of bytes) s += b.toString(16).padStart(2, '0')
+  return s
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const enc  = new TextEncoder()
+  const hash = await crypto.subtle.digest('SHA-256', enc.encode(input))
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
 /* ══════════════════════════════════════════════════════════════════
    AUTH MIDDLEWARE
 ══════════════════════════════════════════════════════════════════ */
@@ -197,10 +218,10 @@ async function requireAuth(c: any, next: any) {
   if (!token) return c.json({ error: 'Unauthorized' }, 401)
 
   const session = await c.env.DB.prepare(
-    `SELECT s.user_id, s.expires_at, u.tier, u.credits, u.email
+    `SELECT s.user_id, s.expires_at, u.tier, u.credits, u.email, u.email_verified, u.phone, u.phone_verified
      FROM sessions s JOIN users u ON s.user_id = u.id
      WHERE s.id = ? AND s.expires_at > datetime('now')`
-  ).bind(token).first<{ user_id: string; expires_at: string; tier: string; credits: number; email: string }>()
+  ).bind(token).first<{ user_id: string; expires_at: string; tier: string; credits: number; email: string; email_verified: number; phone: string | null; phone_verified: number }>()
 
   if (!session) return c.json({ error: 'Session expired or invalid' }, 401)
 
@@ -208,6 +229,9 @@ async function requireAuth(c: any, next: any) {
   c.set('userTier', session.tier)
   c.set('userCredits', session.credits)
   c.set('userEmail', session.email)
+  c.set('emailVerified', !!session.email_verified)
+  c.set('userPhone', session.phone)
+  c.set('phoneVerified', !!session.phone_verified)
   await next()
 }
 
@@ -268,17 +292,25 @@ async function stripeRequest(
   return res.json()
 }
 
-// Constant-time HMAC-SHA256 signature verification for Stripe webhooks
+// Constant-time HMAC-SHA256 signature verification for Stripe webhooks.
+// Includes a 5-minute replay-window check (Stripe's own recommended tolerance)
+// so a validly-signed but old/replayed payload is rejected.
 async function verifyStripeSignature(
   payload: string,
   sigHeader: string,
-  secret: string
+  secret: string,
+  toleranceSeconds: number = 300
 ): Promise<boolean> {
   try {
     const parts = Object.fromEntries(sigHeader.split(',').map(p => p.split('=')))
     const ts = parts['t']
     const v1 = parts['v1']
     if (!ts || !v1) return false
+
+    const tsNum = Number(ts)
+    if (!Number.isFinite(tsNum)) return false
+    const ageSeconds = Math.abs(Date.now() / 1000 - tsNum)
+    if (ageSeconds > toleranceSeconds) return false  // reject stale/replayed webhook payloads
 
     const signed = `${ts}.${payload}`
     const enc    = new TextEncoder()
@@ -290,6 +322,107 @@ async function verifyStripeSignature(
     return hex === v1
   } catch {
     return false
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   RESEND HELPERS — transactional email (Item 3)
+   Degrades gracefully: if RESEND_API_KEY is unset, sendEmail() returns
+   { ok: false, skipped: true } instead of throwing, so calling routes
+   can proceed (e.g. still create the reset token) and simply report
+   "email not configured" rather than 500ing.
+══════════════════════════════════════════════════════════════════ */
+async function sendEmail(env: Bindings, params: {
+  to: string
+  subject: string
+  html: string
+}): Promise<{ ok: boolean; skipped?: boolean; error?: string }> {
+  if (!env.RESEND_API_KEY) return { ok: false, skipped: true, error: 'RESEND_API_KEY not configured' }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+        'Content-Type':  'application/json',
+      },
+      body: JSON.stringify({
+        from:    env.RESEND_FROM_EMAIL || 'Spectra <onboarding@resend.dev>',
+        to:      [params.to],
+        subject: params.subject,
+        html:    params.html,
+      }),
+    })
+    if (!res.ok) {
+      const body = await res.text().catch(() => '')
+      return { ok: false, error: `Resend ${res.status}: ${body.slice(0, 300)}` }
+    }
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+}
+
+function emailTemplate(title: string, bodyHtml: string, ctaUrl?: string, ctaLabel?: string): string {
+  return `<!DOCTYPE html><html><body style="margin:0;padding:0;background:#0a0a0f;font-family:'Space Grotesk',Arial,sans-serif;color:#e8e8f0;">
+  <div style="max-width:480px;margin:0 auto;padding:40px 24px;">
+    <div style="font-size:20px;font-weight:700;letter-spacing:0.05em;color:#fff;margin-bottom:32px;">SPECTRA</div>
+    <h1 style="font-size:22px;font-weight:600;margin:0 0 16px;color:#fff;">${title}</h1>
+    <div style="font-size:15px;line-height:1.6;color:#b4b4c4;margin-bottom:28px;">${bodyHtml}</div>
+    ${ctaUrl ? `<a href="${ctaUrl}" style="display:inline-block;background:#A78BFA;color:#0a0a0f;font-weight:600;font-size:14px;padding:12px 28px;border-radius:8px;text-decoration:none;">${ctaLabel || 'Continue'}</a>` : ''}
+    <div style="margin-top:40px;padding-top:20px;border-top:1px solid #23232f;font-size:12px;color:#6b6b7f;">If you didn't request this, you can safely ignore this email.</div>
+  </div></body></html>`
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   TWILIO VERIFY HELPERS — phone verification / SMS OTP (Item 4)
+   Uses Twilio Verify (not raw SMS) so Twilio handles OTP generation,
+   expiry, and attempt-rate-limiting server-side. Degrades gracefully:
+   if Twilio secrets are unset, both functions return
+   { ok: false, skipped: true } rather than throwing.
+══════════════════════════════════════════════════════════════════ */
+async function twilioVerifyStart(env: Bindings, phone: string): Promise<{ ok: boolean; skipped?: boolean; sid?: string; error?: string }> {
+  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN || !env.TWILIO_VERIFY_SERVICE_SID) {
+    return { ok: false, skipped: true, error: 'Twilio not configured' }
+  }
+  try {
+    const url  = `https://verify.twilio.com/v2/Services/${env.TWILIO_VERIFY_SERVICE_SID}/Verifications`
+    const auth = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)
+    const res  = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type':  'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ To: phone, Channel: 'sms' }).toString(),
+    })
+    const data = await res.json<any>()
+    if (!res.ok) return { ok: false, error: data?.message || `Twilio ${res.status}` }
+    return { ok: true, sid: data.sid }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+}
+
+async function twilioVerifyCheck(env: Bindings, phone: string, code: string): Promise<{ ok: boolean; skipped?: boolean; approved?: boolean; error?: string }> {
+  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN || !env.TWILIO_VERIFY_SERVICE_SID) {
+    return { ok: false, skipped: true, error: 'Twilio not configured' }
+  }
+  try {
+    const url  = `https://verify.twilio.com/v2/Services/${env.TWILIO_VERIFY_SERVICE_SID}/VerificationCheck`
+    const auth = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)
+    const res  = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type':  'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ To: phone, Code: code }).toString(),
+    })
+    const data = await res.json<any>()
+    if (!res.ok) return { ok: false, error: data?.message || `Twilio ${res.status}` }
+    return { ok: true, approved: data.status === 'approved' }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
   }
 }
 
@@ -609,6 +742,71 @@ Respond with ONLY a JSON array of ${beatCount} objects, no prose, no markdown fe
   }
 }
 
+/* ══════════════════════════════════════════════════════════════════
+   PERSONA ENGINE — ARCHETYPE CATALOG
+   Reference vocabulary for the persona builder UI — a starting point,
+   not a hard constraint (unlike CAMERA_MOVES, users can freely type
+   their own archetype/traits too).
+══════════════════════════════════════════════════════════════════ */
+const PERSONA_ARCHETYPES = [
+  { id: 'mentor',      label: 'The Mentor',       traits: ['wise', 'encouraging', 'patient'] },
+  { id: 'rebel',       label: 'The Rebel',        traits: ['bold', 'unfiltered', 'contrarian'] },
+  { id: 'best_friend', label: 'The Best Friend',  traits: ['warm', 'relatable', 'casual'] },
+  { id: 'expert',      label: 'The Expert',       traits: ['authoritative', 'precise', 'data-driven'] },
+  { id: 'entertainer', label: 'The Entertainer',  traits: ['witty', 'high-energy', 'playful'] },
+  { id: 'storyteller', label: 'The Storyteller',  traits: ['vivid', 'reflective', 'emotive'] },
+  { id: 'hype',        label: 'The Hype Machine', traits: ['loud', 'urgent', 'motivational'] },
+  { id: 'minimalist',  label: 'The Minimalist',   traits: ['calm', 'sparse', 'deliberate'] },
+]
+
+/* ══════════════════════════════════════════════════════════════════
+   PERSONA ENGINE — AI VOICE APPLICATION
+   Given a persona's voice definition + a piece of source copy, ask
+   GPT-4o to rewrite the copy in that persona's voice. Falls back to
+   returning the original text unmodified if the model call fails —
+   same safe-degradation pattern as enhancePromptAdvanced/composeMotionSequence.
+══════════════════════════════════════════════════════════════════ */
+async function applyPersonaVoice(env: Bindings, params: {
+  persona: {
+    name: string
+    archetype?: string | null
+    tone_traits?: string[]
+    vocabulary_notes?: string | null
+    audience_summary?: string | null
+    example_lines?: string[]
+  }
+  source_text: string
+  context?: string   // e.g. "video_prompt" | "caption" | "hook" | "general"
+}): Promise<string> {
+  try {
+    const ai = getAIClient(env)
+    const traits = (params.persona.tone_traits || []).join(', ') || 'not specified'
+    const examples = (params.persona.example_lines || []).slice(0, 5).map(l => `- "${l}"`).join('\n')
+
+    const systemPrompt = `You are a brand-voice ghostwriter. Rewrite the user's text so it sounds exactly like the persona described below, while preserving the original meaning and any factual content. Do not add commentary, explanations, or quotation marks around the result — return ONLY the rewritten text.
+
+PERSONA: ${params.persona.name}${params.persona.archetype ? ` (archetype: ${params.persona.archetype})` : ''}
+TONE TRAITS: ${traits}
+${params.persona.audience_summary ? `AUDIENCE: ${params.persona.audience_summary}\n` : ''}${params.persona.vocabulary_notes ? `VOCABULARY NOTES: ${params.persona.vocabulary_notes}\n` : ''}${examples ? `EXAMPLE LINES IN THIS VOICE:\n${examples}\n` : ''}
+CONTEXT: This text will be used as: ${params.context || 'general content'}.`
+
+    const resp = await ai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: params.source_text },
+      ],
+      temperature: 0.75,
+      max_tokens:  700,
+    })
+
+    const out = resp.choices[0]?.message?.content?.trim()
+    return out || params.source_text
+  } catch {
+    return params.source_text
+  }
+}
+
 async function checkTierLimits(db: D1Database, userId: string, tier: string): Promise<{ ok: boolean; reason?: string }> {
   const limits = TIER_LIMITS[tier] || TIER_LIMITS.free
 
@@ -694,7 +892,33 @@ app.post('/api/auth/register', async (c) => {
       path:     '/',
     })
 
-    return c.json({ ok: true, user: { id, email: email.toLowerCase(), tier: 'free', credits: 10 } })
+    // Fire off a verification email — best-effort, never blocks registration.
+    // Returns { skipped: true } until RESEND_API_KEY is configured; harmless either way.
+    let emailQueued = false
+    try {
+      const rawToken = generateUrlSafeToken()
+      const tokenHash = await sha256Hex(rawToken)
+      const tokExpires = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+      await c.env.DB.prepare(
+        `INSERT INTO auth_tokens (id, user_id, purpose, token_hash, expires_at) VALUES (?, ?, 'verify_email', ?, ?)`
+      ).bind(uuid(), id, tokenHash, tokExpires).run()
+
+      const origin = c.env.APP_BASE_URL || new URL(c.req.url).origin
+      const verifyUrl = `${origin}/api/auth/verify-email?token=${rawToken}`
+      const result = await sendEmail(c.env, {
+        to: email.toLowerCase(),
+        subject: 'Verify your Spectra account',
+        html: emailTemplate(
+          'Verify your email',
+          `Welcome to Spectra. Click below to verify your email address. This link expires in 24 hours.`,
+          verifyUrl,
+          'Verify Email',
+        ),
+      })
+      emailQueued = result.ok
+    } catch { /* never block registration on email failure */ }
+
+    return c.json({ ok: true, user: { id, email: email.toLowerCase(), tier: 'free', credits: 10, email_verified: false }, verification_email_sent: emailQueued })
   } catch (err: any) {
     return c.json({ error: err.message }, 500)
   }
@@ -747,12 +971,221 @@ app.post('/api/auth/logout', async (c) => {
 // GET /api/auth/me
 app.get('/api/auth/me', requireAuth, async (c) => {
   return c.json({
-    id:      c.get('userId'),
-    email:   c.get('userEmail'),
-    tier:    c.get('userTier'),
-    credits: c.get('userCredits'),
-    limits:  TIER_LIMITS[c.get('userTier')] || TIER_LIMITS.free,
+    id:             c.get('userId'),
+    email:          c.get('userEmail'),
+    tier:           c.get('userTier'),
+    credits:        c.get('userCredits'),
+    limits:         TIER_LIMITS[c.get('userTier')] || TIER_LIMITS.free,
+    email_verified: c.get('emailVerified'),
+    phone:          c.get('userPhone'),
+    phone_verified: c.get('phoneVerified'),
   })
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   EMAIL VERIFICATION + PASSWORD RESET  (Item 3 — Resend)
+   All routes below degrade gracefully when RESEND_API_KEY is unset:
+   tokens are still created/consumed correctly, but the email itself
+   won't be delivered — `email_sent`/`skipped` in the response makes
+   this visible to the frontend so it can show a helpful message
+   instead of silently pretending an email went out.
+══════════════════════════════════════════════════════════════════ */
+
+// POST /api/auth/resend-verification — re-send the verify-email link
+app.post('/api/auth/resend-verification', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const email  = c.get('userEmail')
+    if (c.get('emailVerified')) return c.json({ ok: true, already_verified: true })
+
+    // Invalidate any prior unused verify tokens for this user (avoid pile-up)
+    await c.env.DB.prepare(
+      `UPDATE auth_tokens SET used_at = datetime('now') WHERE user_id = ? AND purpose = 'verify_email' AND used_at IS NULL`
+    ).bind(userId).run()
+
+    const rawToken   = generateUrlSafeToken()
+    const tokenHash  = await sha256Hex(rawToken)
+    const tokExpires = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+    await c.env.DB.prepare(
+      `INSERT INTO auth_tokens (id, user_id, purpose, token_hash, expires_at) VALUES (?, ?, 'verify_email', ?, ?)`
+    ).bind(uuid(), userId, tokenHash, tokExpires).run()
+
+    const origin    = c.env.APP_BASE_URL || new URL(c.req.url).origin
+    const verifyUrl = `${origin}/api/auth/verify-email?token=${rawToken}`
+    const result = await sendEmail(c.env, {
+      to: email,
+      subject: 'Verify your Spectra account',
+      html: emailTemplate('Verify your email', `Click below to verify your email address. This link expires in 24 hours.`, verifyUrl, 'Verify Email'),
+    })
+
+    return c.json({ ok: true, email_sent: result.ok, skipped: !!result.skipped, error: result.skipped ? 'Email delivery is not configured yet — contact support to verify manually.' : (result.error || undefined) })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// GET /api/auth/verify-email?token=... — clicked from the emailed link
+app.get('/api/auth/verify-email', async (c) => {
+  const token = c.req.query('token') || ''
+  const origin = c.env.APP_BASE_URL || new URL(c.req.url).origin
+  if (!token) return c.redirect(`${origin}/?verify=missing`)
+  try {
+    const tokenHash = await sha256Hex(token)
+    const row = await c.env.DB.prepare(
+      `SELECT id, user_id, expires_at, used_at FROM auth_tokens WHERE token_hash = ? AND purpose = 'verify_email'`
+    ).bind(tokenHash).first<{ id: string; user_id: string; expires_at: string; used_at: string | null }>()
+
+    if (!row || row.used_at || new Date(row.expires_at) < new Date()) {
+      return c.redirect(`${origin}/?verify=invalid`)
+    }
+
+    await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE users SET email_verified = 1, updated_at = datetime('now') WHERE id = ?`).bind(row.user_id),
+      c.env.DB.prepare(`UPDATE auth_tokens SET used_at = datetime('now') WHERE id = ?`).bind(row.id),
+    ])
+
+    return c.redirect(`${origin}/?verify=success`)
+  } catch {
+    return c.redirect(`${origin}/?verify=error`)
+  }
+})
+
+// POST /api/auth/forgot-password — { email } → always returns { ok: true } (no user enumeration)
+app.post('/api/auth/forgot-password', async (c) => {
+  try {
+    const { email } = await c.req.json()
+    if (!email) return c.json({ error: 'Email required' }, 400)
+
+    const user = await c.env.DB.prepare(`SELECT id FROM users WHERE email = ?`).bind(String(email).toLowerCase()).first<{ id: string }>()
+    // Always respond identically whether or not the account exists, to avoid leaking which emails are registered.
+    if (user) {
+      await c.env.DB.prepare(
+        `UPDATE auth_tokens SET used_at = datetime('now') WHERE user_id = ? AND purpose = 'reset_password' AND used_at IS NULL`
+      ).bind(user.id).run()
+
+      const rawToken   = generateUrlSafeToken()
+      const tokenHash  = await sha256Hex(rawToken)
+      const tokExpires = new Date(Date.now() + 60 * 60 * 1000).toISOString()  // 1 hour
+      await c.env.DB.prepare(
+        `INSERT INTO auth_tokens (id, user_id, purpose, token_hash, expires_at) VALUES (?, ?, 'reset_password', ?, ?)`
+      ).bind(uuid(), user.id, tokenHash, tokExpires).run()
+
+      const origin   = c.env.APP_BASE_URL || new URL(c.req.url).origin
+      const resetUrl = `${origin}/tools/video-generator/?reset_token=${rawToken}`
+      await sendEmail(c.env, {
+        to: email.toLowerCase(),
+        subject: 'Reset your Spectra password',
+        html: emailTemplate('Reset your password', `Click below to set a new password. This link expires in 1 hour.`, resetUrl, 'Reset Password'),
+      })
+    }
+
+    return c.json({ ok: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// POST /api/auth/reset-password — { token, password }
+app.post('/api/auth/reset-password', async (c) => {
+  try {
+    const { token, password } = await c.req.json()
+    if (!token || !password) return c.json({ error: 'Token and new password required' }, 400)
+    if (password.length < 8) return c.json({ error: 'Password must be at least 8 characters' }, 400)
+
+    const tokenHash = await sha256Hex(token)
+    const row = await c.env.DB.prepare(
+      `SELECT id, user_id, expires_at, used_at FROM auth_tokens WHERE token_hash = ? AND purpose = 'reset_password'`
+    ).bind(tokenHash).first<{ id: string; user_id: string; expires_at: string; used_at: string | null }>()
+
+    if (!row || row.used_at || new Date(row.expires_at) < new Date()) {
+      return c.json({ error: 'This reset link is invalid or has expired' }, 400)
+    }
+
+    const hash = await hashPassword(password)
+    await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?`).bind(hash, row.user_id),
+      c.env.DB.prepare(`UPDATE auth_tokens SET used_at = datetime('now') WHERE id = ?`).bind(row.id),
+      // Invalidate all existing sessions on password reset, for security.
+      c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(row.user_id),
+    ])
+
+    return c.json({ ok: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   PHONE VERIFICATION  (Item 4 — Twilio Verify)
+   Optional, opt-in flow (not required at signup): a logged-in user
+   can add + verify a phone number via SMS OTP. Degrades gracefully
+   when Twilio secrets are unset — returns a clear "not configured"
+   error rather than a crash or a fake success.
+══════════════════════════════════════════════════════════════════ */
+
+// POST /api/auth/phone/send-code — { phone } → sends an SMS OTP via Twilio Verify
+app.post('/api/auth/phone/send-code', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const { phone } = await c.req.json()
+    if (!phone || !/^\+[1-9]\d{6,14}$/.test(phone)) {
+      return c.json({ error: 'Phone number must be in E.164 format, e.g. +15551234567' }, 400)
+    }
+
+    // Basic rate-limit: max 1 pending send per 60s per user
+    const recent = await c.env.DB.prepare(
+      `SELECT id FROM phone_verifications WHERE user_id = ? AND created_at > datetime('now', '-60 seconds') ORDER BY created_at DESC LIMIT 1`
+    ).bind(userId).first()
+    if (recent) return c.json({ error: 'Please wait a minute before requesting another code' }, 429)
+
+    const result = await twilioVerifyStart(c.env, phone)
+    if (result.skipped) return c.json({ error: 'Phone verification is not configured yet', skipped: true }, 503)
+    if (!result.ok) return c.json({ error: result.error || 'Failed to send verification code' }, 502)
+
+    const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString()
+    await c.env.DB.prepare(
+      `INSERT INTO phone_verifications (id, user_id, phone, status, twilio_sid, expires_at) VALUES (?, ?, ?, 'pending', ?, ?)`
+    ).bind(uuid(), userId, phone, result.sid || null, expires).run()
+
+    // Store the (unverified) phone on the user record immediately so the UI can show it as "pending verification".
+    await c.env.DB.prepare(`UPDATE users SET phone = ?, phone_verified = 0, updated_at = datetime('now') WHERE id = ?`).bind(phone, userId).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// POST /api/auth/phone/verify-code — { code } → checks the OTP against Twilio Verify
+app.post('/api/auth/phone/verify-code', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const { code } = await c.req.json()
+    if (!code) return c.json({ error: 'Code required' }, 400)
+
+    const user = await c.env.DB.prepare(`SELECT phone FROM users WHERE id = ?`).bind(userId).first<{ phone: string | null }>()
+    if (!user?.phone) return c.json({ error: 'No pending phone verification for this account' }, 400)
+
+    const result = await twilioVerifyCheck(c.env, user.phone, code)
+    if (result.skipped) return c.json({ error: 'Phone verification is not configured yet', skipped: true }, 503)
+    if (!result.ok) return c.json({ error: result.error || 'Verification failed' }, 502)
+
+    if (!result.approved) {
+      await c.env.DB.prepare(
+        `UPDATE phone_verifications SET attempts = attempts + 1 WHERE user_id = ? AND phone = ? AND status = 'pending'`
+      ).bind(userId, user.phone).run()
+      return c.json({ ok: false, error: 'Incorrect or expired code' }, 400)
+    }
+
+    await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE users SET phone_verified = 1, updated_at = datetime('now') WHERE id = ?`).bind(userId),
+      c.env.DB.prepare(`UPDATE phone_verifications SET status = 'approved' WHERE user_id = ? AND phone = ? AND status = 'pending'`).bind(userId, user.phone),
+    ])
+
+    return c.json({ ok: true, verified: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
 })
 
 /* ══════════════════════════════════════════════════════════════════
@@ -892,6 +1325,11 @@ app.patch('/api/projects/:id', requireAuth, async (c) => {
     ).bind(projectId, userId).first()
     if (!project) return c.json({ error: 'Project not found' }, 404)
 
+    if (body.persona_id) {
+      const persona = await c.env.DB.prepare(`SELECT id FROM personas WHERE id = ? AND user_id = ?`).bind(body.persona_id, userId).first()
+      if (!persona) return c.json({ error: 'Persona not found' }, 404)
+    }
+
     const fields: string[] = []
     const values: any[]    = []
 
@@ -899,6 +1337,7 @@ app.patch('/api/projects/:id', requireAuth, async (c) => {
     if (body.style_bible !== undefined)      { fields.push('style_bible = ?');      values.push(JSON.stringify(body.style_bible)) }
     if (body.default_provider !== undefined) { fields.push('default_provider = ?'); values.push(body.default_provider) }
     if (body.default_model !== undefined)    { fields.push('default_model = ?');    values.push(body.default_model) }
+    if (body.persona_id !== undefined)       { fields.push('persona_id = ?');       values.push(body.persona_id || null) }
 
     if (!fields.length) return c.json({ error: 'Nothing to update' }, 400)
 
@@ -1379,6 +1818,10 @@ app.get('/api/video/:key', async (c) => {
    ITEM 2 — STRIPE BILLING
 ══════════════════════════════════════════════════════════════════ */
 
+// Real Stripe Price IDs are placeholder strings until the client's Stripe dashboard is
+// configured — this flag lets the frontend show "Billing coming soon" instead of a raw 500.
+const STRIPE_PRICES_ARE_PLACEHOLDERS = Object.values(STRIPE_PRICES).every(v => v.startsWith('price_') && v.includes('_monthly'))
+
 // GET /api/billing/status
 app.get('/api/billing/status', requireAuth, async (c) => {
   try {
@@ -1392,6 +1835,7 @@ app.get('/api/billing/status', requireAuth, async (c) => {
       stripe_customer_id:      user.stripe_customer_id,
       stripe_subscription_id:  user.stripe_subscription_id,
       limits:                  TIER_LIMITS[user.tier] || TIER_LIMITS.free,
+      billing_configured:      !!c.env.STRIPE_SECRET_KEY && !STRIPE_PRICES_ARE_PLACEHOLDERS,
     })
   } catch (err: any) {
     return c.json({ error: err.message }, 500)
@@ -1401,7 +1845,8 @@ app.get('/api/billing/status', requireAuth, async (c) => {
 // POST /api/billing/checkout — create Stripe Checkout session
 app.post('/api/billing/checkout', requireAuth, async (c) => {
   try {
-    if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Stripe not configured' }, 500)
+    if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Billing is not configured yet — Stripe API keys have not been added. Contact support.', not_configured: true }, 503)
+    if (STRIPE_PRICES_ARE_PLACEHOLDERS) return c.json({ error: 'Billing plans have not been finalized yet — check back soon.', not_configured: true }, 503)
     const userId = c.get('userId')
     const email  = c.get('userEmail')
     const { tier } = await c.req.json()
@@ -1489,6 +1934,27 @@ app.post('/api/billing/webhook', async (c) => {
     }
 
     return c.json({ received: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// POST /api/billing/portal — Stripe Customer Portal (self-service manage/cancel subscription)
+app.post('/api/billing/portal', requireAuth, async (c) => {
+  try {
+    if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Billing is not configured yet — Stripe API keys have not been added. Contact support.', not_configured: true }, 503)
+    const userId = c.get('userId')
+    const user = await c.env.DB.prepare(`SELECT stripe_customer_id FROM users WHERE id = ?`).bind(userId).first<{ stripe_customer_id: string | null }>()
+    if (!user?.stripe_customer_id) return c.json({ error: 'No billing account found for this user yet — upgrade first.' }, 400)
+
+    const origin = new URL(c.req.url).origin
+    const portal = await stripeRequest('/billing_portal/sessions', 'POST', {
+      customer:   user.stripe_customer_id,
+      return_url: `${origin}/tools/video-generator/`,
+    }, c.env.STRIPE_SECRET_KEY)
+
+    if (portal.error) return c.json({ error: portal.error.message }, 400)
+    return c.json({ ok: true, url: portal.url })
   } catch (err: any) {
     return c.json({ error: err.message }, 500)
   }
@@ -4284,6 +4750,190 @@ app.get('/api/motion/sequences/:id/export', requireAuth, async (c) => {
 })
 
 /* ══════════════════════════════════════════════════════════════════
+   PERSONA ENGINE — Brand Voice Profile Builder
+   A persona is a reusable voice/tone definition that can be attached to
+   many projects (projects.persona_id) and applied to arbitrary copy via
+   the AI voice-application helper (applyPersonaVoice). Mirrors the
+   Motion Engine route structure exactly.
+══════════════════════════════════════════════════════════════════ */
+
+// GET /api/persona/archetypes — reference catalog (soft suggestions, not enforced)
+app.get('/api/persona/archetypes', (c) => c.json({ archetypes: PERSONA_ARCHETYPES }))
+
+// GET /api/personas — list all personas owned by the authenticated user
+app.get('/api/personas', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const rows = await c.env.DB.prepare(
+      `SELECT p.*, (SELECT COUNT(*) FROM projects pr WHERE pr.persona_id = p.id) as project_count,
+              (SELECT COUNT(*) FROM persona_applications pa WHERE pa.persona_id = p.id) as application_count
+       FROM personas p
+       WHERE p.user_id = ?
+       ORDER BY p.is_default DESC, p.updated_at DESC`
+    ).bind(userId).all()
+
+    const personas = rows.results.map((p: any) => ({
+      ...p,
+      tone_traits:   p.tone_traits   ? JSON.parse(p.tone_traits)   : [],
+      example_lines: p.example_lines ? JSON.parse(p.example_lines) : [],
+      is_default:    !!p.is_default,
+    }))
+
+    return c.json({ personas })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// POST /api/personas — create a new persona
+app.post('/api/personas', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const body   = await c.req.json()
+    if (!body.name?.trim()) return c.json({ error: 'name required' }, 400)
+
+    const id = uuid()
+    const toneTraits   = Array.isArray(body.tone_traits)   ? JSON.stringify(body.tone_traits)   : null
+    const exampleLines = Array.isArray(body.example_lines) ? JSON.stringify(body.example_lines) : null
+
+    await c.env.DB.prepare(
+      `INSERT INTO personas (id, user_id, name, archetype, tone_traits, vocabulary_notes, audience_summary, example_lines)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      id, userId, body.name.trim(),
+      body.archetype?.trim() || null,
+      toneTraits,
+      body.vocabulary_notes?.trim() || null,
+      body.audience_summary?.trim() || null,
+      exampleLines,
+    ).run()
+
+    return c.json({ ok: true, id }, 201)
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// GET /api/personas/:id — full persona detail
+app.get('/api/personas/:id', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const personaId = c.req.param('id')
+
+    const persona = await c.env.DB.prepare(
+      `SELECT * FROM personas WHERE id = ? AND user_id = ?`
+    ).bind(personaId, userId).first<any>()
+    if (!persona) return c.json({ error: 'Persona not found' }, 404)
+
+    const applications = await c.env.DB.prepare(
+      `SELECT id, source_text, output_text, context, created_at FROM persona_applications
+       WHERE persona_id = ? ORDER BY created_at DESC LIMIT 20`
+    ).bind(personaId).all()
+
+    return c.json({
+      ...persona,
+      tone_traits:   persona.tone_traits   ? JSON.parse(persona.tone_traits)   : [],
+      example_lines: persona.example_lines ? JSON.parse(persona.example_lines) : [],
+      is_default:    !!persona.is_default,
+      recent_applications: applications.results,
+    })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// PATCH /api/personas/:id — update any subset of fields
+app.patch('/api/personas/:id', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const personaId = c.req.param('id')
+    const body      = await c.req.json()
+
+    const persona = await c.env.DB.prepare(
+      `SELECT id FROM personas WHERE id = ? AND user_id = ?`
+    ).bind(personaId, userId).first()
+    if (!persona) return c.json({ error: 'Persona not found' }, 404)
+
+    const fields: string[] = []
+    const values: any[]    = []
+    if (body.name              !== undefined) { fields.push('name = ?');              values.push(String(body.name).trim()) }
+    if (body.archetype         !== undefined) { fields.push('archetype = ?');         values.push(body.archetype?.trim() || null) }
+    if (body.tone_traits       !== undefined) { fields.push('tone_traits = ?');       values.push(Array.isArray(body.tone_traits) ? JSON.stringify(body.tone_traits) : null) }
+    if (body.vocabulary_notes  !== undefined) { fields.push('vocabulary_notes = ?');  values.push(body.vocabulary_notes?.trim() || null) }
+    if (body.audience_summary  !== undefined) { fields.push('audience_summary = ?');  values.push(body.audience_summary?.trim() || null) }
+    if (body.example_lines     !== undefined) { fields.push('example_lines = ?');     values.push(Array.isArray(body.example_lines) ? JSON.stringify(body.example_lines) : null) }
+    if (!fields.length) return c.json({ error: 'Nothing to update' }, 400)
+    fields.push(`updated_at = datetime('now')`)
+
+    await c.env.DB.prepare(
+      `UPDATE personas SET ${fields.join(', ')} WHERE id = ?`
+    ).bind(...values, personaId).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// DELETE /api/personas/:id — cascades to persona_applications, detaches projects (SET NULL)
+app.delete('/api/personas/:id', requireAuth, async (c) => {
+  const userId    = c.get('userId')
+  const personaId = c.req.param('id')
+  await c.env.DB.prepare(
+    `DELETE FROM personas WHERE id = ? AND user_id = ?`
+  ).bind(personaId, userId).run()
+  return c.json({ ok: true })
+})
+
+// POST /api/personas/:id/set-default — mark this persona as the user's default (unsets any other)
+app.post('/api/personas/:id/set-default', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const personaId = c.req.param('id')
+
+    const persona = await c.env.DB.prepare(
+      `SELECT id FROM personas WHERE id = ? AND user_id = ?`
+    ).bind(personaId, userId).first()
+    if (!persona) return c.json({ error: 'Persona not found' }, 404)
+
+    await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE personas SET is_default = 0 WHERE user_id = ?`).bind(userId),
+      c.env.DB.prepare(`UPDATE personas SET is_default = 1, updated_at = datetime('now') WHERE id = ?`).bind(personaId),
+    ])
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// POST /api/personas/:id/apply — rewrite source_text in this persona's voice via AI
+app.post('/api/personas/:id/apply', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const personaId = c.req.param('id')
+    const { source_text, context } = await c.req.json()
+    if (!source_text?.trim()) return c.json({ error: 'source_text required' }, 400)
+
+    const persona = await c.env.DB.prepare(
+      `SELECT * FROM personas WHERE id = ? AND user_id = ?`
+    ).bind(personaId, userId).first<any>()
+    if (!persona) return c.json({ error: 'Persona not found' }, 404)
+
+    const output = await applyPersonaVoice(c.env, {
+      persona: {
+        name:             persona.name,
+        archetype:        persona.archetype,
+        tone_traits:      persona.tone_traits   ? JSON.parse(persona.tone_traits)   : [],
+        vocabulary_notes: persona.vocabulary_notes,
+        audience_summary: persona.audience_summary,
+        example_lines:    persona.example_lines ? JSON.parse(persona.example_lines) : [],
+      },
+      source_text: source_text.trim(),
+      context:     context?.trim() || undefined,
+    })
+
+    const appId = uuid()
+    await c.env.DB.prepare(
+      `INSERT INTO persona_applications (id, persona_id, user_id, source_text, output_text, context)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(appId, personaId, userId, source_text.trim(), output, context?.trim() || null).run()
+
+    return c.json({ ok: true, id: appId, output_text: output, unchanged: output === source_text.trim() })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+/* ══════════════════════════════════════════════════════════════════
    ADMIN PANEL — secret-key gated
    ADMIN_SECRET env var must be set; passed as ?secret= or X-Admin-Secret header
 ══════════════════════════════════════════════════════════════════ */
@@ -4506,7 +5156,7 @@ app.get('/tools/distribution-engine/', (c) => c.html(distributionPage()))
 app.get('/tools/motion-engine',  (c) => c.redirect('/tools/motion-engine/'))
 app.get('/tools/motion-engine/', (c) => c.html(motionEnginePage()))
 app.get('/tools/persona-engine',  (c) => c.redirect('/tools/persona-engine/'))
-app.get('/tools/persona-engine/', (c) => c.html(toolShell('Spectra Persona Engine', 'persona', '#F87171')))
+app.get('/tools/persona-engine/', (c) => c.html(personaEnginePage()))
 app.get('/', (c) => c.html(landingPage()))
 
 export default app
@@ -6162,6 +6812,188 @@ function motionEnginePage(): string {
 <div class="mo-toast" id="mo-toast"></div>
 
 <script src="/static/motion-engine.js"></script>
+</body>
+</html>`
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   PERSONA ENGINE PAGE — Brand Voice Profile Builder
+══════════════════════════════════════════════════════════════════ */
+function personaEnginePage(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Persona Engine — Spectra</title>
+<meta name="description" content="Build reusable brand voice profiles and apply them to any copy across your projects.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/persona-engine.css"/>
+</head>
+<body>
+
+<!-- NAV -->
+<nav class="pe-nav">
+  <a href="/" class="pe-nav-logo">
+    <span class="pe-nav-mark">S</span>
+    <span class="pe-nav-wordmark">SPECTRA</span>
+  </a>
+  <div class="pe-nav-center">
+    <span class="pe-nav-tool-badge">
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0116 0v1"/></svg>
+      Persona Engine
+    </span>
+  </div>
+  <div class="pe-nav-right">
+    <span class="pe-nav-email" id="pe-user-email"></span>
+    <a href="/tools/video-generator/" class="pe-nav-back">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+      Video Generator
+    </a>
+  </div>
+</nav>
+
+<!-- AUTH GATE -->
+<div id="pe-auth-gate" class="pe-auth-gate" style="display:none">
+  <div class="pe-auth-card">
+    <div class="pe-auth-logo"><span class="pe-nav-mark" style="width:40px;height:40px;font-size:1rem">S</span></div>
+    <h2 class="pe-auth-title">Sign in to Spectra</h2>
+    <p class="pe-auth-sub">Access the Persona Engine</p>
+    <form id="pe-auth-form" class="pe-auth-form" autocomplete="off">
+      <input type="email"    id="pe-auth-email" class="pe-input" placeholder="Email" required autocomplete="email"/>
+      <input type="password" id="pe-auth-pass"  class="pe-input" placeholder="Password" required/>
+      <button type="submit"  class="pe-btn-primary" id="pe-auth-submit">Sign In</button>
+    </form>
+    <p class="pe-auth-err" id="pe-auth-err"></p>
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="pe-app" style="display:none">
+
+  <!-- LEFT RAIL — personas + archetypes -->
+  <aside class="pe-rail">
+    <div class="pe-rail-section pe-rail-grow">
+      <div class="pe-rail-label-row">
+        <span class="pe-rail-label">Personas</span>
+        <button class="pe-icon-btn" id="btn-new-persona" title="New persona">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+      </div>
+      <div class="pe-persona-list" id="pe-persona-list">
+        <div class="pe-persona-empty">No personas yet</div>
+      </div>
+    </div>
+
+    <div class="pe-rail-section">
+      <div class="pe-rail-label">Archetype Reference</div>
+      <div class="pe-archetype-palette" id="pe-archetype-palette"></div>
+    </div>
+  </aside>
+
+  <!-- MAIN EDITOR -->
+  <main class="pe-main">
+
+    <!-- Empty state -->
+    <div class="pe-empty-state" id="pe-empty-state">
+      <div class="pe-empty-icon">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0116 0v1"/></svg>
+      </div>
+      <h3>No persona selected</h3>
+      <p>Create a brand voice persona to define tone, vocabulary, and audience — then apply it to any copy across your projects.</p>
+      <button class="pe-btn-primary" id="btn-empty-new-persona">New Persona</button>
+    </div>
+
+    <!-- Persona editor -->
+    <div class="pe-editor" id="pe-editor" style="display:none">
+      <div class="pe-editor-header">
+        <div class="pe-editor-title-wrap">
+          <input type="text" id="pe-name" class="pe-name-input" placeholder="Persona name — e.g. 'Late Night Mentor'"/>
+          <input type="text" id="pe-archetype" class="pe-archetype-input" placeholder="Archetype (optional — e.g. The Mentor, or your own label)"/>
+        </div>
+        <div class="pe-editor-actions">
+          <button class="pe-btn-ghost" id="btn-set-default" title="Mark as default persona">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15 9 22 9.5 17 14.5 18.5 22 12 18 5.5 22 7 14.5 2 9.5 9 9"/></svg>
+            Default
+          </button>
+          <button class="pe-btn-danger-ghost" id="btn-delete-persona">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Voice definition fields -->
+      <div class="pe-field-group">
+        <div class="pe-field">
+          <span class="pe-field-label">Tone Traits</span>
+          <div class="pe-tag-input-wrap" id="pe-traits-wrap">
+            <input type="text" id="pe-traits-input" class="pe-tag-input" placeholder="Type a trait and press Enter — e.g. witty, direct, warm"/>
+          </div>
+        </div>
+
+        <div class="pe-field">
+          <span class="pe-field-label">Audience Summary</span>
+          <textarea id="pe-audience" class="pe-textarea" rows="2" placeholder="Who is this voice speaking to? e.g. 'Busy founders who want blunt, no-fluff advice.'"></textarea>
+        </div>
+
+        <div class="pe-field">
+          <span class="pe-field-label">Vocabulary Notes</span>
+          <textarea id="pe-vocab" class="pe-textarea" rows="2" placeholder="Words/phrases to use or avoid, sentence length preferences, slang, etc."></textarea>
+        </div>
+
+        <div class="pe-field">
+          <div class="pe-section-header">
+            <span>Example Lines (few-shot voice samples)</span>
+            <button class="pe-btn-ghost pe-btn-sm" id="btn-add-example">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              Add Line
+            </button>
+          </div>
+          <div class="pe-example-list" id="pe-example-list"></div>
+          <span class="pe-field-hint">These are shown to the AI as style samples when applying this voice.</span>
+        </div>
+
+        <button class="pe-btn-primary" id="btn-save-persona">Save Persona</button>
+      </div>
+
+      <!-- Voice apply panel -->
+      <div class="pe-section-header"><span>Apply This Voice</span></div>
+      <div class="pe-apply-panel">
+        <div class="pe-apply-row">
+          <textarea id="pe-apply-input" class="pe-apply-input" placeholder="Paste any copy — a video prompt, a caption, a hook — and rewrite it in this persona's voice." rows="3"></textarea>
+          <div class="pe-apply-controls">
+            <select id="pe-apply-context" class="pe-apply-select">
+              <option value="general">General</option>
+              <option value="video_prompt">Video Prompt</option>
+              <option value="caption">Caption</option>
+              <option value="hook">Hook</option>
+            </select>
+            <button class="pe-btn-primary" id="btn-apply-voice">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L9.5 9.5 2 12l7.5 2.5L12 22l2.5-7.5L22 12l-7.5-2.5z"/></svg>
+              Apply Voice
+            </button>
+          </div>
+        </div>
+        <div class="pe-apply-output pe-apply-output-empty" id="pe-apply-output">Output will appear here.</div>
+        <div class="pe-apply-output-actions">
+          <button class="pe-btn-ghost pe-btn-sm" id="btn-copy-output">Copy Result</button>
+        </div>
+      </div>
+
+      <!-- History -->
+      <div class="pe-section-header"><span>Recent Applications</span></div>
+      <div class="pe-history-list" id="pe-history-list">
+        <div class="pe-history-empty">No applications yet — try Apply Voice above.</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="pe-toast" id="pe-toast"></div>
+
+<script src="/static/persona-engine.js"></script>
 </body>
 </html>`
 }
