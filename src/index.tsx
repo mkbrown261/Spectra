@@ -19,6 +19,12 @@ type Bindings = {
   FB_ACCESS_TOKEN:       string
   STRIPE_SECRET_KEY:     string   // sk_live_... or sk_test_...
   STRIPE_WEBHOOK_SECRET: string   // whsec_...
+  RESEND_API_KEY:        string   // re_...  (email delivery — https://resend.com)
+  RESEND_FROM_EMAIL:     string   // verified sender, e.g. "Spectra <noreply@yourdomain.com>"
+  TWILIO_ACCOUNT_SID:    string   // AC...
+  TWILIO_AUTH_TOKEN:     string
+  TWILIO_VERIFY_SERVICE_SID: string  // VA...  (Twilio Verify service — handles OTP generation/expiry server-side)
+  APP_BASE_URL:          string   // e.g. https://spectra-b8s.pages.dev — used to build email links; falls back to request origin if unset
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -51,6 +57,35 @@ const HF_MODELS = [
 ]
 
 const HF_BASE = 'https://platform.higgsfield.ai'
+
+/* ══════════════════════════════════════════════════════════════════
+   MOTION ENGINE — CAMERA MOVE CATALOG
+   Vocabulary shared between the AI composer and the manual beat
+   editor. `prompt_fragment` is appended to the shot prompt sent to
+   Higgsfield; `strength_hint` seeds the default intensity slider.
+══════════════════════════════════════════════════════════════════ */
+const CAMERA_MOVES = [
+  { id: 'static',        label: 'Static Lock',      category: 'still',  prompt_fragment: 'locked-off static shot, no camera movement',              strength_hint: 2 },
+  { id: 'push_in',       label: 'Push In',          category: 'dolly',  prompt_fragment: 'slow dolly push-in toward the subject',                    strength_hint: 5 },
+  { id: 'pull_out',      label: 'Pull Out',         category: 'dolly',  prompt_fragment: 'slow dolly pull-out revealing the wider scene',            strength_hint: 5 },
+  { id: 'pan_left',      label: 'Pan Left',         category: 'pan',    prompt_fragment: 'smooth camera pan to the left',                            strength_hint: 4 },
+  { id: 'pan_right',     label: 'Pan Right',        category: 'pan',    prompt_fragment: 'smooth camera pan to the right',                           strength_hint: 4 },
+  { id: 'tilt_up',       label: 'Tilt Up',          category: 'pan',    prompt_fragment: 'camera tilts upward, revealing scale',                     strength_hint: 4 },
+  { id: 'tilt_down',     label: 'Tilt Down',        category: 'pan',    prompt_fragment: 'camera tilts downward',                                    strength_hint: 4 },
+  { id: 'orbit_left',    label: 'Orbit Left',       category: 'orbit',  prompt_fragment: 'camera orbits counter-clockwise around the subject',       strength_hint: 6 },
+  { id: 'orbit_right',   label: 'Orbit Right',      category: 'orbit',  prompt_fragment: 'camera orbits clockwise around the subject',               strength_hint: 6 },
+  { id: 'crane_up',      label: 'Crane Up',         category: 'crane',  prompt_fragment: 'crane shot rising upward above the subject',               strength_hint: 6 },
+  { id: 'crane_down',    label: 'Crane Down',       category: 'crane',  prompt_fragment: 'crane shot descending toward the subject',                 strength_hint: 6 },
+  { id: 'handheld',      label: 'Handheld',         category: 'handheld', prompt_fragment: 'handheld camera with natural shake, documentary feel',  strength_hint: 7 },
+  { id: 'whip_pan',      label: 'Whip Pan',         category: 'pan',    prompt_fragment: 'fast whip-pan transition, motion blur',                    strength_hint: 9 },
+  { id: 'zoom_in',       label: 'Zoom In',          category: 'zoom',   prompt_fragment: 'lens zoom in, tightening on the subject',                  strength_hint: 5 },
+  { id: 'zoom_out',      label: 'Zoom Out',         category: 'zoom',   prompt_fragment: 'lens zoom out, widening the frame',                        strength_hint: 5 },
+  { id: 'dolly_zoom',    label: 'Dolly Zoom (Vertigo)', category: 'dolly', prompt_fragment: 'dolly zoom vertigo effect, background warps',           strength_hint: 8 },
+  { id: 'tracking',      label: 'Tracking Shot',    category: 'tracking', prompt_fragment: 'camera tracks alongside the subject in motion',         strength_hint: 6 },
+  { id: 'aerial',        label: 'Aerial / Drone',   category: 'aerial', prompt_fragment: 'sweeping aerial drone shot from above',                    strength_hint: 7 },
+  { id: 'low_angle',     label: 'Low Angle Push',   category: 'dolly',  prompt_fragment: 'low-angle push-in, subject towers over camera',            strength_hint: 6 },
+  { id: 'shake_impact',  label: 'Impact Shake',     category: 'handheld', prompt_fragment: 'sudden camera shake on impact, high energy',             strength_hint: 9 },
+]
 
 /* ══════════════════════════════════════════════════════════════════
    UTILITIES
@@ -160,6 +195,21 @@ function generateSessionToken(): string {
   return bytesToBase64(crypto.getRandomValues(new Uint8Array(32)))
 }
 
+// URL-safe random token for email links (verify-email / reset-password) — raw value is
+// emailed to the user and NEVER stored; only its SHA-256 hex digest lives in D1.
+function generateUrlSafeToken(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32))
+  let s = ''
+  for (const b of bytes) s += b.toString(16).padStart(2, '0')
+  return s
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const enc  = new TextEncoder()
+  const hash = await crypto.subtle.digest('SHA-256', enc.encode(input))
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
 /* ══════════════════════════════════════════════════════════════════
    AUTH MIDDLEWARE
 ══════════════════════════════════════════════════════════════════ */
@@ -168,10 +218,10 @@ async function requireAuth(c: any, next: any) {
   if (!token) return c.json({ error: 'Unauthorized' }, 401)
 
   const session = await c.env.DB.prepare(
-    `SELECT s.user_id, s.expires_at, u.tier, u.credits, u.email
+    `SELECT s.user_id, s.expires_at, u.tier, u.credits, u.email, u.email_verified, u.phone, u.phone_verified
      FROM sessions s JOIN users u ON s.user_id = u.id
      WHERE s.id = ? AND s.expires_at > datetime('now')`
-  ).bind(token).first<{ user_id: string; expires_at: string; tier: string; credits: number; email: string }>()
+  ).bind(token).first<{ user_id: string; expires_at: string; tier: string; credits: number; email: string; email_verified: number; phone: string | null; phone_verified: number }>()
 
   if (!session) return c.json({ error: 'Session expired or invalid' }, 401)
 
@@ -179,6 +229,9 @@ async function requireAuth(c: any, next: any) {
   c.set('userTier', session.tier)
   c.set('userCredits', session.credits)
   c.set('userEmail', session.email)
+  c.set('emailVerified', !!session.email_verified)
+  c.set('userPhone', session.phone)
+  c.set('phoneVerified', !!session.phone_verified)
   await next()
 }
 
@@ -239,17 +292,25 @@ async function stripeRequest(
   return res.json()
 }
 
-// Constant-time HMAC-SHA256 signature verification for Stripe webhooks
+// Constant-time HMAC-SHA256 signature verification for Stripe webhooks.
+// Includes a 5-minute replay-window check (Stripe's own recommended tolerance)
+// so a validly-signed but old/replayed payload is rejected.
 async function verifyStripeSignature(
   payload: string,
   sigHeader: string,
-  secret: string
+  secret: string,
+  toleranceSeconds: number = 300
 ): Promise<boolean> {
   try {
     const parts = Object.fromEntries(sigHeader.split(',').map(p => p.split('=')))
     const ts = parts['t']
     const v1 = parts['v1']
     if (!ts || !v1) return false
+
+    const tsNum = Number(ts)
+    if (!Number.isFinite(tsNum)) return false
+    const ageSeconds = Math.abs(Date.now() / 1000 - tsNum)
+    if (ageSeconds > toleranceSeconds) return false  // reject stale/replayed webhook payloads
 
     const signed = `${ts}.${payload}`
     const enc    = new TextEncoder()
@@ -261,6 +322,107 @@ async function verifyStripeSignature(
     return hex === v1
   } catch {
     return false
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   RESEND HELPERS — transactional email (Item 3)
+   Degrades gracefully: if RESEND_API_KEY is unset, sendEmail() returns
+   { ok: false, skipped: true } instead of throwing, so calling routes
+   can proceed (e.g. still create the reset token) and simply report
+   "email not configured" rather than 500ing.
+══════════════════════════════════════════════════════════════════ */
+async function sendEmail(env: Bindings, params: {
+  to: string
+  subject: string
+  html: string
+}): Promise<{ ok: boolean; skipped?: boolean; error?: string }> {
+  if (!env.RESEND_API_KEY) return { ok: false, skipped: true, error: 'RESEND_API_KEY not configured' }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${env.RESEND_API_KEY}`,
+        'Content-Type':  'application/json',
+      },
+      body: JSON.stringify({
+        from:    env.RESEND_FROM_EMAIL || 'Spectra <onboarding@resend.dev>',
+        to:      [params.to],
+        subject: params.subject,
+        html:    params.html,
+      }),
+    })
+    if (!res.ok) {
+      const body = await res.text().catch(() => '')
+      return { ok: false, error: `Resend ${res.status}: ${body.slice(0, 300)}` }
+    }
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+}
+
+function emailTemplate(title: string, bodyHtml: string, ctaUrl?: string, ctaLabel?: string): string {
+  return `<!DOCTYPE html><html><body style="margin:0;padding:0;background:#0a0a0f;font-family:'Space Grotesk',Arial,sans-serif;color:#e8e8f0;">
+  <div style="max-width:480px;margin:0 auto;padding:40px 24px;">
+    <div style="font-size:20px;font-weight:700;letter-spacing:0.05em;color:#fff;margin-bottom:32px;">SPECTRA</div>
+    <h1 style="font-size:22px;font-weight:600;margin:0 0 16px;color:#fff;">${title}</h1>
+    <div style="font-size:15px;line-height:1.6;color:#b4b4c4;margin-bottom:28px;">${bodyHtml}</div>
+    ${ctaUrl ? `<a href="${ctaUrl}" style="display:inline-block;background:#A78BFA;color:#0a0a0f;font-weight:600;font-size:14px;padding:12px 28px;border-radius:8px;text-decoration:none;">${ctaLabel || 'Continue'}</a>` : ''}
+    <div style="margin-top:40px;padding-top:20px;border-top:1px solid #23232f;font-size:12px;color:#6b6b7f;">If you didn't request this, you can safely ignore this email.</div>
+  </div></body></html>`
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   TWILIO VERIFY HELPERS — phone verification / SMS OTP (Item 4)
+   Uses Twilio Verify (not raw SMS) so Twilio handles OTP generation,
+   expiry, and attempt-rate-limiting server-side. Degrades gracefully:
+   if Twilio secrets are unset, both functions return
+   { ok: false, skipped: true } rather than throwing.
+══════════════════════════════════════════════════════════════════ */
+async function twilioVerifyStart(env: Bindings, phone: string): Promise<{ ok: boolean; skipped?: boolean; sid?: string; error?: string }> {
+  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN || !env.TWILIO_VERIFY_SERVICE_SID) {
+    return { ok: false, skipped: true, error: 'Twilio not configured' }
+  }
+  try {
+    const url  = `https://verify.twilio.com/v2/Services/${env.TWILIO_VERIFY_SERVICE_SID}/Verifications`
+    const auth = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)
+    const res  = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type':  'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ To: phone, Channel: 'sms' }).toString(),
+    })
+    const data = await res.json<any>()
+    if (!res.ok) return { ok: false, error: data?.message || `Twilio ${res.status}` }
+    return { ok: true, sid: data.sid }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
+  }
+}
+
+async function twilioVerifyCheck(env: Bindings, phone: string, code: string): Promise<{ ok: boolean; skipped?: boolean; approved?: boolean; error?: string }> {
+  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN || !env.TWILIO_VERIFY_SERVICE_SID) {
+    return { ok: false, skipped: true, error: 'Twilio not configured' }
+  }
+  try {
+    const url  = `https://verify.twilio.com/v2/Services/${env.TWILIO_VERIFY_SERVICE_SID}/VerificationCheck`
+    const auth = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`)
+    const res  = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type':  'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ To: phone, Code: code }).toString(),
+    })
+    const data = await res.json<any>()
+    if (!res.ok) return { ok: false, error: data?.message || `Twilio ${res.status}` }
+    return { ok: true, approved: data.status === 'approved' }
+  } catch (err: any) {
+    return { ok: false, error: err.message }
   }
 }
 
@@ -494,6 +656,156 @@ async function enhancePromptAdvanced(env: Bindings, params: {
   }
 }
 
+/* ══════════════════════════════════════════════════════════════════
+   MOTION ENGINE — AI SEQUENCE COMPOSER
+   Given a scene description + desired beat count, ask GPT-4o to pick
+   an ordered list of camera moves from CAMERA_MOVES (by id only) with
+   per-beat intensity/duration/notes. Falls back to a simple
+   push-in → orbit → pull-out arc if the model call fails or returns
+   something we can't parse.
+══════════════════════════════════════════════════════════════════ */
+async function composeMotionSequence(env: Bindings, params: {
+  description: string
+  beat_count?: number
+  mood?: string
+}): Promise<Array<{ camera_move: string; intensity: number; duration_sec: number; notes: string }>> {
+  const beatCount = Math.min(Math.max(params.beat_count || 4, 2), 10)
+  const catalogIds = CAMERA_MOVES.map(m => m.id).join(', ')
+
+  const fallback = () => {
+    const arc = ['push_in', 'orbit_left', 'tracking', 'pull_out']
+    return Array.from({ length: beatCount }, (_, i) => {
+      const id = arc[i % arc.length]
+      const move = CAMERA_MOVES.find(m => m.id === id)!
+      return { camera_move: id, intensity: move.strength_hint, duration_sec: 5, notes: 'Fallback beat (AI composer unavailable).' }
+    })
+  }
+
+  try {
+    const ai = getAIClient(env)
+    const systemPrompt = `You are a cinematography director composing a camera-motion sequence for an AI video generator.
+Choose exactly ${beatCount} beats, each using ONE camera move id from this catalog: ${catalogIds}.
+For each beat return: camera_move (catalog id, exact match), intensity (1-10 integer), duration_sec (2-10 integer), notes (one short sentence explaining the choice).
+Respond with ONLY a JSON array of ${beatCount} objects, no prose, no markdown fences.`
+
+    const userPrompt = `Scene: ${params.description}${params.mood ? `\nMood/genre: ${params.mood}` : ''}`
+
+    const resp = await ai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userPrompt },
+      ],
+      temperature: 0.8,
+      max_tokens:  600,
+      response_format: { type: 'json_object' as any },
+    }).catch(async () => {
+      // Some models reject response_format on plain arrays — retry without it.
+      return ai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user',   content: userPrompt },
+        ],
+        temperature: 0.8,
+        max_tokens:  600,
+      })
+    })
+
+    let raw = resp.choices[0]?.message?.content?.trim() || ''
+    raw = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim()
+
+    let parsed: any = JSON.parse(raw)
+    // Model may wrap the array under a key like {"beats":[...]} when json_object mode forces an object.
+    if (!Array.isArray(parsed)) {
+      const arrKey = Object.keys(parsed).find(k => Array.isArray(parsed[k]))
+      parsed = arrKey ? parsed[arrKey] : null
+    }
+    if (!Array.isArray(parsed) || parsed.length === 0) return fallback()
+
+    const validIds = new Set(CAMERA_MOVES.map(m => m.id))
+    const beats = parsed.slice(0, beatCount).map((b: any) => {
+      const moveId = validIds.has(b.camera_move) ? b.camera_move : 'push_in'
+      const move    = CAMERA_MOVES.find(m => m.id === moveId)!
+      const intensity = Number.isFinite(Number(b.intensity)) ? Math.min(10, Math.max(1, Math.round(Number(b.intensity)))) : move.strength_hint
+      const duration  = Number.isFinite(Number(b.duration_sec)) ? Math.min(10, Math.max(2, Math.round(Number(b.duration_sec)))) : 5
+      return {
+        camera_move:  moveId,
+        intensity,
+        duration_sec: duration,
+        notes:        String(b.notes || '').slice(0, 200) || move.label,
+      }
+    })
+    return beats.length ? beats : fallback()
+  } catch {
+    return fallback()
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   PERSONA ENGINE — ARCHETYPE CATALOG
+   Reference vocabulary for the persona builder UI — a starting point,
+   not a hard constraint (unlike CAMERA_MOVES, users can freely type
+   their own archetype/traits too).
+══════════════════════════════════════════════════════════════════ */
+const PERSONA_ARCHETYPES = [
+  { id: 'mentor',      label: 'The Mentor',       traits: ['wise', 'encouraging', 'patient'] },
+  { id: 'rebel',       label: 'The Rebel',        traits: ['bold', 'unfiltered', 'contrarian'] },
+  { id: 'best_friend', label: 'The Best Friend',  traits: ['warm', 'relatable', 'casual'] },
+  { id: 'expert',      label: 'The Expert',       traits: ['authoritative', 'precise', 'data-driven'] },
+  { id: 'entertainer', label: 'The Entertainer',  traits: ['witty', 'high-energy', 'playful'] },
+  { id: 'storyteller', label: 'The Storyteller',  traits: ['vivid', 'reflective', 'emotive'] },
+  { id: 'hype',        label: 'The Hype Machine', traits: ['loud', 'urgent', 'motivational'] },
+  { id: 'minimalist',  label: 'The Minimalist',   traits: ['calm', 'sparse', 'deliberate'] },
+]
+
+/* ══════════════════════════════════════════════════════════════════
+   PERSONA ENGINE — AI VOICE APPLICATION
+   Given a persona's voice definition + a piece of source copy, ask
+   GPT-4o to rewrite the copy in that persona's voice. Falls back to
+   returning the original text unmodified if the model call fails —
+   same safe-degradation pattern as enhancePromptAdvanced/composeMotionSequence.
+══════════════════════════════════════════════════════════════════ */
+async function applyPersonaVoice(env: Bindings, params: {
+  persona: {
+    name: string
+    archetype?: string | null
+    tone_traits?: string[]
+    vocabulary_notes?: string | null
+    audience_summary?: string | null
+    example_lines?: string[]
+  }
+  source_text: string
+  context?: string   // e.g. "video_prompt" | "caption" | "hook" | "general"
+}): Promise<string> {
+  try {
+    const ai = getAIClient(env)
+    const traits = (params.persona.tone_traits || []).join(', ') || 'not specified'
+    const examples = (params.persona.example_lines || []).slice(0, 5).map(l => `- "${l}"`).join('\n')
+
+    const systemPrompt = `You are a brand-voice ghostwriter. Rewrite the user's text so it sounds exactly like the persona described below, while preserving the original meaning and any factual content. Do not add commentary, explanations, or quotation marks around the result — return ONLY the rewritten text.
+
+PERSONA: ${params.persona.name}${params.persona.archetype ? ` (archetype: ${params.persona.archetype})` : ''}
+TONE TRAITS: ${traits}
+${params.persona.audience_summary ? `AUDIENCE: ${params.persona.audience_summary}\n` : ''}${params.persona.vocabulary_notes ? `VOCABULARY NOTES: ${params.persona.vocabulary_notes}\n` : ''}${examples ? `EXAMPLE LINES IN THIS VOICE:\n${examples}\n` : ''}
+CONTEXT: This text will be used as: ${params.context || 'general content'}.`
+
+    const resp = await ai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: params.source_text },
+      ],
+      temperature: 0.75,
+      max_tokens:  700,
+    })
+
+    const out = resp.choices[0]?.message?.content?.trim()
+    return out || params.source_text
+  } catch {
+    return params.source_text
+  }
+}
 
 async function checkTierLimits(db: D1Database, userId: string, tier: string): Promise<{ ok: boolean; reason?: string }> {
   const limits = TIER_LIMITS[tier] || TIER_LIMITS.free
@@ -580,7 +892,33 @@ app.post('/api/auth/register', async (c) => {
       path:     '/',
     })
 
-    return c.json({ ok: true, user: { id, email: email.toLowerCase(), tier: 'free', credits: 10 } })
+    // Fire off a verification email — best-effort, never blocks registration.
+    // Returns { skipped: true } until RESEND_API_KEY is configured; harmless either way.
+    let emailQueued = false
+    try {
+      const rawToken = generateUrlSafeToken()
+      const tokenHash = await sha256Hex(rawToken)
+      const tokExpires = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+      await c.env.DB.prepare(
+        `INSERT INTO auth_tokens (id, user_id, purpose, token_hash, expires_at) VALUES (?, ?, 'verify_email', ?, ?)`
+      ).bind(uuid(), id, tokenHash, tokExpires).run()
+
+      const origin = c.env.APP_BASE_URL || new URL(c.req.url).origin
+      const verifyUrl = `${origin}/api/auth/verify-email?token=${rawToken}`
+      const result = await sendEmail(c.env, {
+        to: email.toLowerCase(),
+        subject: 'Verify your Spectra account',
+        html: emailTemplate(
+          'Verify your email',
+          `Welcome to Spectra. Click below to verify your email address. This link expires in 24 hours.`,
+          verifyUrl,
+          'Verify Email',
+        ),
+      })
+      emailQueued = result.ok
+    } catch { /* never block registration on email failure */ }
+
+    return c.json({ ok: true, user: { id, email: email.toLowerCase(), tier: 'free', credits: 10, email_verified: false }, verification_email_sent: emailQueued })
   } catch (err: any) {
     return c.json({ error: err.message }, 500)
   }
@@ -633,12 +971,221 @@ app.post('/api/auth/logout', async (c) => {
 // GET /api/auth/me
 app.get('/api/auth/me', requireAuth, async (c) => {
   return c.json({
-    id:      c.get('userId'),
-    email:   c.get('userEmail'),
-    tier:    c.get('userTier'),
-    credits: c.get('userCredits'),
-    limits:  TIER_LIMITS[c.get('userTier')] || TIER_LIMITS.free,
+    id:             c.get('userId'),
+    email:          c.get('userEmail'),
+    tier:           c.get('userTier'),
+    credits:        c.get('userCredits'),
+    limits:         TIER_LIMITS[c.get('userTier')] || TIER_LIMITS.free,
+    email_verified: c.get('emailVerified'),
+    phone:          c.get('userPhone'),
+    phone_verified: c.get('phoneVerified'),
   })
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   EMAIL VERIFICATION + PASSWORD RESET  (Item 3 — Resend)
+   All routes below degrade gracefully when RESEND_API_KEY is unset:
+   tokens are still created/consumed correctly, but the email itself
+   won't be delivered — `email_sent`/`skipped` in the response makes
+   this visible to the frontend so it can show a helpful message
+   instead of silently pretending an email went out.
+══════════════════════════════════════════════════════════════════ */
+
+// POST /api/auth/resend-verification — re-send the verify-email link
+app.post('/api/auth/resend-verification', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const email  = c.get('userEmail')
+    if (c.get('emailVerified')) return c.json({ ok: true, already_verified: true })
+
+    // Invalidate any prior unused verify tokens for this user (avoid pile-up)
+    await c.env.DB.prepare(
+      `UPDATE auth_tokens SET used_at = datetime('now') WHERE user_id = ? AND purpose = 'verify_email' AND used_at IS NULL`
+    ).bind(userId).run()
+
+    const rawToken   = generateUrlSafeToken()
+    const tokenHash  = await sha256Hex(rawToken)
+    const tokExpires = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+    await c.env.DB.prepare(
+      `INSERT INTO auth_tokens (id, user_id, purpose, token_hash, expires_at) VALUES (?, ?, 'verify_email', ?, ?)`
+    ).bind(uuid(), userId, tokenHash, tokExpires).run()
+
+    const origin    = c.env.APP_BASE_URL || new URL(c.req.url).origin
+    const verifyUrl = `${origin}/api/auth/verify-email?token=${rawToken}`
+    const result = await sendEmail(c.env, {
+      to: email,
+      subject: 'Verify your Spectra account',
+      html: emailTemplate('Verify your email', `Click below to verify your email address. This link expires in 24 hours.`, verifyUrl, 'Verify Email'),
+    })
+
+    return c.json({ ok: true, email_sent: result.ok, skipped: !!result.skipped, error: result.skipped ? 'Email delivery is not configured yet — contact support to verify manually.' : (result.error || undefined) })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// GET /api/auth/verify-email?token=... — clicked from the emailed link
+app.get('/api/auth/verify-email', async (c) => {
+  const token = c.req.query('token') || ''
+  const origin = c.env.APP_BASE_URL || new URL(c.req.url).origin
+  if (!token) return c.redirect(`${origin}/?verify=missing`)
+  try {
+    const tokenHash = await sha256Hex(token)
+    const row = await c.env.DB.prepare(
+      `SELECT id, user_id, expires_at, used_at FROM auth_tokens WHERE token_hash = ? AND purpose = 'verify_email'`
+    ).bind(tokenHash).first<{ id: string; user_id: string; expires_at: string; used_at: string | null }>()
+
+    if (!row || row.used_at || new Date(row.expires_at) < new Date()) {
+      return c.redirect(`${origin}/?verify=invalid`)
+    }
+
+    await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE users SET email_verified = 1, updated_at = datetime('now') WHERE id = ?`).bind(row.user_id),
+      c.env.DB.prepare(`UPDATE auth_tokens SET used_at = datetime('now') WHERE id = ?`).bind(row.id),
+    ])
+
+    return c.redirect(`${origin}/?verify=success`)
+  } catch {
+    return c.redirect(`${origin}/?verify=error`)
+  }
+})
+
+// POST /api/auth/forgot-password — { email } → always returns { ok: true } (no user enumeration)
+app.post('/api/auth/forgot-password', async (c) => {
+  try {
+    const { email } = await c.req.json()
+    if (!email) return c.json({ error: 'Email required' }, 400)
+
+    const user = await c.env.DB.prepare(`SELECT id FROM users WHERE email = ?`).bind(String(email).toLowerCase()).first<{ id: string }>()
+    // Always respond identically whether or not the account exists, to avoid leaking which emails are registered.
+    if (user) {
+      await c.env.DB.prepare(
+        `UPDATE auth_tokens SET used_at = datetime('now') WHERE user_id = ? AND purpose = 'reset_password' AND used_at IS NULL`
+      ).bind(user.id).run()
+
+      const rawToken   = generateUrlSafeToken()
+      const tokenHash  = await sha256Hex(rawToken)
+      const tokExpires = new Date(Date.now() + 60 * 60 * 1000).toISOString()  // 1 hour
+      await c.env.DB.prepare(
+        `INSERT INTO auth_tokens (id, user_id, purpose, token_hash, expires_at) VALUES (?, ?, 'reset_password', ?, ?)`
+      ).bind(uuid(), user.id, tokenHash, tokExpires).run()
+
+      const origin   = c.env.APP_BASE_URL || new URL(c.req.url).origin
+      const resetUrl = `${origin}/tools/video-generator/?reset_token=${rawToken}`
+      await sendEmail(c.env, {
+        to: email.toLowerCase(),
+        subject: 'Reset your Spectra password',
+        html: emailTemplate('Reset your password', `Click below to set a new password. This link expires in 1 hour.`, resetUrl, 'Reset Password'),
+      })
+    }
+
+    return c.json({ ok: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// POST /api/auth/reset-password — { token, password }
+app.post('/api/auth/reset-password', async (c) => {
+  try {
+    const { token, password } = await c.req.json()
+    if (!token || !password) return c.json({ error: 'Token and new password required' }, 400)
+    if (password.length < 8) return c.json({ error: 'Password must be at least 8 characters' }, 400)
+
+    const tokenHash = await sha256Hex(token)
+    const row = await c.env.DB.prepare(
+      `SELECT id, user_id, expires_at, used_at FROM auth_tokens WHERE token_hash = ? AND purpose = 'reset_password'`
+    ).bind(tokenHash).first<{ id: string; user_id: string; expires_at: string; used_at: string | null }>()
+
+    if (!row || row.used_at || new Date(row.expires_at) < new Date()) {
+      return c.json({ error: 'This reset link is invalid or has expired' }, 400)
+    }
+
+    const hash = await hashPassword(password)
+    await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?`).bind(hash, row.user_id),
+      c.env.DB.prepare(`UPDATE auth_tokens SET used_at = datetime('now') WHERE id = ?`).bind(row.id),
+      // Invalidate all existing sessions on password reset, for security.
+      c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(row.user_id),
+    ])
+
+    return c.json({ ok: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   PHONE VERIFICATION  (Item 4 — Twilio Verify)
+   Optional, opt-in flow (not required at signup): a logged-in user
+   can add + verify a phone number via SMS OTP. Degrades gracefully
+   when Twilio secrets are unset — returns a clear "not configured"
+   error rather than a crash or a fake success.
+══════════════════════════════════════════════════════════════════ */
+
+// POST /api/auth/phone/send-code — { phone } → sends an SMS OTP via Twilio Verify
+app.post('/api/auth/phone/send-code', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const { phone } = await c.req.json()
+    if (!phone || !/^\+[1-9]\d{6,14}$/.test(phone)) {
+      return c.json({ error: 'Phone number must be in E.164 format, e.g. +15551234567' }, 400)
+    }
+
+    // Basic rate-limit: max 1 pending send per 60s per user
+    const recent = await c.env.DB.prepare(
+      `SELECT id FROM phone_verifications WHERE user_id = ? AND created_at > datetime('now', '-60 seconds') ORDER BY created_at DESC LIMIT 1`
+    ).bind(userId).first()
+    if (recent) return c.json({ error: 'Please wait a minute before requesting another code' }, 429)
+
+    const result = await twilioVerifyStart(c.env, phone)
+    if (result.skipped) return c.json({ error: 'Phone verification is not configured yet', skipped: true }, 503)
+    if (!result.ok) return c.json({ error: result.error || 'Failed to send verification code' }, 502)
+
+    const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString()
+    await c.env.DB.prepare(
+      `INSERT INTO phone_verifications (id, user_id, phone, status, twilio_sid, expires_at) VALUES (?, ?, ?, 'pending', ?, ?)`
+    ).bind(uuid(), userId, phone, result.sid || null, expires).run()
+
+    // Store the (unverified) phone on the user record immediately so the UI can show it as "pending verification".
+    await c.env.DB.prepare(`UPDATE users SET phone = ?, phone_verified = 0, updated_at = datetime('now') WHERE id = ?`).bind(phone, userId).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// POST /api/auth/phone/verify-code — { code } → checks the OTP against Twilio Verify
+app.post('/api/auth/phone/verify-code', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const { code } = await c.req.json()
+    if (!code) return c.json({ error: 'Code required' }, 400)
+
+    const user = await c.env.DB.prepare(`SELECT phone FROM users WHERE id = ?`).bind(userId).first<{ phone: string | null }>()
+    if (!user?.phone) return c.json({ error: 'No pending phone verification for this account' }, 400)
+
+    const result = await twilioVerifyCheck(c.env, user.phone, code)
+    if (result.skipped) return c.json({ error: 'Phone verification is not configured yet', skipped: true }, 503)
+    if (!result.ok) return c.json({ error: result.error || 'Verification failed' }, 502)
+
+    if (!result.approved) {
+      await c.env.DB.prepare(
+        `UPDATE phone_verifications SET attempts = attempts + 1 WHERE user_id = ? AND phone = ? AND status = 'pending'`
+      ).bind(userId, user.phone).run()
+      return c.json({ ok: false, error: 'Incorrect or expired code' }, 400)
+    }
+
+    await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE users SET phone_verified = 1, updated_at = datetime('now') WHERE id = ?`).bind(userId),
+      c.env.DB.prepare(`UPDATE phone_verifications SET status = 'approved' WHERE user_id = ? AND phone = ? AND status = 'pending'`).bind(userId, user.phone),
+    ])
+
+    return c.json({ ok: true, verified: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
 })
 
 /* ══════════════════════════════════════════════════════════════════
@@ -778,6 +1325,11 @@ app.patch('/api/projects/:id', requireAuth, async (c) => {
     ).bind(projectId, userId).first()
     if (!project) return c.json({ error: 'Project not found' }, 404)
 
+    if (body.persona_id) {
+      const persona = await c.env.DB.prepare(`SELECT id FROM personas WHERE id = ? AND user_id = ?`).bind(body.persona_id, userId).first()
+      if (!persona) return c.json({ error: 'Persona not found' }, 404)
+    }
+
     const fields: string[] = []
     const values: any[]    = []
 
@@ -785,6 +1337,7 @@ app.patch('/api/projects/:id', requireAuth, async (c) => {
     if (body.style_bible !== undefined)      { fields.push('style_bible = ?');      values.push(JSON.stringify(body.style_bible)) }
     if (body.default_provider !== undefined) { fields.push('default_provider = ?'); values.push(body.default_provider) }
     if (body.default_model !== undefined)    { fields.push('default_model = ?');    values.push(body.default_model) }
+    if (body.persona_id !== undefined)       { fields.push('persona_id = ?');       values.push(body.persona_id || null) }
 
     if (!fields.length) return c.json({ error: 'Nothing to update' }, 400)
 
@@ -1265,6 +1818,10 @@ app.get('/api/video/:key', async (c) => {
    ITEM 2 — STRIPE BILLING
 ══════════════════════════════════════════════════════════════════ */
 
+// Real Stripe Price IDs are placeholder strings until the client's Stripe dashboard is
+// configured — this flag lets the frontend show "Billing coming soon" instead of a raw 500.
+const STRIPE_PRICES_ARE_PLACEHOLDERS = Object.values(STRIPE_PRICES).every(v => v.startsWith('price_') && v.includes('_monthly'))
+
 // GET /api/billing/status
 app.get('/api/billing/status', requireAuth, async (c) => {
   try {
@@ -1278,6 +1835,7 @@ app.get('/api/billing/status', requireAuth, async (c) => {
       stripe_customer_id:      user.stripe_customer_id,
       stripe_subscription_id:  user.stripe_subscription_id,
       limits:                  TIER_LIMITS[user.tier] || TIER_LIMITS.free,
+      billing_configured:      !!c.env.STRIPE_SECRET_KEY && !STRIPE_PRICES_ARE_PLACEHOLDERS,
     })
   } catch (err: any) {
     return c.json({ error: err.message }, 500)
@@ -1287,7 +1845,8 @@ app.get('/api/billing/status', requireAuth, async (c) => {
 // POST /api/billing/checkout — create Stripe Checkout session
 app.post('/api/billing/checkout', requireAuth, async (c) => {
   try {
-    if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Stripe not configured' }, 500)
+    if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Billing is not configured yet — Stripe API keys have not been added. Contact support.', not_configured: true }, 503)
+    if (STRIPE_PRICES_ARE_PLACEHOLDERS) return c.json({ error: 'Billing plans have not been finalized yet — check back soon.', not_configured: true }, 503)
     const userId = c.get('userId')
     const email  = c.get('userEmail')
     const { tier } = await c.req.json()
@@ -1375,6 +1934,27 @@ app.post('/api/billing/webhook', async (c) => {
     }
 
     return c.json({ received: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
+})
+
+// POST /api/billing/portal — Stripe Customer Portal (self-service manage/cancel subscription)
+app.post('/api/billing/portal', requireAuth, async (c) => {
+  try {
+    if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Billing is not configured yet — Stripe API keys have not been added. Contact support.', not_configured: true }, 503)
+    const userId = c.get('userId')
+    const user = await c.env.DB.prepare(`SELECT stripe_customer_id FROM users WHERE id = ?`).bind(userId).first<{ stripe_customer_id: string | null }>()
+    if (!user?.stripe_customer_id) return c.json({ error: 'No billing account found for this user yet — upgrade first.' }, 400)
+
+    const origin = new URL(c.req.url).origin
+    const portal = await stripeRequest('/billing_portal/sessions', 'POST', {
+      customer:   user.stripe_customer_id,
+      return_url: `${origin}/tools/video-generator/`,
+    }, c.env.STRIPE_SECRET_KEY)
+
+    if (portal.error) return c.json({ error: portal.error.message }, 400)
+    return c.json({ ok: true, url: portal.url })
   } catch (err: any) {
     return c.json({ error: err.message }, 500)
   }
@@ -2396,9 +2976,8 @@ app.post('/api/distribution/upload', requireAuth, async (c) => {
       httpMetadata: { contentType: file.type || 'video/mp4' },
     })
 
-    const publicUrl = `https://pub-${c.env.STORAGE.toString().split(':')[0]}.r2.dev/${key}`
-    // Serve through our own proxy route
-    const serveUrl = `/api/media/${key}`
+    // Serve through our own R2 proxy route (same pattern as /api/video/:key used elsewhere)
+    const serveUrl = `/api/video/${encodeURIComponent(key)}`
 
     return c.json({ ok: true, key, url: serveUrl, size: file.size, name: file.name })
   } catch (err: any) { return c.json({ error: err.message }, 500) }
@@ -3838,6 +4417,523 @@ function formatTimecode(totalSeconds: number): string {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+   MOTION COMPOSITION ENGINE — API ROUTES
+   Choreograph ordered camera-move sequences ("beats") per project,
+   either hand-built beat by beat or AI-composed from a scene
+   description. Beats can optionally be linked to a generated shot
+   and their move+intensity translate directly into the
+   motion_strength/prompt fields Video Generator sends to Higgsfield.
+══════════════════════════════════════════════════════════════════ */
+
+// GET /api/motion/catalog — camera-move vocabulary for the UI palette
+app.get('/api/motion/catalog', (c) => c.json({ moves: CAMERA_MOVES }))
+
+// GET /api/motion/sequences?project_id=... — list sequences for a project
+app.get('/api/motion/sequences', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const projectId = c.req.query('project_id')
+    if (!projectId) return c.json({ error: 'project_id required' }, 400)
+
+    const project = await c.env.DB.prepare(
+      `SELECT id FROM projects WHERE id = ? AND user_id = ?`
+    ).bind(projectId, userId).first()
+    if (!project) return c.json({ error: 'Project not found' }, 404)
+
+    const rows = await c.env.DB.prepare(
+      `SELECT ms.*, (SELECT COUNT(*) FROM motion_beats mb WHERE mb.sequence_id = ms.id) as beat_count,
+              (SELECT COALESCE(SUM(duration_sec),0) FROM motion_beats mb WHERE mb.sequence_id = ms.id) as total_duration_sec
+       FROM motion_sequences ms
+       WHERE ms.project_id = ? AND ms.user_id = ?
+       ORDER BY ms.updated_at DESC`
+    ).bind(projectId, userId).all()
+
+    return c.json({ sequences: rows.results })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// POST /api/motion/sequences — create an empty sequence
+app.post('/api/motion/sequences', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const { project_id, name, mood } = await c.req.json()
+    if (!project_id) return c.json({ error: 'project_id required' }, 400)
+    if (!name?.trim()) return c.json({ error: 'name required' }, 400)
+
+    const project = await c.env.DB.prepare(
+      `SELECT id FROM projects WHERE id = ? AND user_id = ?`
+    ).bind(project_id, userId).first()
+    if (!project) return c.json({ error: 'Project not found' }, 404)
+
+    const id = uuid()
+    await c.env.DB.prepare(
+      `INSERT INTO motion_sequences (id, project_id, user_id, name, mood) VALUES (?, ?, ?, ?, ?)`
+    ).bind(id, project_id, userId, name.trim(), mood?.trim() || null).run()
+
+    return c.json({ ok: true, id }, 201)
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// GET /api/motion/sequences/:id — full sequence with ordered beats
+app.get('/api/motion/sequences/:id', requireAuth, async (c) => {
+  try {
+    const userId     = c.get('userId')
+    const sequenceId = c.req.param('id')
+
+    const sequence = await c.env.DB.prepare(
+      `SELECT * FROM motion_sequences WHERE id = ? AND user_id = ?`
+    ).bind(sequenceId, userId).first()
+    if (!sequence) return c.json({ error: 'Sequence not found' }, 404)
+
+    const beats = await c.env.DB.prepare(
+      `SELECT * FROM motion_beats WHERE sequence_id = ? ORDER BY sort_order ASC, created_at ASC`
+    ).bind(sequenceId).all()
+
+    return c.json({ ...sequence, beats: beats.results })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// PATCH /api/motion/sequences/:id — rename / update mood
+app.patch('/api/motion/sequences/:id', requireAuth, async (c) => {
+  try {
+    const userId     = c.get('userId')
+    const sequenceId = c.req.param('id')
+    const { name, mood } = await c.req.json()
+
+    const sequence = await c.env.DB.prepare(
+      `SELECT id FROM motion_sequences WHERE id = ? AND user_id = ?`
+    ).bind(sequenceId, userId).first()
+    if (!sequence) return c.json({ error: 'Sequence not found' }, 404)
+
+    const fields: string[] = []
+    const values: any[]    = []
+    if (name !== undefined) { fields.push('name = ?'); values.push(String(name).trim()) }
+    if (mood !== undefined) { fields.push('mood = ?'); values.push(mood ? String(mood).trim() : null) }
+    if (!fields.length) return c.json({ error: 'Nothing to update' }, 400)
+    fields.push(`updated_at = datetime('now')`)
+
+    await c.env.DB.prepare(
+      `UPDATE motion_sequences SET ${fields.join(', ')} WHERE id = ?`
+    ).bind(...values, sequenceId).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// DELETE /api/motion/sequences/:id
+app.delete('/api/motion/sequences/:id', requireAuth, async (c) => {
+  const userId     = c.get('userId')
+  const sequenceId = c.req.param('id')
+  await c.env.DB.prepare(
+    `DELETE FROM motion_sequences WHERE id = ? AND user_id = ?`
+  ).bind(sequenceId, userId).run()
+  return c.json({ ok: true })
+})
+
+// POST /api/motion/sequences/:id/beats — append a single beat
+app.post('/api/motion/sequences/:id/beats', requireAuth, async (c) => {
+  try {
+    const userId     = c.get('userId')
+    const sequenceId = c.req.param('id')
+    const { camera_move, intensity, duration_sec, notes } = await c.req.json()
+
+    const sequence = await c.env.DB.prepare(
+      `SELECT id FROM motion_sequences WHERE id = ? AND user_id = ?`
+    ).bind(sequenceId, userId).first()
+    if (!sequence) return c.json({ error: 'Sequence not found' }, 404)
+
+    if (!CAMERA_MOVES.some(m => m.id === camera_move)) {
+      return c.json({ error: 'Invalid camera_move id' }, 400)
+    }
+
+    const { count } = await c.env.DB.prepare(
+      `SELECT COUNT(*) as count FROM motion_beats WHERE sequence_id = ?`
+    ).bind(sequenceId).first<{ count: number }>() || { count: 0 }
+
+    const id = uuid()
+    await c.env.DB.prepare(
+      `INSERT INTO motion_beats (id, sequence_id, sort_order, camera_move, intensity, duration_sec, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      id, sequenceId, count, camera_move,
+      Math.min(10, Math.max(1, Number(intensity) || 5)),
+      Math.min(10, Math.max(2, Number(duration_sec) || 5)),
+      notes?.trim() || null,
+    ).run()
+
+    await c.env.DB.prepare(`UPDATE motion_sequences SET updated_at = datetime('now') WHERE id = ?`).bind(sequenceId).run()
+
+    return c.json({ ok: true, id }, 201)
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// PATCH /api/motion/beats/:beatId — edit a beat's move/intensity/duration/notes/shot link
+app.patch('/api/motion/beats/:beatId', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const beatId = c.req.param('beatId')
+    const body   = await c.req.json()
+
+    // Ownership check via join to motion_sequences
+    const beat = await c.env.DB.prepare(
+      `SELECT mb.id, mb.sequence_id FROM motion_beats mb
+       JOIN motion_sequences ms ON ms.id = mb.sequence_id
+       WHERE mb.id = ? AND ms.user_id = ?`
+    ).bind(beatId, userId).first<{ id: string; sequence_id: string }>()
+    if (!beat) return c.json({ error: 'Beat not found' }, 404)
+
+    const fields: string[] = []
+    const values: any[]    = []
+    if (body.camera_move !== undefined) {
+      if (!CAMERA_MOVES.some(m => m.id === body.camera_move)) return c.json({ error: 'Invalid camera_move id' }, 400)
+      fields.push('camera_move = ?'); values.push(body.camera_move)
+    }
+    if (body.intensity    !== undefined) { fields.push('intensity = ?');    values.push(Math.min(10, Math.max(1, Number(body.intensity)))) }
+    if (body.duration_sec !== undefined) { fields.push('duration_sec = ?'); values.push(Math.min(10, Math.max(2, Number(body.duration_sec)))) }
+    if (body.notes        !== undefined) { fields.push('notes = ?');        values.push(body.notes?.trim() || null) }
+    if (body.shot_id      !== undefined) { fields.push('shot_id = ?');      values.push(body.shot_id || null) }
+    if (!fields.length) return c.json({ error: 'Nothing to update' }, 400)
+
+    await c.env.DB.prepare(
+      `UPDATE motion_beats SET ${fields.join(', ')} WHERE id = ?`
+    ).bind(...values, beatId).run()
+
+    await c.env.DB.prepare(`UPDATE motion_sequences SET updated_at = datetime('now') WHERE id = ?`).bind(beat.sequence_id).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// DELETE /api/motion/beats/:beatId
+app.delete('/api/motion/beats/:beatId', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const beatId = c.req.param('beatId')
+
+    const beat = await c.env.DB.prepare(
+      `SELECT mb.id, mb.sequence_id FROM motion_beats mb
+       JOIN motion_sequences ms ON ms.id = mb.sequence_id
+       WHERE mb.id = ? AND ms.user_id = ?`
+    ).bind(beatId, userId).first<{ id: string; sequence_id: string }>()
+    if (!beat) return c.json({ error: 'Beat not found' }, 404)
+
+    await c.env.DB.prepare(`DELETE FROM motion_beats WHERE id = ?`).bind(beatId).run()
+    await c.env.DB.prepare(`UPDATE motion_sequences SET updated_at = datetime('now') WHERE id = ?`).bind(beat.sequence_id).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// PATCH /api/motion/sequences/:id/reorder — reorder beats (mirrors shot reorder)
+app.patch('/api/motion/sequences/:id/reorder', requireAuth, async (c) => {
+  try {
+    const userId     = c.get('userId')
+    const sequenceId = c.req.param('id')
+
+    const sequence = await c.env.DB.prepare(
+      `SELECT id FROM motion_sequences WHERE id = ? AND user_id = ?`
+    ).bind(sequenceId, userId).first()
+    if (!sequence) return c.json({ error: 'Sequence not found' }, 404)
+
+    const { beat_ids } = await c.req.json()
+    if (!Array.isArray(beat_ids) || beat_ids.length === 0) {
+      return c.json({ error: 'beat_ids array required' }, 400)
+    }
+
+    const stmts = beat_ids.map((id: string, idx: number) =>
+      c.env.DB.prepare(`UPDATE motion_beats SET sort_order = ? WHERE id = ? AND sequence_id = ?`).bind(idx, id, sequenceId)
+    )
+    await c.env.DB.batch(stmts)
+    await c.env.DB.prepare(`UPDATE motion_sequences SET updated_at = datetime('now') WHERE id = ?`).bind(sequenceId).run()
+
+    return c.json({ ok: true, count: beat_ids.length })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// POST /api/motion/compose — AI-composed beat list from a scene description
+// Does NOT persist anything by itself; returns beats for the client to
+// review/edit before saving them into a sequence via the beats endpoints.
+app.post('/api/motion/compose', requireAuth, async (c) => {
+  try {
+    const { description, beat_count, mood } = await c.req.json()
+    if (!description?.trim()) return c.json({ error: 'description required' }, 400)
+
+    const beats = await composeMotionSequence(c.env, {
+      description: description.trim(),
+      beat_count:  Number(beat_count) || 4,
+      mood:        mood?.trim() || undefined,
+    })
+
+    return c.json({ ok: true, beats })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// POST /api/motion/sequences/:id/compose — AI-compose AND save directly into an existing sequence
+app.post('/api/motion/sequences/:id/compose', requireAuth, async (c) => {
+  try {
+    const userId     = c.get('userId')
+    const sequenceId = c.req.param('id')
+    const { description, beat_count, mood, replace } = await c.req.json()
+    if (!description?.trim()) return c.json({ error: 'description required' }, 400)
+
+    const sequence = await c.env.DB.prepare(
+      `SELECT id FROM motion_sequences WHERE id = ? AND user_id = ?`
+    ).bind(sequenceId, userId).first()
+    if (!sequence) return c.json({ error: 'Sequence not found' }, 404)
+
+    const beats = await composeMotionSequence(c.env, {
+      description: description.trim(),
+      beat_count:  Number(beat_count) || 4,
+      mood:        mood?.trim() || undefined,
+    })
+
+    if (replace) {
+      await c.env.DB.prepare(`DELETE FROM motion_beats WHERE sequence_id = ?`).bind(sequenceId).run()
+    }
+
+    const { count: existingCount } = await c.env.DB.prepare(
+      `SELECT COUNT(*) as count FROM motion_beats WHERE sequence_id = ?`
+    ).bind(sequenceId).first<{ count: number }>() || { count: 0 }
+
+    const stmts = beats.map((b, idx) =>
+      c.env.DB.prepare(
+        `INSERT INTO motion_beats (id, sequence_id, sort_order, camera_move, intensity, duration_sec, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).bind(uuid(), sequenceId, existingCount + idx, b.camera_move, b.intensity, b.duration_sec, b.notes)
+    )
+    await c.env.DB.batch(stmts)
+    await c.env.DB.prepare(`UPDATE motion_sequences SET updated_at = datetime('now') WHERE id = ?`).bind(sequenceId).run()
+
+    return c.json({ ok: true, beats_added: beats.length })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// GET /api/motion/sequences/:id/export — build a Higgsfield-ready shot-generation plan
+// Each beat becomes a ready-to-submit payload for POST /api/generate, carrying
+// the camera move's prompt fragment + intensity mapped to motion_strength.
+app.get('/api/motion/sequences/:id/export', requireAuth, async (c) => {
+  try {
+    const userId     = c.get('userId')
+    const sequenceId = c.req.param('id')
+
+    const sequence = await c.env.DB.prepare(
+      `SELECT * FROM motion_sequences WHERE id = ? AND user_id = ?`
+    ).bind(sequenceId, userId).first<any>()
+    if (!sequence) return c.json({ error: 'Sequence not found' }, 404)
+
+    const beats = await c.env.DB.prepare(
+      `SELECT * FROM motion_beats WHERE sequence_id = ? ORDER BY sort_order ASC, created_at ASC`
+    ).bind(sequenceId).all<any>()
+
+    const plan = beats.results.map((b: any, idx: number) => {
+      const move = CAMERA_MOVES.find(m => m.id === b.camera_move)
+      return {
+        index:          idx + 1,
+        beat_id:        b.id,
+        camera_move:    b.camera_move,
+        camera_label:   move?.label || b.camera_move,
+        prompt_fragment: move?.prompt_fragment || '',
+        intensity:      b.intensity,
+        quality_string: `motion:${b.intensity}`,
+        duration_sec:   b.duration_sec,
+        notes:          b.notes,
+        shot_id:        b.shot_id,
+      }
+    })
+
+    return c.json({
+      sequence: { id: sequence.id, name: sequence.name, mood: sequence.mood, project_id: sequence.project_id },
+      plan,
+      total_duration_sec: plan.reduce((a: number, p: any) => a + p.duration_sec, 0),
+    })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+/* ══════════════════════════════════════════════════════════════════
+   PERSONA ENGINE — Brand Voice Profile Builder
+   A persona is a reusable voice/tone definition that can be attached to
+   many projects (projects.persona_id) and applied to arbitrary copy via
+   the AI voice-application helper (applyPersonaVoice). Mirrors the
+   Motion Engine route structure exactly.
+══════════════════════════════════════════════════════════════════ */
+
+// GET /api/persona/archetypes — reference catalog (soft suggestions, not enforced)
+app.get('/api/persona/archetypes', (c) => c.json({ archetypes: PERSONA_ARCHETYPES }))
+
+// GET /api/personas — list all personas owned by the authenticated user
+app.get('/api/personas', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const rows = await c.env.DB.prepare(
+      `SELECT p.*, (SELECT COUNT(*) FROM projects pr WHERE pr.persona_id = p.id) as project_count,
+              (SELECT COUNT(*) FROM persona_applications pa WHERE pa.persona_id = p.id) as application_count
+       FROM personas p
+       WHERE p.user_id = ?
+       ORDER BY p.is_default DESC, p.updated_at DESC`
+    ).bind(userId).all()
+
+    const personas = rows.results.map((p: any) => ({
+      ...p,
+      tone_traits:   p.tone_traits   ? JSON.parse(p.tone_traits)   : [],
+      example_lines: p.example_lines ? JSON.parse(p.example_lines) : [],
+      is_default:    !!p.is_default,
+    }))
+
+    return c.json({ personas })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// POST /api/personas — create a new persona
+app.post('/api/personas', requireAuth, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const body   = await c.req.json()
+    if (!body.name?.trim()) return c.json({ error: 'name required' }, 400)
+
+    const id = uuid()
+    const toneTraits   = Array.isArray(body.tone_traits)   ? JSON.stringify(body.tone_traits)   : null
+    const exampleLines = Array.isArray(body.example_lines) ? JSON.stringify(body.example_lines) : null
+
+    await c.env.DB.prepare(
+      `INSERT INTO personas (id, user_id, name, archetype, tone_traits, vocabulary_notes, audience_summary, example_lines)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      id, userId, body.name.trim(),
+      body.archetype?.trim() || null,
+      toneTraits,
+      body.vocabulary_notes?.trim() || null,
+      body.audience_summary?.trim() || null,
+      exampleLines,
+    ).run()
+
+    return c.json({ ok: true, id }, 201)
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// GET /api/personas/:id — full persona detail
+app.get('/api/personas/:id', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const personaId = c.req.param('id')
+
+    const persona = await c.env.DB.prepare(
+      `SELECT * FROM personas WHERE id = ? AND user_id = ?`
+    ).bind(personaId, userId).first<any>()
+    if (!persona) return c.json({ error: 'Persona not found' }, 404)
+
+    const applications = await c.env.DB.prepare(
+      `SELECT id, source_text, output_text, context, created_at FROM persona_applications
+       WHERE persona_id = ? ORDER BY created_at DESC LIMIT 20`
+    ).bind(personaId).all()
+
+    return c.json({
+      ...persona,
+      tone_traits:   persona.tone_traits   ? JSON.parse(persona.tone_traits)   : [],
+      example_lines: persona.example_lines ? JSON.parse(persona.example_lines) : [],
+      is_default:    !!persona.is_default,
+      recent_applications: applications.results,
+    })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// PATCH /api/personas/:id — update any subset of fields
+app.patch('/api/personas/:id', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const personaId = c.req.param('id')
+    const body      = await c.req.json()
+
+    const persona = await c.env.DB.prepare(
+      `SELECT id FROM personas WHERE id = ? AND user_id = ?`
+    ).bind(personaId, userId).first()
+    if (!persona) return c.json({ error: 'Persona not found' }, 404)
+
+    const fields: string[] = []
+    const values: any[]    = []
+    if (body.name              !== undefined) { fields.push('name = ?');              values.push(String(body.name).trim()) }
+    if (body.archetype         !== undefined) { fields.push('archetype = ?');         values.push(body.archetype?.trim() || null) }
+    if (body.tone_traits       !== undefined) { fields.push('tone_traits = ?');       values.push(Array.isArray(body.tone_traits) ? JSON.stringify(body.tone_traits) : null) }
+    if (body.vocabulary_notes  !== undefined) { fields.push('vocabulary_notes = ?');  values.push(body.vocabulary_notes?.trim() || null) }
+    if (body.audience_summary  !== undefined) { fields.push('audience_summary = ?');  values.push(body.audience_summary?.trim() || null) }
+    if (body.example_lines     !== undefined) { fields.push('example_lines = ?');     values.push(Array.isArray(body.example_lines) ? JSON.stringify(body.example_lines) : null) }
+    if (!fields.length) return c.json({ error: 'Nothing to update' }, 400)
+    fields.push(`updated_at = datetime('now')`)
+
+    await c.env.DB.prepare(
+      `UPDATE personas SET ${fields.join(', ')} WHERE id = ?`
+    ).bind(...values, personaId).run()
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// DELETE /api/personas/:id — cascades to persona_applications, detaches projects (SET NULL)
+app.delete('/api/personas/:id', requireAuth, async (c) => {
+  const userId    = c.get('userId')
+  const personaId = c.req.param('id')
+  await c.env.DB.prepare(
+    `DELETE FROM personas WHERE id = ? AND user_id = ?`
+  ).bind(personaId, userId).run()
+  return c.json({ ok: true })
+})
+
+// POST /api/personas/:id/set-default — mark this persona as the user's default (unsets any other)
+app.post('/api/personas/:id/set-default', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const personaId = c.req.param('id')
+
+    const persona = await c.env.DB.prepare(
+      `SELECT id FROM personas WHERE id = ? AND user_id = ?`
+    ).bind(personaId, userId).first()
+    if (!persona) return c.json({ error: 'Persona not found' }, 404)
+
+    await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE personas SET is_default = 0 WHERE user_id = ?`).bind(userId),
+      c.env.DB.prepare(`UPDATE personas SET is_default = 1, updated_at = datetime('now') WHERE id = ?`).bind(personaId),
+    ])
+
+    return c.json({ ok: true })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+// POST /api/personas/:id/apply — rewrite source_text in this persona's voice via AI
+app.post('/api/personas/:id/apply', requireAuth, async (c) => {
+  try {
+    const userId    = c.get('userId')
+    const personaId = c.req.param('id')
+    const { source_text, context } = await c.req.json()
+    if (!source_text?.trim()) return c.json({ error: 'source_text required' }, 400)
+
+    const persona = await c.env.DB.prepare(
+      `SELECT * FROM personas WHERE id = ? AND user_id = ?`
+    ).bind(personaId, userId).first<any>()
+    if (!persona) return c.json({ error: 'Persona not found' }, 404)
+
+    const output = await applyPersonaVoice(c.env, {
+      persona: {
+        name:             persona.name,
+        archetype:        persona.archetype,
+        tone_traits:      persona.tone_traits   ? JSON.parse(persona.tone_traits)   : [],
+        vocabulary_notes: persona.vocabulary_notes,
+        audience_summary: persona.audience_summary,
+        example_lines:    persona.example_lines ? JSON.parse(persona.example_lines) : [],
+      },
+      source_text: source_text.trim(),
+      context:     context?.trim() || undefined,
+    })
+
+    const appId = uuid()
+    await c.env.DB.prepare(
+      `INSERT INTO persona_applications (id, persona_id, user_id, source_text, output_text, context)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(appId, personaId, userId, source_text.trim(), output, context?.trim() || null).run()
+
+    return c.json({ ok: true, id: appId, output_text: output, unchanged: output === source_text.trim() })
+  } catch (err: any) { return c.json({ error: err.message }, 500) }
+})
+
+/* ══════════════════════════════════════════════════════════════════
    ADMIN PANEL — secret-key gated
    ADMIN_SECRET env var must be set; passed as ?secret= or X-Admin-Secret header
 ══════════════════════════════════════════════════════════════════ */
@@ -4058,9 +5154,9 @@ app.get('/tools/video-generator/',   (c) => c.html(videoGeneratorPage()))
 app.get('/tools/distribution-engine',  (c) => c.redirect('/tools/distribution-engine/'))
 app.get('/tools/distribution-engine/', (c) => c.html(distributionPage()))
 app.get('/tools/motion-engine',  (c) => c.redirect('/tools/motion-engine/'))
-app.get('/tools/motion-engine/', (c) => c.html(toolShell('Motion Composition Engine', 'motion', '#FB923C')))
+app.get('/tools/motion-engine/', (c) => c.html(motionEnginePage()))
 app.get('/tools/persona-engine',  (c) => c.redirect('/tools/persona-engine/'))
-app.get('/tools/persona-engine/', (c) => c.html(toolShell('Spectra Persona Engine', 'persona', '#F87171')))
+app.get('/tools/persona-engine/', (c) => c.html(personaEnginePage()))
 app.get('/', (c) => c.html(landingPage()))
 
 export default app
@@ -5548,6 +6644,356 @@ function attentionEnginePage(): string {
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="/static/attention-engine.js"></script>
 </div><!-- /ae-app -->
+</body>
+</html>`
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   MOTION COMPOSITION ENGINE PAGE
+══════════════════════════════════════════════════════════════════ */
+function motionEnginePage(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Motion Composition Engine — Spectra</title>
+<meta name="description" content="Choreograph camera-move sequences for AI video generation — AI-composed or hand-built beat by beat.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/motion-engine.css"/>
+</head>
+<body>
+
+<!-- NAV -->
+<nav class="mo-nav">
+  <a href="/" class="mo-nav-logo">
+    <span class="mo-nav-mark">S</span>
+    <span class="mo-nav-wordmark">SPECTRA</span>
+  </a>
+  <div class="mo-nav-center">
+    <span class="mo-nav-tool-badge">
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 20 C8 12, 14 24, 20 14 S28 6, 30 10"/><circle cx="19" cy="9" r="1.6" fill="currentColor" stroke="none"/></svg>
+      Motion Engine
+    </span>
+  </div>
+  <div class="mo-nav-right">
+    <span class="mo-nav-email" id="mo-user-email"></span>
+    <a href="/tools/video-generator/" class="mo-nav-back">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+      Video Generator
+    </a>
+  </div>
+</nav>
+
+<!-- AUTH GATE -->
+<div id="mo-auth-gate" class="mo-auth-gate" style="display:none">
+  <div class="mo-auth-card">
+    <div class="mo-auth-logo"><span class="mo-nav-mark" style="width:40px;height:40px;font-size:1rem">S</span></div>
+    <h2 class="mo-auth-title">Sign in to Spectra</h2>
+    <p class="mo-auth-sub">Access the Motion Composition Engine</p>
+    <form id="mo-auth-form" class="mo-auth-form" autocomplete="off">
+      <input type="email"    id="mo-auth-email" class="mo-input" placeholder="Email" required autocomplete="email"/>
+      <input type="password" id="mo-auth-pass"  class="mo-input" placeholder="Password" required/>
+      <button type="submit"  class="mo-btn-primary" id="mo-auth-submit">Sign In</button>
+    </form>
+    <p class="mo-auth-err" id="mo-auth-err"></p>
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="mo-app" style="display:none">
+
+  <!-- LEFT RAIL — projects + sequences -->
+  <aside class="mo-rail">
+    <div class="mo-rail-section">
+      <div class="mo-rail-label">Project</div>
+      <select id="mo-project-select" class="mo-select"></select>
+    </div>
+
+    <div class="mo-rail-section mo-rail-grow">
+      <div class="mo-rail-label-row">
+        <span class="mo-rail-label">Sequences</span>
+        <button class="mo-icon-btn" id="btn-new-sequence" title="New sequence">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+      </div>
+      <div class="mo-seq-list" id="mo-seq-list">
+        <div class="mo-seq-empty">No sequences yet</div>
+      </div>
+    </div>
+
+    <div class="mo-rail-section">
+      <div class="mo-rail-label">Camera Move Palette</div>
+      <div class="mo-palette" id="mo-palette"></div>
+    </div>
+  </aside>
+
+  <!-- MAIN EDITOR -->
+  <main class="mo-main">
+
+    <!-- Empty state -->
+    <div class="mo-empty-state" id="mo-empty-state">
+      <div class="mo-empty-icon">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 20 C8 12, 14 24, 20 14 S28 6, 30 10"/></svg>
+      </div>
+      <h3>No sequence selected</h3>
+      <p>Create a new motion sequence or select one from the left rail to start choreographing camera moves.</p>
+      <button class="mo-btn-primary" id="btn-empty-new-sequence">New Sequence</button>
+    </div>
+
+    <!-- Sequence editor -->
+    <div class="mo-editor" id="mo-editor" style="display:none">
+      <div class="mo-editor-header">
+        <div class="mo-editor-title-wrap">
+          <input type="text" id="mo-seq-name" class="mo-seq-name-input" placeholder="Sequence name"/>
+          <input type="text" id="mo-seq-mood" class="mo-seq-mood-input" placeholder="Mood / genre (optional — e.g. tense chase)"/>
+        </div>
+        <div class="mo-editor-actions">
+          <span class="mo-editor-stat" id="mo-editor-duration">0s total</span>
+          <button class="mo-btn-ghost" id="btn-export-plan">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Export Plan
+          </button>
+          <button class="mo-btn-danger-ghost" id="btn-delete-sequence">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- AI Composer -->
+      <div class="mo-composer">
+        <div class="mo-composer-row">
+          <textarea id="mo-composer-desc" class="mo-composer-input" placeholder="Describe the scene — e.g. 'A lone figure walks through a neon-lit alley at night, tension building as they realize they're being followed.'" rows="2"></textarea>
+          <div class="mo-composer-controls">
+            <label class="mo-composer-label">Beats
+              <input type="number" id="mo-composer-count" class="mo-composer-count" value="4" min="2" max="10"/>
+            </label>
+            <button class="mo-btn-primary" id="btn-ai-compose">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L9.5 9.5 2 12l7.5 2.5L12 22l2.5-7.5L22 12l-7.5-2.5z"/></svg>
+              AI Compose
+            </button>
+          </div>
+        </div>
+        <label class="mo-composer-replace">
+          <input type="checkbox" id="mo-composer-replace"/> Replace existing beats instead of appending
+        </label>
+      </div>
+
+      <!-- Beat timeline -->
+      <div class="mo-beats-header">
+        <span>Beats</span>
+        <button class="mo-btn-ghost mo-btn-sm" id="btn-add-beat">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add Beat
+        </button>
+      </div>
+      <div class="mo-beats-list" id="mo-beats-list">
+        <div class="mo-beats-empty">No beats yet — use AI Compose or add a beat manually.</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- Export Plan modal -->
+<div class="mo-modal-overlay" id="mo-export-overlay" style="display:none">
+  <div class="mo-modal">
+    <div class="mo-modal-header">
+      <h3>Generation Plan</h3>
+      <button class="mo-icon-btn" id="btn-close-export"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <p class="mo-modal-sub">Each beat below is ready to submit as a Video Generator shot — the camera move's prompt fragment and intensity map directly to <code>motion_strength</code>.</p>
+    <div class="mo-export-body" id="mo-export-body"></div>
+    <button class="mo-btn-primary full-width" id="btn-copy-export">Copy JSON</button>
+  </div>
+</div>
+
+<div class="mo-toast" id="mo-toast"></div>
+
+<script src="/static/motion-engine.js"></script>
+</body>
+</html>`
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   PERSONA ENGINE PAGE — Brand Voice Profile Builder
+══════════════════════════════════════════════════════════════════ */
+function personaEnginePage(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Persona Engine — Spectra</title>
+<meta name="description" content="Build reusable brand voice profiles and apply them to any copy across your projects.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/persona-engine.css"/>
+</head>
+<body>
+
+<!-- NAV -->
+<nav class="pe-nav">
+  <a href="/" class="pe-nav-logo">
+    <span class="pe-nav-mark">S</span>
+    <span class="pe-nav-wordmark">SPECTRA</span>
+  </a>
+  <div class="pe-nav-center">
+    <span class="pe-nav-tool-badge">
+      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0116 0v1"/></svg>
+      Persona Engine
+    </span>
+  </div>
+  <div class="pe-nav-right">
+    <span class="pe-nav-email" id="pe-user-email"></span>
+    <a href="/tools/video-generator/" class="pe-nav-back">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+      Video Generator
+    </a>
+  </div>
+</nav>
+
+<!-- AUTH GATE -->
+<div id="pe-auth-gate" class="pe-auth-gate" style="display:none">
+  <div class="pe-auth-card">
+    <div class="pe-auth-logo"><span class="pe-nav-mark" style="width:40px;height:40px;font-size:1rem">S</span></div>
+    <h2 class="pe-auth-title">Sign in to Spectra</h2>
+    <p class="pe-auth-sub">Access the Persona Engine</p>
+    <form id="pe-auth-form" class="pe-auth-form" autocomplete="off">
+      <input type="email"    id="pe-auth-email" class="pe-input" placeholder="Email" required autocomplete="email"/>
+      <input type="password" id="pe-auth-pass"  class="pe-input" placeholder="Password" required/>
+      <button type="submit"  class="pe-btn-primary" id="pe-auth-submit">Sign In</button>
+    </form>
+    <p class="pe-auth-err" id="pe-auth-err"></p>
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="pe-app" style="display:none">
+
+  <!-- LEFT RAIL — personas + archetypes -->
+  <aside class="pe-rail">
+    <div class="pe-rail-section pe-rail-grow">
+      <div class="pe-rail-label-row">
+        <span class="pe-rail-label">Personas</span>
+        <button class="pe-icon-btn" id="btn-new-persona" title="New persona">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+      </div>
+      <div class="pe-persona-list" id="pe-persona-list">
+        <div class="pe-persona-empty">No personas yet</div>
+      </div>
+    </div>
+
+    <div class="pe-rail-section">
+      <div class="pe-rail-label">Archetype Reference</div>
+      <div class="pe-archetype-palette" id="pe-archetype-palette"></div>
+    </div>
+  </aside>
+
+  <!-- MAIN EDITOR -->
+  <main class="pe-main">
+
+    <!-- Empty state -->
+    <div class="pe-empty-state" id="pe-empty-state">
+      <div class="pe-empty-icon">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0116 0v1"/></svg>
+      </div>
+      <h3>No persona selected</h3>
+      <p>Create a brand voice persona to define tone, vocabulary, and audience — then apply it to any copy across your projects.</p>
+      <button class="pe-btn-primary" id="btn-empty-new-persona">New Persona</button>
+    </div>
+
+    <!-- Persona editor -->
+    <div class="pe-editor" id="pe-editor" style="display:none">
+      <div class="pe-editor-header">
+        <div class="pe-editor-title-wrap">
+          <input type="text" id="pe-name" class="pe-name-input" placeholder="Persona name — e.g. 'Late Night Mentor'"/>
+          <input type="text" id="pe-archetype" class="pe-archetype-input" placeholder="Archetype (optional — e.g. The Mentor, or your own label)"/>
+        </div>
+        <div class="pe-editor-actions">
+          <button class="pe-btn-ghost" id="btn-set-default" title="Mark as default persona">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15 9 22 9.5 17 14.5 18.5 22 12 18 5.5 22 7 14.5 2 9.5 9 9"/></svg>
+            Default
+          </button>
+          <button class="pe-btn-danger-ghost" id="btn-delete-persona">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Voice definition fields -->
+      <div class="pe-field-group">
+        <div class="pe-field">
+          <span class="pe-field-label">Tone Traits</span>
+          <div class="pe-tag-input-wrap" id="pe-traits-wrap">
+            <input type="text" id="pe-traits-input" class="pe-tag-input" placeholder="Type a trait and press Enter — e.g. witty, direct, warm"/>
+          </div>
+        </div>
+
+        <div class="pe-field">
+          <span class="pe-field-label">Audience Summary</span>
+          <textarea id="pe-audience" class="pe-textarea" rows="2" placeholder="Who is this voice speaking to? e.g. 'Busy founders who want blunt, no-fluff advice.'"></textarea>
+        </div>
+
+        <div class="pe-field">
+          <span class="pe-field-label">Vocabulary Notes</span>
+          <textarea id="pe-vocab" class="pe-textarea" rows="2" placeholder="Words/phrases to use or avoid, sentence length preferences, slang, etc."></textarea>
+        </div>
+
+        <div class="pe-field">
+          <div class="pe-section-header">
+            <span>Example Lines (few-shot voice samples)</span>
+            <button class="pe-btn-ghost pe-btn-sm" id="btn-add-example">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              Add Line
+            </button>
+          </div>
+          <div class="pe-example-list" id="pe-example-list"></div>
+          <span class="pe-field-hint">These are shown to the AI as style samples when applying this voice.</span>
+        </div>
+
+        <button class="pe-btn-primary" id="btn-save-persona">Save Persona</button>
+      </div>
+
+      <!-- Voice apply panel -->
+      <div class="pe-section-header"><span>Apply This Voice</span></div>
+      <div class="pe-apply-panel">
+        <div class="pe-apply-row">
+          <textarea id="pe-apply-input" class="pe-apply-input" placeholder="Paste any copy — a video prompt, a caption, a hook — and rewrite it in this persona's voice." rows="3"></textarea>
+          <div class="pe-apply-controls">
+            <select id="pe-apply-context" class="pe-apply-select">
+              <option value="general">General</option>
+              <option value="video_prompt">Video Prompt</option>
+              <option value="caption">Caption</option>
+              <option value="hook">Hook</option>
+            </select>
+            <button class="pe-btn-primary" id="btn-apply-voice">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L9.5 9.5 2 12l7.5 2.5L12 22l2.5-7.5L22 12l-7.5-2.5z"/></svg>
+              Apply Voice
+            </button>
+          </div>
+        </div>
+        <div class="pe-apply-output pe-apply-output-empty" id="pe-apply-output">Output will appear here.</div>
+        <div class="pe-apply-output-actions">
+          <button class="pe-btn-ghost pe-btn-sm" id="btn-copy-output">Copy Result</button>
+        </div>
+      </div>
+
+      <!-- History -->
+      <div class="pe-section-header"><span>Recent Applications</span></div>
+      <div class="pe-history-list" id="pe-history-list">
+        <div class="pe-history-empty">No applications yet — try Apply Voice above.</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="pe-toast" id="pe-toast"></div>
+
+<script src="/static/persona-engine.js"></script>
 </body>
 </html>`
 }

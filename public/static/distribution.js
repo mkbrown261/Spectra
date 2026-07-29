@@ -83,7 +83,6 @@ const DN = {
   activeTab:    'queue',
   activeFilter: 'all',
   liveChart:    null,
-  livePoller:   null,
   countdownTimer: null,
   queuePoller:  null,   // Task 6: 30s auto-poll timer
   compose: {
@@ -164,7 +163,7 @@ document.addEventListener('DOMContentLoaded', boot);
 
 async function boot() {
   try {
-    const res = await api('GET', '/api/me');
+    const res = await api('GET', '/api/auth/me');
     if (!res.ok) { showAuthGate(); return; }
     DN.user = await res.json();
     $('dn-user-email').textContent = DN.user.email || '';
@@ -759,157 +758,6 @@ async function pullMetrics(postId) {
 }
 
 /* ════════════════════════════════════════════════════════════════
-   LIVE METRICS CHART
-   ════════════════════════════════════════════════════════════════ */
-/* ════════════════════════════════════════════════════════════════
-   METRICS STATS
-   ════════════════════════════════════════════════════════════════ */
-function updateMetricsStats() {
-  const posted = DN.queue.filter(p => p.status === 'posted');
-  const withMetrics = posted.filter(p => p.views_24h != null);
-
-  const totalPosts = posted.length;
-  const totalViews = withMetrics.reduce((s, p) => s + (p.views_24h || 0), 0);
-  const avgViews   = withMetrics.length ? Math.round(totalViews / withMetrics.length) : null;
-
-  // Top platform by views
-  const byPlatform = {};
-  withMetrics.forEach(p => {
-    byPlatform[p.platform] = (byPlatform[p.platform] || 0) + (p.views_24h || 0);
-  });
-  const topPlatform = Object.entries(byPlatform).sort((a,b) => b[1]-a[1])[0]?.[0] || null;
-
-  function setStatVal(id, val) {
-    const el = $(id);
-    if (!el) return;
-    const prev = el.textContent;
-    const next = val != null ? fmtNum(val) : '—';
-    if (prev !== next) {
-      el.textContent = next;
-      el.classList.remove('updated');
-      void el.offsetWidth; // reflow to restart animation
-      el.classList.add('updated');
-    }
-  }
-
-  setStatVal('metric-total-posts',  totalPosts);
-  setStatVal('metric-total-views',  totalViews || null);
-  setStatVal('metric-top-platform', topPlatform ? topPlatform.slice(0,2).toUpperCase() : null);
-  setStatVal('metric-avg-views',    avgViews);
-}
-
-function initLiveChart() {
-  const canvas = $('dn-live-chart');
-  if (!canvas) return;
-
-  const posted = DN.queue.filter(p => p.status === 'posted' && p.views_24h != null).slice(0, 10);
-
-  if (posted.length === 0) {
-    $('dn-live-chart-empty')?.style && ($('dn-live-chart-empty').style.display = 'flex');
-    canvas.style.display = 'none';
-    return;
-  }
-  $('dn-live-chart-empty') && ($('dn-live-chart-empty').style.display = 'none');
-  canvas.style.display = 'block';
-
-  const labels  = posted.map(p => `${p.platform.slice(0,2).toUpperCase()} ${formatDateTime(p.posted_at)}`);
-  const views   = posted.map(p => p.views_24h || 0);
-  const likes   = posted.map(p => p.likes_24h || 0);
-
-  if (DN.liveChart) {
-    DN.liveChart.data.labels  = labels;
-    DN.liveChart.data.datasets[0].data = views;
-    DN.liveChart.data.datasets[1].data = likes;
-    DN.liveChart.update('active');
-    return;
-  }
-
-  DN.liveChart = new Chart(canvas, {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [
-        {
-          label: 'Views (24h)',
-          data: views,
-          borderColor: '#A78BFA',
-          backgroundColor: 'rgba(167,139,250,0.12)',
-          tension: 0.4,
-          fill: true,
-          pointBackgroundColor: '#A78BFA',
-          pointRadius: 5,
-          pointHoverRadius: 7,
-        },
-        {
-          label: 'Likes (24h)',
-          data: likes,
-          borderColor: '#34D399',
-          backgroundColor: 'rgba(52,211,153,0.08)',
-          tension: 0.4,
-          fill: true,
-          pointBackgroundColor: '#34D399',
-          pointRadius: 5,
-          pointHoverRadius: 7,
-        },
-      ],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        legend: { labels: { color: 'rgba(232,244,253,0.55)', font: { family: 'Space Grotesk', size: 12 } } },
-        tooltip: {
-          backgroundColor: '#0b0f1a',
-          borderColor: 'rgba(168,216,240,0.15)',
-          borderWidth: 1,
-          titleColor: '#E8F4FD',
-          bodyColor: 'rgba(232,244,253,0.7)',
-        },
-      },
-      scales: {
-        x: {
-          ticks: { color: 'rgba(232,244,253,0.35)', font: { size: 11 } },
-          grid:  { color: 'rgba(168,216,240,0.05)' },
-        },
-        y: {
-          ticks: { color: 'rgba(232,244,253,0.35)', font: { size: 11 } },
-          grid:  { color: 'rgba(168,216,240,0.05)' },
-        },
-      },
-    },
-  });
-
-  // Start live poller
-  if (DN.livePoller) clearInterval(DN.livePoller);
-  DN.livePoller = setInterval(pollLiveMetrics, 60000);
-}
-
-async function pollLiveMetrics() {
-  const posted = DN.queue.filter(p => p.status === 'posted').slice(0, 20);
-  if (posted.length === 0) return;
-  try {
-    const ids = posted.map(p => p.id).join(',');
-    const res = await api('GET', `/api/distribution/metrics/live?ids=${ids}`);
-    if (!res.ok) return;
-    const data = await res.json();
-    if (!data.metrics) return;
-    // Merge updated metrics into queue
-    data.metrics.forEach(m => {
-      const idx = DN.queue.findIndex(p => p.id === m.post_id);
-      if (idx !== -1) {
-        DN.queue[idx].views_24h = m.views_24h;
-        DN.queue[idx].likes_24h = m.likes_24h;
-        DN.queue[idx].views_72h = m.views_72h;
-      }
-    });
-    renderQueue();
-    initLiveChart(); // refresh chart
-    showToast('Live metrics refreshed', 'info', 1500);
-  } catch {}
-}
-
-/* ════════════════════════════════════════════════════════════════
    FILE UPLOAD — DROP ZONE
    ════════════════════════════════════════════════════════════════ */
 function setVideoInputTab(tab) {
@@ -968,7 +816,7 @@ async function uploadFile(file) {
 
   try {
     const formData = new FormData();
-    formData.append('video', file);
+    formData.append('file', file);
 
     // XHR so we can track progress
     const result = await new Promise((resolve, reject) => {
@@ -1076,12 +924,12 @@ async function openProjectPicker() {
   try {
     const res  = await api('GET', '/api/projects');
     const data = await res.json();
-    const projects = data.projects || [];
+    const projects = Array.isArray(data) ? data : (data.projects || []);
     if (!projects.length) { list.innerHTML = '<div class="dn-picker-loading">No projects found</div>'; return; }
     const shotsPerProject = await Promise.all(
       projects.slice(0, 20).map(async p => {
         try {
-          const r = await api('GET', `/api/projects/${p.id}/shots`);
+          const r = await api('GET', `/api/projects/${p.id}`);
           const d = await r.json();
           return { project: p, shots: (d.shots||[]).filter(s => s.status==='completed' && s.video_url) };
         } catch { return { project: p, shots: [] }; }
@@ -1449,7 +1297,7 @@ async function addBatchFile(file) {
 
   try {
     const formData = new FormData();
-    formData.append('video', file);
+    formData.append('file', file);
     const res    = await fetch('/api/distribution/upload', { method: 'POST', credentials: 'include', body: formData });
     const result = await res.json();
     if (!result.ok) throw new Error(result.error || 'Upload failed');
@@ -1957,9 +1805,36 @@ function renderPostBreakdown(post) {
 }
 
 /* ── Aggregated per-platform breakdown across all posts ─────── */
+/* Shown in the breakdown table on initial load, before any single
+   post is selected in the picker (renderPostBreakdown takes over
+   and overwrites this element once a post is clicked). */
 function renderBreakdownTable(platformStats) {
-  // This is shown in the breakdown section when no post is selected
-  // It will be overwritten by renderPostBreakdown when a post is selected
+  const el = $('dn-metrics-breakdown-table');
+  if (!el) return;
+
+  const platforms = Object.keys(platformStats || {});
+  if (!platforms.length) {
+    el.innerHTML = '<div class="dn-breakdown-empty">No platform metrics yet — select a post above to see its breakdown.</div>';
+    return;
+  }
+
+  el.innerHTML = `
+    <div class="dn-breakdown-header">
+      <span>Platform</span>
+      <span>Posts</span>
+      <span>Views</span>
+      <span>Likes</span>
+    </div>
+    ${platforms.map(p => {
+      const s = platformStats[p] || {};
+      return `<div class="dn-breakdown-row">
+        <span class="dn-breakdown-label">${escHtml(p.slice(0,1).toUpperCase() + p.slice(1))}</span>
+        <span class="dn-breakdown-val">${fmtNum(s.posts || 0)}</span>
+        <span class="dn-breakdown-val">${fmtNum(s.views || 0)}</span>
+        <span class="dn-breakdown-val">${fmtNum(s.likes || 0)}</span>
+      </div>`;
+    }).join('')}
+  `;
 }
 
 /* ── Best posting times ─────────────────────────────────────── */
@@ -1992,7 +1867,4 @@ function renderBestTimes(bestTimes) {
     </div>`;
   }).join('');
 }
-
-/* ── Legacy initLiveChart / pollLiveMetrics kept for compat ─── */
-function initLiveChart() { /* replaced by renderMetricsChart */ }
 

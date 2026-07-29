@@ -2224,13 +2224,18 @@ function initDragAndDrop(grid) {
     VG.shots[projectId] = newOrder;
     renderShotGrid(projectId);
 
-    // Persist to server
+    // Persist to server — roll back to server truth on failure
     try {
-      await api('PATCH', `/api/projects/${projectId}/reorder`, {
+      const res = await api('PATCH', `/api/projects/${projectId}/reorder`, {
         shot_ids: newOrder.map(s => s.id),
       });
+      if (!res.ok) {
+        showToast('Reorder save failed — reverting', true);
+        await loadShots(projectId);
+      }
     } catch {
-      showToast('Reorder save failed', true);
+      showToast('Reorder save failed — reverting', true);
+      await loadShots(projectId);
     }
   });
 }
@@ -4834,14 +4839,8 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   /* ── Compare play all ──────────────────────────────────────── */
-  const comparePlayAll = $('compare-play-all');
-  if (comparePlayAll) comparePlayAll.addEventListener('click', comparePlayAll_handler);
-  function comparePlayAll_handler() { comparePlayAll(); }
-  // Override — correct reference
-  if (comparePlayAll) {
-    comparePlayAll.replaceWith(comparePlayAll.cloneNode(true));
-    $('compare-play-all').addEventListener('click', comparePlayAll);
-  }
+  const comparePlayAllBtn = $('compare-play-all');
+  if (comparePlayAllBtn) comparePlayAllBtn.addEventListener('click', comparePlayAll);
 
   /* ── Compare export JSON ───────────────────────────────────── */
   const compareExportBtn = $('compare-export-json');
